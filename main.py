@@ -844,6 +844,7 @@ class FractalParams:
         self.aa_samples       = 1   # 1=off 2=4xRGSS 3=9x
         # --- Screenshot ---
         self.screenshot_requested = False
+        self.player_mode = False
 
 _params = FractalParams()
 
@@ -930,6 +931,310 @@ class PresetInterpolator:
             self._gui_sync_cb()
 
 _interpolator = PresetInterpolator()
+
+def _py_sdf(pos):
+    p = _params
+    px, py, pz = pos
+
+    rx, ry, rz = p.rot_x, p.rot_y, p.rot_z
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+    x1 = px
+    y1 = cy * py - sy * pz
+    z1 = sy * py + cy * pz
+    x2 = cz * x1 + sz * y1
+    y2 = -sz * x1 + cz * y1
+    z2 = z1
+    x3 = x2
+    y3 = cx * y2 - sx * z2
+    z3 = sx * y2 + cx * z2
+    ox, oy, oz = x3, y3, z3
+
+    ft = p.fractal_type
+    if ft == 0:
+        return _py_sdf_mandelbox(ox, oy, oz)
+    elif ft == 1:
+        return _py_sdf_menger(ox, oy, oz)
+    elif ft == 2:
+        return _py_sdf_sierpinski(ox, oy, oz)
+    else:
+        return _py_sdf_octa(ox, oy, oz)
+
+def _py_sdf_mandelbox(ox, oy, oz):
+    p = _params
+    px, py, pz = ox, oy, oz
+    dr = 1.0
+    fl = p.mb_fold_limit
+    si = p.mb_sphere_inner
+    so = p.mb_sphere_outer * p.mb_fixed_radius
+    for _ in range(p.iterations):
+        px = max(-fl, min(fl, px)) * 2.0 - px
+        py = max(-fl, min(fl, py)) * 2.0 - py
+        pz = max(-fl, min(fl, pz)) * 2.0 - pz
+        r2 = px*px + py*py + pz*pz
+        if r2 < si * si:
+            k = so / (si * si)
+            px *= k; py *= k; pz *= k
+            dr *= k
+        elif r2 < so * so:
+            k = so * so / r2
+            px *= k; py *= k; pz *= k
+            dr *= k
+        px = px * p.scale + p.julia_x
+        py = py * p.scale + p.julia_y
+        pz = pz * p.scale + p.julia_z
+        dr = dr * abs(p.scale) + 1.0
+        if px*px + py*py + pz*pz > p.bailout * p.bailout:
+            break
+    length = math.sqrt(px*px + py*py + pz*pz)
+    return length / abs(dr) * p.de_multiplier
+
+def _py_sdf_menger(ox, oy, oz):
+    p = _params
+    px, py, pz = ox, oy, oz
+    s = 1.0
+    ms, mo = p.ms_scale, p.ms_offset
+    for _ in range(p.iterations):
+        px, py, pz = abs(px), abs(py), abs(pz)
+        if px < py: px, py = py, px
+        if px < pz: px, pz = pz, px
+        if py < pz: py, pz = pz, py
+        px = px * ms - mo
+        py = py * ms - mo
+        pz = pz * ms - mo
+        s *= ms
+    qx, qy, qz = abs(px) - 1.0, abs(py) - 1.0, abs(pz) - 1.0
+    d = math.sqrt(max(qx,0)**2 + max(qy,0)**2 + max(qz,0)**2) + min(max(qx, max(qy, qz)), 0.0)
+    return d / s * p.de_multiplier
+
+def _py_sdf_sierpinski(ox, oy, oz):
+    p = _params
+    vs = p.si_vertex_spread
+    A = ( vs,  vs,  vs)
+    B = (-vs, -vs,  vs)
+    C = (-vs,  vs, -vs)
+    D = ( vs, -vs, -vs)
+    px, py, pz = ox, oy * p.si_squash, oz
+    scale = 1.0
+    fb = p.si_fold_bias
+    for _ in range(p.iterations):
+        verts = [A, B, C, D]
+        best = None
+        best_d = 1e18
+        for v in verts:
+            dx, dy, dz = px - v[0], py - v[1], pz - v[2]
+            dd = dx*dx + dy*dy + dz*dz
+            if dd < best_d:
+                best_d = dd
+                best = v
+        px = fb * px - best[0] * (fb - 1.0)
+        py = fb * py - best[1] * (fb - 1.0)
+        pz = fb * pz - best[2] * (fb - 1.0)
+        scale *= fb
+    md = max(max(-px-py-pz, px+py-pz), max(-px+py+pz, px-py+pz))
+    r = scale * math.sqrt(3.0)
+    return (md - r) / (scale * math.sqrt(3.0)) * p.de_multiplier
+
+def _py_sdf_octa(ox, oy, oz):
+    p = _params
+    px, py, pz = ox, oy, oz
+    s = 1.0
+    ifs_s = p.oc_ifs_scale
+    off = p.oc_offset_uni
+    ox2, oy2, oz2 = p.offset_x * off, p.offset_y * off, p.offset_z * off
+    for _ in range(p.iterations):
+        px, py, pz = abs(px), abs(py), abs(pz)
+        if px < py: px, py = py, px
+        if px < pz: px, pz = pz, px
+        if py < pz: py, pz = pz, py
+        px = ifs_s * px - ox2 * (ifs_s - 1.0)
+        py = ifs_s * py - oy2 * (ifs_s - 1.0)
+        pz = ifs_s * pz - oz2 * (ifs_s - 1.0)
+        s *= ifs_s
+    r = abs(px) + abs(py) + abs(pz) - 1.0
+    return r / s * p.de_multiplier
+
+def _py_sdf_gradient(pos, eps=0.005):
+    d0 = _py_sdf(pos)
+    dx = _py_sdf((pos[0]+eps, pos[1], pos[2])) - d0
+    dy = _py_sdf((pos[0], pos[1]+eps, pos[2])) - d0
+    dz = _py_sdf((pos[0], pos[1], pos[2]+eps)) - d0
+    length = math.sqrt(dx*dx + dy*dy + dz*dz) or 1.0
+    return (dx/length, dy/length, dz/length)
+
+class PlayerState:
+    GRAVITY_STRENGTH = 1.0
+    MOVE_SPEED       = 0.5
+    JUMP_SPEED       = 0.6
+    FRICTION         = 19.0
+    AIR_CONTROL      = 0.13
+    SPEED_CAP        = 4.2
+    COLLISION_BIAS   = 1.0
+    GRAVITY_MODE     = 0
+    PLAYER_HEIGHT    = 0.08
+    GROUND_DIST      = 0.12
+
+    def __init__(self):
+        self.vel = [0.0, 0.0, 0.0]
+        self.on_ground = False
+        self.jump_queued = False
+        self._gravity_dir = (0.0, -1.0, 0.0)
+        self._surface_normal = (0.0, 1.0, 0.0)
+
+    def _effective_threshold(self):
+        raw = _params.min_dist * 0.001
+        scale_factor = max(_params.step_scale, 0.1) * max(_params.de_multiplier, 0.01)
+        return max(raw / scale_factor, 0.002) * self.COLLISION_BIAS
+
+    def _compute_gravity_dir(self, pos, surface_normal):
+        mode = self.GRAVITY_MODE
+        if mode == 0:
+            return (-surface_normal[0], -surface_normal[1], -surface_normal[2])
+        elif mode == 1:
+            cx, cy, cz = -pos[0], -pos[1], -pos[2]
+            clen = math.sqrt(cx*cx + cy*cy + cz*cz)
+            if clen < 1e-6:
+                return (0.0, -1.0, 0.0)
+            return (cx/clen, cy/clen, cz/clen)
+        else:
+            return (0.0, -1.0, 0.0)
+
+    def update(self, dt):
+        if dt <= 0 or dt > 0.1:
+            return
+        pos = list(_params.cam_pos)
+
+        thresh = self._effective_threshold()
+        col_radius = max(self.PLAYER_HEIGHT, thresh)
+        gnd_dist   = max(self.GROUND_DIST, thresh * 1.5)
+
+        d = _py_sdf(pos)
+        gx, gy, gz = _py_sdf_gradient(pos)
+        nlen = math.sqrt(gx*gx + gy*gy + gz*gz)
+        if nlen > 1e-6:
+            gx, gy, gz = gx/nlen, gy/nlen, gz/nlen
+            self._surface_normal = (gx, gy, gz)
+        else:
+            gx, gy, gz = self._surface_normal
+
+        self._gravity_dir = self._compute_gravity_dir(pos, (gx, gy, gz))
+        gd = self._gravity_dir
+
+        self.on_ground = (d < gnd_dist)
+
+        fwd, right, _ = _calc_basis_from_params()
+
+        fwd_proj = [fwd[i] - (fwd[0]*gd[0]+fwd[1]*gd[1]+fwd[2]*gd[2])*gd[i] for i in range(3)]
+        flen = math.sqrt(fwd_proj[0]**2 + fwd_proj[1]**2 + fwd_proj[2]**2)
+        if flen > 1e-6:
+            fwd_proj = [f/flen for f in fwd_proj]
+        else:
+            fwd_proj = list(fwd)
+
+        right_proj = [right[i] - (right[0]*gd[0]+right[1]*gd[1]+right[2]*gd[2])*gd[i] for i in range(3)]
+        rlen = math.sqrt(right_proj[0]**2 + right_proj[1]**2 + right_proj[2]**2)
+        if rlen > 1e-6:
+            right_proj = [r/rlen for r in right_proj]
+        else:
+            right_proj = list(right)
+
+        ci = _cam_input
+        mvx, mvy, mvz = 0.0, 0.0, 0.0
+        if 'w' in ci.keys_pressed:
+            mvx += fwd_proj[0]; mvy += fwd_proj[1]; mvz += fwd_proj[2]
+        if 's' in ci.keys_pressed:
+            mvx -= fwd_proj[0]; mvy -= fwd_proj[1]; mvz -= fwd_proj[2]
+        if 'a' in ci.keys_pressed:
+            mvx -= right_proj[0]; mvy -= right_proj[1]; mvz -= right_proj[2]
+        if 'd' in ci.keys_pressed:
+            mvx += right_proj[0]; mvy += right_proj[1]; mvz += right_proj[2]
+
+        mv_len = math.sqrt(mvx*mvx + mvy*mvy + mvz*mvz)
+        if mv_len > 1e-6:
+            mvx /= mv_len; mvy /= mv_len; mvz /= mv_len
+
+        if self.on_ground:
+            vdot = self.vel[0]*gd[0] + self.vel[1]*gd[1] + self.vel[2]*gd[2]
+            if vdot > 0:
+                self.vel[0] -= gd[0] * vdot
+                self.vel[1] -= gd[1] * vdot
+                self.vel[2] -= gd[2] * vdot
+
+            alpha = min(self.FRICTION * dt, 1.0)
+            if mv_len > 1e-6:
+                target_vx = mvx * self.MOVE_SPEED
+                target_vy = mvy * self.MOVE_SPEED
+                target_vz = mvz * self.MOVE_SPEED
+            else:
+                target_vx = target_vy = target_vz = 0.0
+
+            self.vel[0] += (target_vx - self.vel[0]) * alpha
+            self.vel[1] += (target_vy - self.vel[1]) * alpha
+            self.vel[2] += (target_vz - self.vel[2]) * alpha
+
+            if self.jump_queued:
+                sn = self._surface_normal
+                self.vel[0] += sn[0] * self.JUMP_SPEED
+                self.vel[1] += sn[1] * self.JUMP_SPEED
+                self.vel[2] += sn[2] * self.JUMP_SPEED
+        else:
+            self.vel[0] += gd[0] * self.GRAVITY_STRENGTH * dt
+            self.vel[1] += gd[1] * self.GRAVITY_STRENGTH * dt
+            self.vel[2] += gd[2] * self.GRAVITY_STRENGTH * dt
+
+            if mv_len > 1e-6:
+                self.vel[0] += mvx * self.MOVE_SPEED * self.AIR_CONTROL * dt
+                self.vel[1] += mvy * self.MOVE_SPEED * self.AIR_CONTROL * dt
+                self.vel[2] += mvz * self.MOVE_SPEED * self.AIR_CONTROL * dt
+
+        self.jump_queued = False
+
+        spd = math.sqrt(self.vel[0]**2 + self.vel[1]**2 + self.vel[2]**2)
+        if spd > self.SPEED_CAP:
+            self.vel[0] = self.vel[0] / spd * self.SPEED_CAP
+            self.vel[1] = self.vel[1] / spd * self.SPEED_CAP
+            self.vel[2] = self.vel[2] / spd * self.SPEED_CAP
+
+        steps = 8
+        sub_dt = dt / steps
+        for _ in range(steps):
+            pos[0] += self.vel[0] * sub_dt
+            pos[1] += self.vel[1] * sub_dt
+            pos[2] += self.vel[2] * sub_dt
+            d2 = _py_sdf(pos)
+            if d2 < col_radius:
+                penetration = col_radius - d2 + thresh * 0.5
+                nx, ny, nz = _py_sdf_gradient(pos)
+                pos[0] += nx * penetration
+                pos[1] += ny * penetration
+                pos[2] += nz * penetration
+                vdot = self.vel[0]*nx + self.vel[1]*ny + self.vel[2]*nz
+                if vdot < 0:
+                    self.vel[0] -= nx * vdot
+                    self.vel[1] -= ny * vdot
+                    self.vel[2] -= nz * vdot
+
+        _params.cam_pos = pos
+
+def _calc_basis_from_params():
+    yaw, pitch = _params.cam_yaw, _params.cam_pitch
+    fx =  math.cos(pitch) * math.sin(yaw)
+    fy =  math.sin(pitch)
+    fz = -math.cos(pitch) * math.cos(yaw)
+    fwd = (fx, fy, fz)
+    rx, ry, rz = -fz, 0.0, fx
+    rlen = math.sqrt(rx*rx + rz*rz) or 1.0
+    right = (rx/rlen, 0.0, rz/rlen)
+    ux = right[1]*fwd[2] - right[2]*fwd[1]
+    uy = right[2]*fwd[0] - right[0]*fwd[2]
+    uz = right[0]*fwd[1] - right[1]*fwd[0]
+    ulen = math.sqrt(ux*ux + uy*uy + uz*uz) or 1.0
+    up = (ux/ulen, uy/ulen, uz/ulen)
+    return fwd, right, up
+
+_player_state = PlayerState()
+_player_move_input = [0.0, 0.0]
 
 class _CamInput:
     keys_pressed: set    = set()
@@ -1018,6 +1323,16 @@ class FractalWindow(mglw.WindowConfig):
         if key in (km.LALT, km.RALT):
             if action == PRESS:   _cam_input.keys_pressed.add('alt')
             elif action == RELEASE: _cam_input.keys_pressed.discard('alt')
+        if key == km.V and action == PRESS:
+            _params.player_mode = not _params.player_mode
+            if _params.player_mode:
+                _player_state.vel = [0.0, 0.0, 0.0]
+                _player_state.on_ground = False
+                _player_state.jump_queued = False
+            return
+        if key == km.SPACE and action == PRESS and _params.player_mode:
+            _player_state.jump_queued = True
+            return
         name_map = {
             Keys.W: 'w', Keys.S: 's',
             Keys.A: 'a', Keys.D: 'd',
@@ -1025,7 +1340,6 @@ class FractalWindow(mglw.WindowConfig):
         }
         k = name_map.get(key)
         if k is None:
-            # F12 screenshot
             try:
                 import pyglet
                 km2 = pyglet.window.key
@@ -1073,6 +1387,9 @@ class FractalWindow(mglw.WindowConfig):
         return fwd, right, up
     def _update_camera_keys(self, dt):
         global _cam_vel
+        if _params.player_mode:
+            _player_state.update(dt)
+            return
         ci = _cam_input
         mul = self._speed_mul()
         fwd, right, up = self._calc_basis()
@@ -1582,6 +1899,12 @@ class ControlGUI(QMainWindow):
         self._vbox.addStretch()
         tabs.addTab(tab_presets, "Presets")
 
+        tab_player, vbox = self._make_scroll_tab()
+        self._vbox = vbox
+        self._build_player_section()
+        self._vbox.addStretch()
+        tabs.addTab(tab_player, "Player")
+
         self.setCentralWidget(root)
 
     def _add_section(self, widget):
@@ -1829,6 +2152,22 @@ class ControlGUI(QMainWindow):
                 f"pos  ({px:+.2f}, {py:+.2f}, {pz:+.2f})\n"
                 f"yaw  {yaw:.1f}   pitch  {pitch:.1f}"
             )
+        except Exception:
+            pass
+        try:
+            lbl = self._player_mode_lbl
+            if _params.player_mode:
+                lbl.setText("PLAYER MODE: ON")
+                lbl.setStyleSheet(
+                    f"color: {COLORS['accent']}; background: {COLORS['bg2']};"
+                    "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+                )
+            else:
+                lbl.setText("PLAYER MODE: OFF")
+                lbl.setStyleSheet(
+                    f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
+                    "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+                )
         except Exception:
             pass
     def _build_color_section(self):
@@ -2394,6 +2733,212 @@ class ControlGUI(QMainWindow):
             sl = getattr(self, f'_sl_{attr}', None)
             if sl is not None:
                 sl.set_value(getattr(_params, attr))
+
+    def _build_player_section(self):
+        grp_mode = _section("PLAYER MODE")
+        layout_mode = QVBoxLayout(grp_mode)
+        layout_mode.setSpacing(6)
+
+        hint = _label(
+            "V  — toggle player / fly mode\n"
+            "W A S D  — move   |   Space  — jump\n"
+            "LMB drag  — look around",
+            COLORS['fg2'], FONT_SMALL
+        )
+        hint.setStyleSheet(
+            f"color: {COLORS['fg2']}; background: {COLORS['bg2']};"
+            "padding: 6px 8px; border-radius: 4px;"
+        )
+        layout_mode.addWidget(hint)
+
+        toggle_row = QHBoxLayout()
+        self._player_mode_lbl = _label("PLAYER MODE: OFF", COLORS['fg4'], FONT_SMALL)
+        self._player_mode_lbl.setStyleSheet(
+            f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
+            "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+        )
+        toggle_btn = QPushButton("Toggle (V)")
+        toggle_btn.setFont(FONT_SMALL)
+        toggle_btn.setStyleSheet(_css_button())
+        toggle_btn.clicked.connect(self._toggle_player_mode)
+        toggle_row.addWidget(self._player_mode_lbl, 1)
+        toggle_row.addWidget(toggle_btn)
+        layout_mode.addLayout(toggle_row)
+
+        reset_btn = QPushButton("Reset Velocity")
+        reset_btn.setFont(FONT_SMALL)
+        reset_btn.setStyleSheet(_css_button())
+        reset_btn.clicked.connect(self._reset_player_velocity)
+        layout_mode.addWidget(reset_btn)
+
+        self._add_section(grp_mode)
+
+        grp_grav = _section("GRAVITY MODE")
+        layout_grav = QVBoxLayout(grp_grav)
+        layout_grav.setSpacing(4)
+
+        self._grav_mode_grp = QButtonGroup(self)
+        grav_row = QHBoxLayout()
+        for i, (label, tip) in enumerate([
+            ("To Fractal", "Gravity pulls toward nearest fractal surface (normal-based)"),
+            ("To Center",  "Gravity pulls toward world origin (0, 0, 0)"),
+            ("Down",       "Standard gravity: always pulls along -Y axis"),
+        ]):
+            rb = QRadioButton(label)
+            rb.setFont(FONT_SMALL)
+            rb.setStyleSheet(_css_radio())
+            rb.setChecked(i == _player_state.GRAVITY_MODE)
+            rb.setToolTip(tip)
+            self._grav_mode_grp.addButton(rb, i)
+            grav_row.addWidget(rb)
+        layout_grav.addLayout(grav_row)
+        self._grav_mode_grp.idClicked.connect(
+            lambda idx: setattr(_player_state, 'GRAVITY_MODE', idx)
+        )
+        self._add_section(grp_grav)
+
+        grp_phys = _section("PHYSICS")
+        layout_phys = QVBoxLayout(grp_phys)
+        layout_phys.setSpacing(2)
+
+        def _make_ps_slider(label, attr, mn, mx, step=0.05):
+            sl = SliderRow(label, mn, mx, getattr(_player_state, attr), step)
+            sl.on_change(lambda v, a=attr: setattr(_player_state, a, v))
+            layout_phys.addWidget(sl)
+            return sl
+
+        self._sl_ps_gravity  = _make_ps_slider("Gravity",      'GRAVITY_STRENGTH', 0.1, 15.0, 0.1)
+        self._sl_ps_move     = _make_ps_slider("Move Speed",   'MOVE_SPEED',        0.2, 10.0, 0.1)
+        self._sl_ps_jump     = _make_ps_slider("Jump Speed",   'JUMP_SPEED',        0.2, 12.0, 0.1)
+        self._sl_ps_friction = _make_ps_slider("Friction",     'FRICTION',          0.5, 30.0, 0.5)
+        self._sl_ps_air      = _make_ps_slider("Air Control",  'AIR_CONTROL',       0.0,  1.0, 0.01)
+        self._sl_ps_speedcap = _make_ps_slider("Speed Cap",    'SPEED_CAP',         0.5, 20.0, 0.2)
+        self._sl_ps_height   = _make_ps_slider("Player Height",'PLAYER_HEIGHT',     0.01, 1.0, 0.005)
+        self._sl_ps_gnd      = _make_ps_slider("Ground Dist",  'GROUND_DIST',       0.01, 1.0, 0.005)
+        self._sl_ps_bias     = _make_ps_slider("Coll. Bias",   'COLLISION_BIAS',    0.1, 10.0, 0.1)
+
+        _lbl_hint(layout_phys,
+            "Coll. Bias scales collision threshold to match fractal density.\n"
+            "Increase if falling through surface, decrease if hovering above it.")
+
+        self._add_section(grp_phys)
+
+        grp_pre = _section("PHYSICS PRESETS")
+        layout_pre = QVBoxLayout(grp_pre)
+        layout_pre.setSpacing(4)
+
+        PHYS_PRESETS = {
+            "Default": dict(GRAVITY_STRENGTH=1.0,  MOVE_SPEED=0.5, JUMP_SPEED=0.6,
+                            FRICTION=19.0, AIR_CONTROL=0.13, SPEED_CAP=4.2,  COLLISION_BIAS=1.0),
+            "Moon":    dict(GRAVITY_STRENGTH=0.5,  MOVE_SPEED=0.7, JUMP_SPEED=0.5,
+                            FRICTION=5.0,  AIR_CONTROL=0.5,  SPEED_CAP=8.0,  COLLISION_BIAS=1.0),
+            "Heavy":   dict(GRAVITY_STRENGTH=4.0,  MOVE_SPEED=2.0, JUMP_SPEED=0.6,
+                            FRICTION=19.0, AIR_CONTROL=0.1,  SPEED_CAP=5.0,  COLLISION_BIAS=1.0),
+            "Floaty":  dict(GRAVITY_STRENGTH=0.5,  MOVE_SPEED=1.0, JUMP_SPEED=0.7,
+                            FRICTION=19.0, AIR_CONTROL=0.9, SPEED_CAP=4.2,  COLLISION_BIAS=1.0),
+            "Ice":     dict(GRAVITY_STRENGTH=1.0,  MOVE_SPEED=0.5, JUMP_SPEED=0.6,
+                            FRICTION=5.0, AIR_CONTROL=0.13, SPEED_CAP=4.2,  COLLISION_BIAS=1.0),
+        }
+
+        btn_row = QHBoxLayout()
+        for name, vals in PHYS_PRESETS.items():
+            btn = QPushButton(name)
+            btn.setFont(FONT_SMALL)
+            btn.setStyleSheet(_css_button())
+            btn.clicked.connect(lambda _, v=vals: self._apply_physics_preset(v))
+            btn_row.addWidget(btn)
+        layout_pre.addLayout(btn_row)
+        self._add_section(grp_pre)
+
+        grp_status = _section("STATUS")
+        layout_status = QVBoxLayout(grp_status)
+        layout_status.setSpacing(4)
+
+        self._pl_pos_lbl    = _label("Position:   —", COLORS['fg3'], FONT_SMALL)
+        self._pl_vel_lbl    = _label("Velocity:   —", COLORS['fg3'], FONT_SMALL)
+        self._pl_ground_lbl = _label("On ground:  —", COLORS['fg3'], FONT_SMALL)
+        self._pl_sdf_lbl    = _label("SDF raw:    —", COLORS['fg3'], FONT_SMALL)
+        self._pl_thresh_lbl = _label("Col thresh: —", COLORS['fg3'], FONT_SMALL)
+        self._pl_grav_lbl   = _label("Grav dir:   —", COLORS['fg3'], FONT_SMALL)
+        for lbl in (self._pl_pos_lbl, self._pl_vel_lbl, self._pl_ground_lbl,
+                    self._pl_sdf_lbl, self._pl_thresh_lbl, self._pl_grav_lbl):
+            lbl.setStyleSheet(
+                f"color: {COLORS['fg3']}; background: transparent;"
+                "font: 8pt Consolas;"
+            )
+            layout_status.addWidget(lbl)
+
+        self._status_timer = QTimer(self)
+        self._status_timer.timeout.connect(self._update_player_status)
+        self._status_timer.start(100)
+
+        self._add_section(grp_status)
+
+    def _toggle_player_mode(self):
+        _params.player_mode = not _params.player_mode
+        if _params.player_mode:
+            _player_state.vel = [0.0, 0.0, 0.0]
+            _player_state.jump_queued = False
+            self._player_mode_lbl.setText("PLAYER MODE: ON")
+            self._player_mode_lbl.setStyleSheet(
+                f"color: {COLORS['accent']}; background: {COLORS['bg2']};"
+                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+            )
+        else:
+            self._player_mode_lbl.setText("PLAYER MODE: OFF")
+            self._player_mode_lbl.setStyleSheet(
+                f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
+                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+            )
+
+    def _reset_player_velocity(self):
+        _player_state.vel = [0.0, 0.0, 0.0]
+        _player_state.jump_queued = False
+
+    def _apply_physics_preset(self, vals: dict):
+        for k, v in vals.items():
+            setattr(_player_state, k, v)
+        for attr, sl in [
+            ('GRAVITY_STRENGTH', self._sl_ps_gravity),
+            ('MOVE_SPEED',       self._sl_ps_move),
+            ('JUMP_SPEED',       self._sl_ps_jump),
+            ('FRICTION',         self._sl_ps_friction),
+            ('AIR_CONTROL',      self._sl_ps_air),
+            ('SPEED_CAP',        self._sl_ps_speedcap),
+            ('COLLISION_BIAS',   self._sl_ps_bias),
+        ]:
+            sl.set_value(getattr(_player_state, attr))
+
+    def _update_player_status(self):
+        if not _params.player_mode:
+            return
+        pos = _params.cam_pos
+        vel = _player_state.vel
+        spd = math.sqrt(vel[0]**2 + vel[1]**2 + vel[2]**2)
+        try:
+            d = _py_sdf(pos)
+            thresh = _player_state._effective_threshold()
+            sdf_str   = f"{d:.5f}"
+            thresh_str = f"{thresh:.5f}  (col={thresh*4:.5f}  gnd={thresh*6:.5f})"
+        except Exception:
+            sdf_str = thresh_str = "err"
+        self._pl_pos_lbl.setText(
+            f"Position:   {pos[0]:+.3f}  {pos[1]:+.3f}  {pos[2]:+.3f}"
+        )
+        self._pl_vel_lbl.setText(
+            f"Velocity:   {spd:.3f}  ({vel[0]:+.2f} {vel[1]:+.2f} {vel[2]:+.2f})"
+        )
+        self._pl_ground_lbl.setText(
+            f"On ground:  {'YES' if _player_state.on_ground else 'NO'}"
+        )
+        self._pl_sdf_lbl.setText(f"SDF raw:    {sdf_str}")
+        self._pl_thresh_lbl.setText(f"Col thresh: {thresh_str}")
+        grav_names = {0: "To Fractal", 1: "To Center", 2: "Down"}
+        gd = _player_state._gravity_dir
+        self._pl_grav_lbl.setText(
+            f"Grav dir:   {grav_names.get(_player_state.GRAVITY_MODE, '?')}"
+            f"  ({gd[0]:+.2f} {gd[1]:+.2f} {gd[2]:+.2f})"
+        )
 
 def run_gl():
     mglw_settings.WINDOW = {
