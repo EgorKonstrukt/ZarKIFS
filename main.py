@@ -13,11 +13,11 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QScrollArea,
     QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QSlider, QRadioButton, QCheckBox, QPushButton,
-    QButtonGroup, QGroupBox, QColorDialog,
+    QButtonGroup, QGroupBox, QColorDialog, QTabWidget,
 )
 from moderngl_window.conf import settings as mglw_settings
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.3.0"
 
 VERT_SHADER = """
 #version 330 core
@@ -54,85 +54,118 @@ uniform int   u_fractal_type;
 uniform float u_bailout;
 uniform float u_min_dist;
 uniform float u_fog_density;
+uniform vec3  u_fog_color;
 uniform vec3  u_color1;
 uniform vec3  u_color2;
 uniform vec3  u_color3;
 uniform int   u_color_mode;
 uniform float u_ao_strength;
+uniform float u_ao_radius;
+uniform int   u_ao_samples;
 uniform float u_shadow_soft;
 uniform int   u_shadows;
 uniform float u_glow;
+uniform float u_de_multiplier;
 uniform vec3  u_cam_pos;
 uniform vec3  u_cam_fwd;
 uniform vec3  u_cam_right;
 uniform vec3  u_cam_up;
+uniform float u_fov;
 uniform int   u_animate;
 uniform float u_anim_speed;
 
-// --- Light ---
-uniform vec3  u_light_dir;        // world-space light direction (default 1,2,1.5 normalized)
-uniform float u_specular_power;   // Blinn-Phong exponent (default 32.0)
-uniform float u_specular_strength;// specular contribution scale (default 0.3)
-uniform float u_ambient;          // ambient light level (default 0.2)
+// --- Orbit trap ---
+uniform int   u_orbit_trap_type;  // 0=sphere, 1=plane-y, 2=cube, 3=torus
+
+// --- Light primary ---
+uniform vec3  u_light_dir;
+uniform float u_specular_power;
+uniform float u_specular_strength;
+uniform float u_ambient;
+uniform float u_subsurface;
+uniform float u_fresnel_power;
+
+// --- Second light ---
+uniform vec3  u_light2_dir;
+uniform vec3  u_light2_color;
+uniform float u_light2_strength;
 
 // --- Color animation ---
-uniform float u_color_anim_speed; // palette time scroll speed (default 0.05)
-uniform float u_color_offset;     // static phase offset added to palette t (default 0.0)
+uniform float u_color_anim_speed;
+uniform float u_color_offset;
 
 // --- Raymarching ---
-uniform float u_step_scale;       // fraction of distance to step (default 0.5)
-uniform float u_normal_eps;       // finite-diff epsilon for normals (default 0.001)
+uniform float u_step_scale;
+uniform float u_normal_eps;
+uniform float u_reflection;
 
 // --- Glow ---
-uniform float u_glow_intensity;   // overall brightness of the halo  (default 5.0)
-uniform float u_glow_falloff;     // how quickly halo falls with distance (default 8.0)
-uniform float u_glow_radius;      // inner "core" brightness boost (default 1.0)
-uniform float u_rim_strength;     // rim-light on surface edges (default 0.4)
-uniform float u_emission;         // self-emission mixed into surface colour (default 0.2)
+uniform float u_glow_intensity;
+uniform float u_glow_falloff;
+uniform float u_glow_radius;
+uniform float u_rim_strength;
+uniform float u_emission;
 
 // --- Background ---
-uniform vec3  u_bg_color1;        // horizon/zenith colour (default deep blue)
-uniform vec3  u_bg_color2;        // nadir colour (default black)
-uniform int   u_bg_mode;          // 0=flat, 1=gradient, 2=nebula, 3=starfield
+uniform vec3  u_bg_color1;
+uniform vec3  u_bg_color2;
+uniform int   u_bg_mode;
 
 // --- Stars ---
-uniform float u_star_density;     // star density 0..1 (default 0.5)
-uniform float u_star_brightness;  // star brightness multiplier (default 1.0)
-uniform float u_star_twinkle;     // twinkle strength 0..1 (default 0.3)
-uniform float u_star_size;        // star size multiplier (default 1.0)
-uniform int   u_milkyway;         // milky way on/off (default 1)
+uniform float u_star_density;
+uniform float u_star_brightness;
+uniform float u_star_twinkle;
+uniform float u_star_size;
+uniform int   u_milkyway;
 
 // --- Anti-aliasing ---
-uniform int   u_aa_samples;       // MSAA sub-pixel count: 1,2,4  (default 1 = off)
+uniform int   u_aa_samples;
+
+// --- DOF ---
+uniform float u_dof_focus;
+uniform float u_dof_blur;
+
+// --- Performance feature flags ---
+uniform int u_feat_ao;           // 0=off 1=on
+uniform int u_feat_shadows;      // 0=off 1=on  (overrides u_shadows)
+uniform int u_feat_normals_full; // 0=3-tap cheap 1=6-tap full
+uniform int u_feat_second_light; // 0=off 1=on
+uniform int u_feat_fog;          // 0=off 1=on
+uniform int u_feat_glow;         // 0=off 1=on
+uniform int u_feat_reflection;   // 0=off 1=on
+uniform int u_feat_subsurface;   // 0=off 1=on
+uniform int u_feat_dof;          // 0=off 1=on
+uniform int u_feat_orbit_trap;   // 0=off (step count only) 1=on
 
 // --- Mandelbox fine-tune ---
-uniform float u_mb_fold_limit;    // box-fold clamp value (default 1.0)
-uniform float u_mb_sphere_inner;  // inner sphere radius^2 (default 0.25)
-uniform float u_mb_sphere_outer;  // outer sphere radius^2 (default 1.0)
-uniform float u_mb_fixed_radius;  // fixed-radius factor for outer fold (default 1.0)
-uniform float u_mb_color_scale;   // orbit trap color scale (default 0.5)
-uniform float u_mb_rot_per_iter;  // Y-rotation added each iteration (default 0.0)
+uniform float u_mb_fold_limit;
+uniform float u_mb_sphere_inner;
+uniform float u_mb_sphere_outer;
+uniform float u_mb_fixed_radius;
+uniform float u_mb_color_scale;
+uniform float u_mb_rot_per_iter;
+uniform int   u_mb_fold_mode;     // 0=clamp, 1=abs, 2=sin
 
 // --- Menger Sponge fine-tune ---
-uniform float u_ms_cross_width;   // cross-gap width (default 2.0, range 1..3)
-uniform float u_ms_scale;         // IFS scale per level (default 3.0, range 2..4)
-uniform float u_ms_offset;        // IFS offset (default 2.0, range 1..3)
-uniform float u_ms_twist;         // per-iteration rotation angle (default 0.0)
-uniform float u_ms_sharpness;     // box corner sharpness 1=sharp 0.5=round (default 1.0)
+uniform float u_ms_cross_width;
+uniform float u_ms_scale;
+uniform float u_ms_offset;
+uniform float u_ms_twist;
+uniform float u_ms_sharpness;
 
 // --- Sierpinski fine-tune ---
-uniform float u_si_vertex_spread; // vertex spread factor (default 1.0)
-uniform float u_si_fold_bias;     // fold distance bias (default 2.0 = classic IFS * 2)
-uniform float u_si_twist;         // twist angle added per iteration (default 0.0)
-uniform float u_si_squash;        // y-axis squash (default 1.0)
-uniform float u_si_vertex_jitter; // random vertex perturbation amount (default 0.0)
+uniform float u_si_vertex_spread;
+uniform float u_si_fold_bias;
+uniform float u_si_twist;
+uniform float u_si_squash;
+uniform float u_si_vertex_jitter;
 
 // --- Octahedron IFS fine-tune ---
-uniform float u_oc_ifs_scale;     // IFS scale (default 2.0)
-uniform float u_oc_twist;         // rotation per iteration (default 0.0)
-uniform float u_oc_sharpness;     // l-norm exponent (2=sphere, 1=octa, default 1.0)
-uniform float u_oc_offset_uni;    // uniform offset multiplier (default 1.0)
-uniform float u_oc_fold_amount;   // extra abs-fold mixing 0..1 (default 0.0)
+uniform float u_oc_ifs_scale;
+uniform float u_oc_twist;
+uniform float u_oc_sharpness;
+uniform float u_oc_offset_uni;
+uniform float u_oc_fold_amount;
 
 #define PI 3.14159265358979323846
 #define MAX_STEPS 200
@@ -161,6 +194,20 @@ float sdTetra(vec3 p, float r) {
     return (md - r) / sqrt(3.0);
 }
 
+float orbitTrap(vec3 p, float s) {
+    if (u_feat_orbit_trap == 0) return dot(p, p) / (s * s);
+    if (u_orbit_trap_type == 0) {
+        return dot(p, p) / (s * s);
+    } else if (u_orbit_trap_type == 1) {
+        return abs(p.y) / (abs(s) + 0.0001);
+    } else if (u_orbit_trap_type == 2) {
+        return max(abs(p.x), max(abs(p.y), abs(p.z))) / (abs(s) + 0.0001);
+    } else {
+        float r = length(p.xz);
+        return length(vec2(r - abs(s) * 0.4, p.y)) / (abs(s) * 0.3 + 0.0001);
+    }
+}
+
 vec2 mandelbox(vec3 pos) {
     vec3 p = pos;
     float trap = 1e10;
@@ -170,7 +217,13 @@ vec2 mandelbox(vec3 pos) {
     float sphOut = u_mb_sphere_outer * u_mb_fixed_radius;
     for (int i = 0; i < u_iterations; i++) {
         if (u_mb_rot_per_iter > 0.0001) p = rotY(u_mb_rot_per_iter * float(i)) * p;
-        p = clamp(p, -foldL, foldL) * 2.0 - p;
+        if (u_mb_fold_mode == 0) {
+            p = clamp(p, -foldL, foldL) * 2.0 - p;
+        } else if (u_mb_fold_mode == 1) {
+            p = abs(p + foldL) - abs(p - foldL) - p;
+        } else {
+            p = sin(p * PI / (2.0 * foldL)) * foldL;
+        }
         float r2 = dot(p, p);
         if (r2 < sphIn) {
             float k = sphOut / sphIn;
@@ -181,10 +234,10 @@ vec2 mandelbox(vec3 pos) {
         }
         p = p * u_scale + vec3(u_julia_x, u_julia_y, u_julia_z);
         dr = dr * abs(u_scale) + 1.0;
-        trap = min(trap, dot(p,p) * u_mb_color_scale);
+        trap = min(trap, orbitTrap(p, u_mb_color_scale));
         if (dot(p,p) > u_bailout * u_bailout) break;
     }
-    return vec2(length(p) / abs(dr), trap);
+    return vec2(length(p) / abs(dr) * u_de_multiplier, trap);
 }
 
 vec2 mengerSponge(vec3 pos) {
@@ -202,7 +255,7 @@ vec2 mengerSponge(vec3 pos) {
         p = p * ms - vec3(mo);
         p.z += mo * clamp(p.z / mo * 0.5 + 0.5, 0.0, 1.0) * u_ms_cross_width;
         s *= ms;
-        trap = min(trap, dot(p, p) / (s * s));
+        trap = min(trap, orbitTrap(p, s));
     }
     vec3 q = abs(p) - vec3(1.0);
     float boxDist;
@@ -213,7 +266,7 @@ vec2 mengerSponge(vec3 pos) {
         vec3 qr = max(q + r, 0.0);
         boxDist = length(qr) - r + min(max(q.x, max(q.y, q.z)), 0.0);
     }
-    return vec2(boxDist / s, trap);
+    return vec2(boxDist / s * u_de_multiplier, trap);
 }
 
 vec2 sierpinski(vec3 pos) {
@@ -245,9 +298,9 @@ vec2 sierpinski(vec3 pos) {
         if (dd < d) { closest = D; }
         p = u_si_fold_bias * p - closest * (u_si_fold_bias - 1.0);
         scale *= u_si_fold_bias;
-        trap = min(trap, dot(p, p) / (scale * scale));
+        trap = min(trap, orbitTrap(p, scale));
     }
-    return vec2(sdTetra(p, scale) / scale, trap);
+    return vec2(sdTetra(p, scale) / scale * u_de_multiplier, trap);
 }
 
 vec2 octahedronIFS(vec3 pos) {
@@ -269,7 +322,7 @@ vec2 octahedronIFS(vec3 pos) {
         if (p.y < p.z) p.yz = p.zy;
         p = IFS_SCALE * p - off * (IFS_SCALE - 1.0);
         s *= IFS_SCALE;
-        trap = min(trap, dot(p, p) / (s * s));
+        trap = min(trap, orbitTrap(p, s));
     }
     float sh = max(u_oc_sharpness, 0.5);
     float r;
@@ -278,7 +331,7 @@ vec2 octahedronIFS(vec3 pos) {
     } else {
         r = pow(pow(abs(p.x), sh) + pow(abs(p.y), sh) + pow(abs(p.z), sh), 1.0/sh) - 1.0;
     }
-    return vec2(r / s, trap);
+    return vec2(r / s * u_de_multiplier, trap);
 }
 
 vec2 sceneDist(vec3 p) {
@@ -292,11 +345,20 @@ vec2 sceneDist(vec3 p) {
 
 vec3 calcNormal(vec3 p) {
     float e = u_normal_eps;
-    return normalize(vec3(
-        sceneDist(p+vec3(e,0,0)).x - sceneDist(p-vec3(e,0,0)).x,
-        sceneDist(p+vec3(0,e,0)).x - sceneDist(p-vec3(0,e,0)).x,
-        sceneDist(p+vec3(0,0,e)).x - sceneDist(p-vec3(0,0,e)).x
-    ));
+    if (u_feat_normals_full == 1) {
+        return normalize(vec3(
+            sceneDist(p+vec3(e,0,0)).x - sceneDist(p-vec3(e,0,0)).x,
+            sceneDist(p+vec3(0,e,0)).x - sceneDist(p-vec3(0,e,0)).x,
+            sceneDist(p+vec3(0,0,e)).x - sceneDist(p-vec3(0,0,e)).x
+        ));
+    } else {
+        float base = sceneDist(p).x;
+        return normalize(vec3(
+            sceneDist(p+vec3(e,0,0)).x - base,
+            sceneDist(p+vec3(0,e,0)).x - base,
+            sceneDist(p+vec3(0,0,e)).x - base
+        ));
+    }
 }
 
 float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k) {
@@ -313,9 +375,12 @@ float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k) {
 }
 
 float ambientOcclusion(vec3 p, vec3 n) {
+    if (u_feat_ao == 0) return 1.0;
     float occ = 0.0, scale = 1.0;
-    for (int i = 0; i < 5; i++) {
-        float h = 0.01 + 0.12 * float(i) / 4.0;
+    int ns = clamp(u_ao_samples, 1, 16);
+    for (int i = 0; i < 16; i++) {
+        if (i >= ns) break;
+        float h = u_ao_radius * 0.1 + u_ao_radius * float(i) / float(ns);
         float d = sceneDist(p + n*h).x;
         occ += (h - d) * scale;
         scale *= 0.95;
@@ -369,52 +434,44 @@ vec2 cubeFaceUV(vec3 rd) {
 }
 
 vec3 starTemperature(float h) {
-    // map hash [0..1] to blackbody-like star colour: blue->white->yellow->orange
-    if (h < 0.15) return vec3(0.6, 0.7, 1.0);   // blue-white (O/B)
-    if (h < 0.40) return vec3(0.9, 0.95, 1.0);  // white (A)
-    if (h < 0.65) return vec3(1.0, 0.97, 0.88); // yellow-white (F/G)
-    if (h < 0.85) return vec3(1.0, 0.85, 0.5);  // yellow-orange (K)
-    return vec3(1.0, 0.55, 0.25);               // orange-red (M)
+    if (h < 0.15) return vec3(0.6, 0.7, 1.0);
+    if (h < 0.40) return vec3(0.9, 0.95, 1.0);
+    if (h < 0.65) return vec3(1.0, 0.97, 0.88);
+    if (h < 0.85) return vec3(1.0, 0.85, 0.5);
+    return vec3(1.0, 0.55, 0.25);
 }
 
-float oneStar(vec2 cuv, float scale, float densityThresh, float seed) {
-    vec2 uv   = cuv * scale + seed;
-    vec2 cell = floor(uv);
-    vec2 loc  = fract(uv) - 0.5;
-    vec2 ji   = hash2(cell + seed) - 0.5;
-    vec2 off  = loc - ji * 0.7;
-    float br  = hash(cell + seed + 3.7);
-    if (br < densityThresh) return 0.0;
-    float r     = length(off);
-    float sharp = mix(180.0, 60.0, br);
-    float core  = exp(-r * r * sharp);
-    float halo  = exp(-r * r * sharp * 0.08) * 0.12;
-    return (core + halo) * (0.4 + br * 1.6);
+vec2 sphericalUV(vec3 rd) {
+    float phi   = atan(rd.z, rd.x);
+    float theta = asin(clamp(rd.y, -1.0, 1.0));
+    return vec2(phi / (2.0 * PI) + 0.5, theta / PI + 0.5);
 }
 
-vec3 starField(vec2 cuv, float t) {
+vec3 starField(vec3 rd, float t) {
+    vec2 suv = sphericalUV(rd);
     vec3 col = vec3(0.0);
-    float layers[4];
+
     float scales[4];
     float thresh[4];
     float seeds[4];
-    layers[0] = 0.0; scales[0] = 18.0; thresh[0] = 0.86; seeds[0] = 0.0;
-    layers[1] = 0.0; scales[1] = 35.0; thresh[1] = 0.80; seeds[1] = 5.3;
-    layers[2] = 0.0; scales[2] = 70.0; thresh[2] = 0.75; seeds[2] = 11.7;
-    layers[3] = 0.0; scales[3] = 130.0; thresh[3] = 0.70; seeds[3] = 23.1;
+    scales[0] = 120.0; thresh[0] = 0.965; seeds[0] = 0.0;
+    scales[1] = 240.0; thresh[1] = 0.960; seeds[1] = 5.3;
+    scales[2] = 480.0; thresh[2] = 0.955; seeds[2] = 11.7;
+    scales[3] = 800.0; thresh[3] = 0.950; seeds[3] = 23.1;
+
     for (int i = 0; i < 4; i++) {
-        vec2 cell = floor(cuv * scales[i] + seeds[i]);
-        vec2 loc  = fract(cuv * scales[i] + seeds[i]) - 0.5;
+        vec2 cell = floor(suv * scales[i] + seeds[i]);
+        vec2 loc  = fract(suv * scales[i] + seeds[i]) - 0.5;
         vec2 ji   = hash2(cell + seeds[i]) - 0.5;
-        vec2 off  = loc - ji * 0.7;
+        vec2 off  = loc - ji * 0.6;
         float br  = hash(cell + seeds[i] + 3.7);
         if (br >= thresh[i]) {
             float r     = length(off);
-            float sharp = mix(160.0, 50.0, br);
+            float sharp = mix(6000.0, 2000.0, br);
             float core  = exp(-r * r * sharp);
-            float halo  = exp(-r * r * sharp * 0.07) * 0.10;
-            float lum   = (core + halo) * (0.3 + br * 1.7);
-            float tw    = 1.0 + 0.08 * sin(t * (2.0 + br * 3.0) + br * 47.3);
+            float halo  = exp(-r * r * sharp * 0.06) * 0.08;
+            float lum   = (core + halo) * (0.5 + br * 1.5);
+            float tw    = 1.0 + 0.06 * sin(t * (2.0 + br * 3.0) + br * 47.3);
             vec3  tint  = starTemperature(hash(cell + seeds[i] + 99.1));
             col += tint * lum * tw;
         }
@@ -422,11 +479,12 @@ vec3 starField(vec2 cuv, float t) {
     return col;
 }
 
-vec3 milkyWay(vec2 cuv) {
-    float band  = fbm(cuv * 0.8 + vec2(3.1, 7.4));
-    float band2 = fbm(cuv * 1.6 + vec2(11.2, 2.9));
+vec3 milkyWay(vec3 rd) {
+    vec2 suv    = sphericalUV(rd);
+    float band  = fbm(suv * 0.8 + vec2(3.1, 7.4));
+    float band2 = fbm(suv * 1.6 + vec2(11.2, 2.9));
     float mw    = smoothstep(0.35, 0.65, band) * smoothstep(0.30, 0.60, band2);
-    float dust  = 1.0 - smoothstep(0.45, 0.55, fbm(cuv * 2.5 + vec2(5.5, 1.1)));
+    float dust  = 1.0 - smoothstep(0.45, 0.55, fbm(suv * 2.5 + vec2(5.5, 1.1)));
     mw *= dust;
     vec3 mwCol  = mix(vec3(0.05, 0.07, 0.15), vec3(0.20, 0.22, 0.35), mw);
     return mwCol * mw * 0.6;
@@ -444,15 +502,16 @@ vec3 background(vec3 rd, float t) {
         return mix(u_bg_color2, u_bg_color1, n) * (0.4 + 0.6 * h);
     }
     vec3 base  = mix(u_bg_color2, u_bg_color1, h * h);
-    vec3 stars = starField(cuv, t);
-    vec3 mw    = milkyWay(cuv);
+    vec3 stars = starField(rd, t);
+    vec3 mw    = milkyWay(rd);
     return base + stars + mw;
 }
 
 // ---- Single ray -------------------------------------------------------
 vec3 castRay(vec2 uv, float t) {
     vec3 ro = u_cam_pos;
-    vec3 rd = normalize(uv.x * u_cam_right + uv.y * u_cam_up + 1.5 * u_cam_fwd);
+    float focalLen = u_fov;
+    vec3 rd = normalize(uv.x * u_cam_right + uv.y * u_cam_up + focalLen * u_cam_fwd);
 
     float totalDist = 0.0;
     float minDist   = 1e10;
@@ -478,19 +537,22 @@ vec3 castRay(vec2 uv, float t) {
         vec3 p   = ro + rd * totalDist;
         vec3 n   = calcNormal(p);
         vec3 lightDir = normalize(u_light_dir);
-        float diff    = max(dot(n, lightDir), 0.0);
-        float spec    = pow(max(dot(reflect(-lightDir, n), -rd), 0.0), u_specular_power);
-        float ao      = ambientOcclusion(p, n);
-        float shadow  = u_shadows == 1 ? softShadow(p, lightDir, 0.02, 10.0, u_shadow_soft) : 1.0;
+
+        float diff   = max(dot(n, lightDir), 0.0);
+        float spec   = pow(max(dot(reflect(-lightDir, n), -rd), 0.0), u_specular_power);
+        float ao     = ambientOcclusion(p, n);
+        float shadow = (u_feat_shadows == 1 && u_shadows == 1)
+                       ? softShadow(p, lightDir, 0.02, 10.0, u_shadow_soft) : 1.0;
 
         float colorParam;
         if (u_color_mode == 0)      colorParam = float(steps) / float(u_iterations * 2);
-        else if (u_color_mode == 1) colorParam = clamp(sqrt(trap) * 0.5, 0.0, 1.0);
+        else if (u_color_mode == 1) colorParam = clamp(sqrt(max(trap, 0.0)) * 0.5, 0.0, 1.0);
         else if (u_color_mode == 2) colorParam = n.x * 0.5 + 0.5;
         else                        colorParam = clamp(totalDist / MAX_DIST, 0.0, 1.0);
 
-        vec3 baseCol  = palette(colorParam + u_color_offset + t * u_color_anim_speed);
-        float rim     = pow(1.0 - max(dot(n, -rd), 0.0), 3.0) * u_rim_strength;
+        vec3 baseCol = palette(colorParam + u_color_offset + t * u_color_anim_speed);
+        float NdotV  = max(dot(n, -rd), 0.0);
+        float rim    = pow(1.0 - NdotV, 3.0) * u_rim_strength;
         float emitStr = u_emission * (1.0 + colorParam);
 
         col  = baseCol * (diff * shadow * (1.0 - u_ambient) + u_ambient) * ao;
@@ -499,32 +561,65 @@ vec3 castRay(vec2 uv, float t) {
         col += palette(colorParam) * rim;
         col += baseCol * u_glow_intensity * 0.04;
 
-        float fog = exp(-totalDist * u_fog_density * 0.1);
-        col = mix(bg, col, fog);
+        if (u_feat_second_light == 1) {
+            vec3 ld2   = normalize(u_light2_dir);
+            float d2   = max(dot(n, ld2), 0.0);
+            float sp2  = pow(max(dot(reflect(-ld2, n), -rd), 0.0), u_specular_power);
+            col += (baseCol * d2 + sp2 * u_specular_strength) * u_light2_color * u_light2_strength;
+        }
+
+        if (u_feat_subsurface == 1) {
+            float sss = u_subsurface * max(-dot(n, lightDir), 0.0) * (0.5 + 0.5 * colorParam);
+            col += baseCol * sss;
+        }
+
+        if (u_feat_reflection == 1) {
+            float fresnelFactor = pow(1.0 - NdotV, max(u_fresnel_power, 0.5));
+            vec3 envRefl = background(reflect(rd, n), t);
+            col = mix(col, envRefl, u_reflection * fresnelFactor);
+            col = mix(col, vec3(dot(col, vec3(0.333))), fresnelFactor * 0.3);
+        }
+
+        if (u_feat_fog == 1) {
+            float fog = exp(-totalDist * u_fog_density * 0.1);
+            vec3 fogC = mix(bg, u_fog_color, clamp(u_fog_density * 0.3, 0.0, 1.0));
+            col = mix(fogC, col, fog);
+        }
+
+        if (u_feat_dof == 1) {
+            float depthDiff = abs(totalDist - u_dof_focus);
+            col = mix(col, bg, clamp(depthDiff * u_dof_blur * 0.05, 0.0, 0.5));
+        }
     } else {
-        float falloff   = max(u_glow_falloff, 0.1);
-        float proximity = pow(1.0 - exp(-1.0 / (minDist * falloff + 0.001)), 2.0);
-        float core      = exp(-minDist * minDist * falloff * falloff * u_glow_radius * 2.0);
-        vec3  glowCol   = palette(float(steps) / float(MAX_STEPS) + t * 0.04);
-        col  = bg;
-        col += glowCol * proximity * u_glow_intensity * 0.25;
-        col += glowCol * core      * u_glow_intensity * 0.55;
+        col = bg;
+        if (u_feat_glow == 1) {
+            float falloff = max(u_glow_falloff, 0.1);
+
+            // Single smooth exponential envelope — no discontinuous pieces
+            float d       = max(minDist, 0.0001);
+            float glow    = exp(-d * falloff * u_glow_radius);
+
+            // Use minDist continuously for color to avoid step-count banding
+            // log(d) maps [near..far] to a smooth continuous range
+            float colorT  = clamp(-log(d * falloff + 0.001) * 0.15, 0.0, 1.0)
+                            + t * 0.04;
+            vec3  glowCol = palette(colorT);
+
+            col += glowCol * glow * u_glow_intensity * 0.8;
+        }
     }
     return col;
 }
 
 void main() {
-    float aspect = u_resolution.x / u_resolution.y;
-    float t      = u_animate == 1 ? u_time * u_anim_speed : 0.0;
+    float aspect  = u_resolution.x / u_resolution.y;
+    float t       = u_animate == 1 ? u_time * u_anim_speed : 0.0;
     vec2  pixSize = vec2(1.0 / u_resolution.x, 1.0 / u_resolution.y);
 
     vec3 col = vec3(0.0);
-
     if (u_aa_samples <= 1) {
-        vec2 uv = vec2(v_uv.x * aspect, v_uv.y);
-        col = castRay(uv, t);
+        col = castRay(vec2(v_uv.x * aspect, v_uv.y), t);
     } else if (u_aa_samples == 2) {
-        // 2x2 rotated-grid
         const vec2 o[4] = vec2[4](vec2(-0.25,-0.25), vec2( 0.25,-0.25),
                                    vec2(-0.25, 0.25), vec2( 0.25, 0.25));
         for (int i = 0; i < 4; i++) {
@@ -534,7 +629,6 @@ void main() {
         }
         col *= 0.25;
     } else {
-        // 3x3 jittered 9-sample
         for (int y = -1; y <= 1; y++) {
             for (int x = -1; x <= 1; x++) {
                 vec2 off = vec2(float(x), float(y)) * 0.33;
@@ -546,7 +640,76 @@ void main() {
         col /= 9.0;
     }
 
-    col = pow(clamp(col, 0.0, 1.0), vec3(0.4545));
+    fragColor = vec4(col, 1.0);
+}
+"""
+
+POST_VERT = """
+#version 330 core
+in vec2 in_position;
+out vec2 v_uv;
+void main() {
+    v_uv = in_position * 0.5 + 0.5;
+    gl_Position = vec4(in_position, 0.0, 1.0);
+}
+"""
+
+POST_FRAG = """
+#version 330 core
+in vec2 v_uv;
+out vec4 fragColor;
+
+uniform sampler2D u_scene;
+uniform vec2  u_resolution;
+uniform float u_gamma;
+uniform float u_exposure;
+uniform float u_saturation;
+uniform float u_vignette;
+uniform float u_chroma_aber;
+uniform float u_bloom_strength;
+uniform float u_bloom_threshold;
+
+void main() {
+    vec2 pixSize = 1.0 / u_resolution;
+    vec2 uv = v_uv;
+
+    vec3 col;
+    if (u_chroma_aber > 0.001) {
+        float ca = u_chroma_aber * 0.003;
+        vec2 dir = (uv - 0.5);
+        col.r = texture(u_scene, uv + dir * ca).r;
+        col.g = texture(u_scene, uv).g;
+        col.b = texture(u_scene, uv - dir * ca).b;
+    } else {
+        col = texture(u_scene, uv).rgb;
+    }
+
+    if (u_bloom_strength > 0.001) {
+        vec3 bloom = vec3(0.0);
+        float wsum = 0.0;
+        for (int bx = -3; bx <= 3; bx++) {
+            for (int by = -3; by <= 3; by++) {
+                vec2 buv = uv + vec2(float(bx), float(by)) * pixSize * 2.0;
+                vec3 s = texture(u_scene, buv).rgb;
+                float lum = dot(s, vec3(0.2126, 0.7152, 0.0722));
+                float w = max(lum - u_bloom_threshold, 0.0);
+                w *= exp(-0.5 * float(bx*bx + by*by));
+                bloom += s * w;
+                wsum  += w + 0.0001;
+            }
+        }
+        col += (bloom / wsum) * u_bloom_strength;
+    }
+
+    col *= u_exposure;
+
+    float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    col = mix(vec3(lum), col, u_saturation);
+
+    vec2 vc = uv - 0.5;
+    col *= clamp(1.0 - u_vignette * dot(vc, vc) * 4.0, 0.0, 1.0);
+
+    col = pow(clamp(col, 0.0, 1.0), vec3(1.0 / max(u_gamma, 0.1)));
     fragColor = vec4(col, 1.0);
 }
 """
@@ -584,57 +747,102 @@ class FractalParams:
         self.cam_pitch    = 0.0
         self.animate      = True
         self.anim_speed   = 2.5
-
+        # --- Mandelbox fine-tune ---
         self.mb_fold_limit    = 1.0
         self.mb_sphere_inner  = 0.25
         self.mb_sphere_outer  = 1.0
         self.mb_fixed_radius  = 1.0
         self.mb_color_scale   = 0.5
         self.mb_rot_per_iter  = 0.0
-
+        self.mb_fold_mode     = 0   # 0=clamp 1=abs 2=sin
+        # --- Menger Sponge fine-tune ---
         self.ms_cross_width   = 1.0
         self.ms_scale         = 3.0
         self.ms_offset        = 2.0
         self.ms_twist         = 0.0
         self.ms_sharpness     = 1.0
-
+        # --- Sierpinski fine-tune ---
         self.si_vertex_spread = 1.0
         self.si_fold_bias     = 2.0
         self.si_twist         = 0.0
         self.si_squash        = 1.0
         self.si_vertex_jitter = 0.0
-
+        # --- Octahedron IFS fine-tune ---
         self.oc_ifs_scale     = 2.0
         self.oc_twist         = 0.0
         self.oc_sharpness     = 1.0
         self.oc_offset_uni    = 1.0
         self.oc_fold_amount   = 0.0
-
+        # --- Orbit trap ---
+        self.orbit_trap_type  = 0   # 0=sphere 1=plane 2=cube 3=torus
+        # --- DE multiplier ---
+        self.de_multiplier    = 1.0
+        # --- Light primary ---
         self.light_x          = 1.0
         self.light_y          = 2.0
         self.light_z          = 1.5
         self.specular_power   = 32.0
         self.specular_strength= 0.3
         self.ambient          = 0.2
-
+        self.subsurface       = 0.0
+        self.fresnel_power    = 5.0
+        # --- Second light ---
+        self.light2_x         = -1.0
+        self.light2_y         = -0.5
+        self.light2_z         = 1.0
+        self.light2_r         = 0.2
+        self.light2_g         = 0.3
+        self.light2_b         = 0.5
+        self.light2_strength  = 0.0
+        # --- Color animation ---
         self.color_anim_speed = 0.05
         self.color_offset     = 0.0
-
+        # --- Raymarching ---
         self.step_scale       = 0.5
         self.normal_eps       = 0.001
-
+        self.reflection       = 0.0
+        # --- FOV ---
+        self.fov              = 1.5
+        # --- AO ---
+        self.ao_radius        = 0.12
+        self.ao_samples       = 5
+        # --- Fog ---
+        self.fog_color        = (0.02, 0.03, 0.08)
+        # --- Post-process ---
+        self.gamma            = 2.2
+        self.exposure         = 1.0
+        self.saturation       = 1.0
+        self.vignette         = 0.0
+        self.chroma_aber      = 0.0
+        self.bloom_strength   = 0.0
+        self.bloom_threshold  = 0.7
+        # --- DOF ---
+        self.dof_focus        = 5.0
+        self.dof_blur         = 0.0
+        # --- Performance feature flags ---
+        self.feat_ao           = True
+        self.feat_shadows      = True
+        self.feat_normals_full = True
+        self.feat_second_light = True
+        self.feat_fog          = True
+        self.feat_glow         = True
+        self.feat_reflection   = True
+        self.feat_subsurface   = True
+        self.feat_dof          = True
+        self.feat_orbit_trap   = True
+        # --- Glow ---
         self.glow_intensity   = 5.0
         self.glow_falloff     = 8.0
         self.glow_radius      = 1.0
         self.rim_strength     = 0.4
         self.emission         = 0.2
-
+        # --- Background ---
         self.bg_color1        = (0.02, 0.03, 0.08)
         self.bg_color2        = (0.0,  0.0,  0.0)
         self.bg_mode          = 1   # 0=flat 1=gradient 2=nebula 3=starfield
-
+        # --- Anti-aliasing ---
         self.aa_samples       = 1   # 1=off 2=4xRGSS 3=9x
-
+        # --- Screenshot ---
         self.screenshot_requested = False
 
 _params = FractalParams()
@@ -644,8 +852,8 @@ INTERP_FLOAT_ATTRS = [
     'offset_x', 'offset_y', 'offset_z',
     'julia_x', 'julia_y', 'julia_z',
     'bailout', 'min_dist', 'fog_density',
-    'ao_strength', 'shadow_soft', 'glow',
-    'anim_speed',
+    'ao_strength', 'ao_radius', 'shadow_soft', 'glow',
+    'anim_speed', 'fov', 'de_multiplier',
     'glow_intensity', 'glow_falloff', 'glow_radius', 'rim_strength', 'emission',
     'mb_fold_limit', 'mb_sphere_inner', 'mb_sphere_outer', 'mb_fixed_radius', 'mb_color_scale',
     'mb_rot_per_iter',
@@ -653,11 +861,15 @@ INTERP_FLOAT_ATTRS = [
     'si_vertex_spread', 'si_fold_bias', 'si_twist', 'si_squash', 'si_vertex_jitter',
     'oc_ifs_scale', 'oc_twist', 'oc_sharpness', 'oc_offset_uni', 'oc_fold_amount',
     'light_x', 'light_y', 'light_z',
-    'specular_power', 'specular_strength', 'ambient',
+    'specular_power', 'specular_strength', 'ambient', 'subsurface', 'fresnel_power',
+    'light2_x', 'light2_y', 'light2_z', 'light2_r', 'light2_g', 'light2_b', 'light2_strength',
     'color_anim_speed', 'color_offset',
-    'step_scale', 'normal_eps',
+    'step_scale', 'normal_eps', 'reflection',
+    'gamma', 'exposure', 'saturation', 'vignette', 'chroma_aber',
+    'bloom_strength', 'bloom_threshold',
+    'dof_focus', 'dof_blur',
 ]
-INTERP_COLOR_ATTRS = ['color1', 'color2', 'color3', 'bg_color1', 'bg_color2']
+INTERP_COLOR_ATTRS = ['color1', 'color2', 'color3', 'bg_color1', 'bg_color2', 'fog_color']
 
 class PresetInterpolator:
     DURATION_MS  = 1200
@@ -728,7 +940,7 @@ _cam_vel   = [0.0, 0.0, 0.0]
 
 class FractalWindow(mglw.WindowConfig):
     title        = "Kaleidoscopic IFS Fractal " + APP_VERSION
-    gl_version   = (4, 6)
+    gl_version   = (3, 3)
     window_size  = (1280, 720)
     aspect_ratio = None
     resizable    = True
@@ -749,8 +961,29 @@ class FractalWindow(mglw.WindowConfig):
         verts = np.array([-1,-1, 1,-1, -1,1, 1,1], dtype='f4')
         vbo = self.ctx.buffer(verts)
         self.vao = self.ctx.simple_vertex_array(self.prog, vbo, 'in_position')
+
+        self.post_prog = self.ctx.program(vertex_shader=POST_VERT,
+                                          fragment_shader=POST_FRAG)
+        self.post_vao  = self.ctx.simple_vertex_array(self.post_prog, vbo, 'in_position')
+
+        w, h = self.wnd.size
+        self._fbo_size = (w, h)
+        self._scene_tex = self.ctx.texture((w, h), 3, dtype='f4')
+        self._scene_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._scene_fbo = self.ctx.framebuffer(color_attachments=[self._scene_tex])
+
         self.start = time.time()
         self._pending_screenshot = False
+
+    def _ensure_fbo(self):
+        w, h = self.wnd.size
+        if (w, h) != self._fbo_size:
+            self._scene_tex.release()
+            self._scene_fbo.release()
+            self._scene_tex = self.ctx.texture((w, h), 3, dtype='f4')
+            self._scene_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self._scene_fbo = self.ctx.framebuffer(color_attachments=[self._scene_tex])
+            self._fbo_size  = (w, h)
     def _set(self, name, val):
         if name in self.prog:
             self.prog[name].value = val
@@ -863,10 +1096,13 @@ class FractalWindow(mglw.WindowConfig):
         _params.cam_pos = [p[i] + _cam_vel[i] * dt for i in range(3)]
     def render(self, t, ft):
         self._update_camera_keys(ft)
+        self._ensure_fbo()
         p = _params
         fwd, right, up = self._calc_basis()
-        self.ctx.clear(0, 0, 0)
         elapsed = time.time() - self.start
+
+        self._scene_fbo.use()
+        self._scene_fbo.clear(0, 0, 0)
         self._set('u_time',         elapsed)
         self._set('u_resolution',   self.wnd.size)
         self._set('u_iterations',   p.iterations)
@@ -901,6 +1137,14 @@ class FractalWindow(mglw.WindowConfig):
         self._set('u_cam_up',       up)
         self._set('u_animate',      1 if p.animate else 0)
         self._set('u_anim_speed',   p.anim_speed)
+        self._set('u_fov',          p.fov)
+        self._set('u_de_multiplier', p.de_multiplier)
+        self._set('u_orbit_trap_type', p.orbit_trap_type)
+        # Fog
+        self._set('u_fog_color',    p.fog_color)
+        # AO
+        self._set('u_ao_radius',    p.ao_radius)
+        self._set('u_ao_samples',   p.ao_samples)
         # Glow
         self._set('u_glow_intensity', p.glow_intensity)
         self._set('u_glow_falloff',   p.glow_falloff)
@@ -920,6 +1164,7 @@ class FractalWindow(mglw.WindowConfig):
         self._set('u_mb_fixed_radius', p.mb_fixed_radius)
         self._set('u_mb_color_scale',  p.mb_color_scale)
         self._set('u_mb_rot_per_iter', p.mb_rot_per_iter)
+        self._set('u_mb_fold_mode',    p.mb_fold_mode)
         # Menger fine-tune
         self._set('u_ms_cross_width',  p.ms_cross_width)
         self._set('u_ms_scale',        p.ms_scale)
@@ -938,20 +1183,59 @@ class FractalWindow(mglw.WindowConfig):
         self._set('u_oc_sharpness',    p.oc_sharpness)
         self._set('u_oc_offset_uni',   p.oc_offset_uni)
         self._set('u_oc_fold_amount',  p.oc_fold_amount)
-        # Light
+        # Light primary
         self._set('u_light_dir',       (p.light_x, p.light_y, p.light_z))
         self._set('u_specular_power',  p.specular_power)
         self._set('u_specular_strength', p.specular_strength)
         self._set('u_ambient',         p.ambient)
+        self._set('u_subsurface',      p.subsurface)
+        self._set('u_fresnel_power',   p.fresnel_power)
+        # Second light
+        self._set('u_light2_dir',      (p.light2_x, p.light2_y, p.light2_z))
+        self._set('u_light2_color',    (p.light2_r, p.light2_g, p.light2_b))
+        self._set('u_light2_strength', p.light2_strength)
         # Color animation
         self._set('u_color_anim_speed', p.color_anim_speed)
         self._set('u_color_offset',    p.color_offset)
         # Raymarching
         self._set('u_step_scale',      p.step_scale)
         self._set('u_normal_eps',      p.normal_eps)
+        self._set('u_reflection',      p.reflection)
+        # DOF
+        self._set('u_dof_focus',       p.dof_focus)
+        self._set('u_dof_blur',        p.dof_blur)
+        # Performance feature flags
+        self._set('u_feat_ao',           1 if p.feat_ao           else 0)
+        self._set('u_feat_shadows',      1 if p.feat_shadows      else 0)
+        self._set('u_feat_normals_full', 1 if p.feat_normals_full else 0)
+        self._set('u_feat_second_light', 1 if p.feat_second_light else 0)
+        self._set('u_feat_fog',          1 if p.feat_fog          else 0)
+        self._set('u_feat_glow',         1 if p.feat_glow         else 0)
+        self._set('u_feat_reflection',   1 if p.feat_reflection   else 0)
+        self._set('u_feat_subsurface',   1 if p.feat_subsurface   else 0)
+        self._set('u_feat_dof',          1 if p.feat_dof          else 0)
+        self._set('u_feat_orbit_trap',   1 if p.feat_orbit_trap   else 0)
         self.vao.render(moderngl.TRIANGLE_STRIP)
 
-        # Screenshot: capture framebuffer after render
+        self.ctx.screen.use()
+        self.ctx.clear(0, 0, 0)
+        self._scene_tex.use(location=0)
+        if 'u_scene' in self.post_prog:
+            self.post_prog['u_scene'].value = 0
+        if 'u_resolution' in self.post_prog:
+            self.post_prog['u_resolution'].value = self.wnd.size
+        def _pset(name, val):
+            if name in self.post_prog:
+                self.post_prog[name].value = val
+        _pset('u_gamma',           p.gamma)
+        _pset('u_exposure',        p.exposure)
+        _pset('u_saturation',      p.saturation)
+        _pset('u_vignette',        p.vignette)
+        _pset('u_chroma_aber',     p.chroma_aber)
+        _pset('u_bloom_strength',  p.bloom_strength)
+        _pset('u_bloom_threshold', p.bloom_threshold)
+        self.post_vao.render(moderngl.TRIANGLE_STRIP)
+
         if self._pending_screenshot or p.screenshot_requested:
             self._pending_screenshot  = False
             p.screenshot_requested    = False
@@ -961,7 +1245,7 @@ class FractalWindow(mglw.WindowConfig):
         try:
             import datetime
             w, h = self.wnd.size
-            data = self.ctx.fbo.read(components=3)
+            data = self.ctx.screen.read(components=3)
             from PIL import Image
             img  = Image.frombytes('RGB', (w, h), data)
             img  = img.transpose(Image.FLIP_TOP_BOTTOM)
@@ -969,7 +1253,6 @@ class FractalWindow(mglw.WindowConfig):
             path = Path(__file__).parent / f'fractal_{ts}.png'
             img.save(str(path))
             print(f'[screenshot] saved → {path}')
-            # notify GUI if callback registered
             if callable(getattr(_params, '_on_screenshot', None)):
                 _params._on_screenshot(str(path))
         except Exception as e:
@@ -1174,26 +1457,43 @@ class ControlGUI(QMainWindow):
         self.setWindowTitle("IFS Parameters")
         self.resize(1020, 860)
         self.setStyleSheet(f"QMainWindow, QWidget {{ background: {COLORS['bg']}; }}")
+        self._feat_sections: dict = {}
         self._build()
         self._cam_timer = QTimer(self)
         self._cam_timer.timeout.connect(self._sync_camera_ui)
         self._cam_timer.start(self.CAM_SYNC_MS)
-    def _build(self):
+    def _register_feat_section(self, feat_attr: str, widget):
+        self._feat_sections.setdefault(feat_attr, []).append(widget)
+        widget.setVisible(getattr(_params, feat_attr, True))
+
+    def _make_scroll_tab(self) -> tuple:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setStyleSheet("QScrollArea { border: none; }")
         container = QWidget()
         container.setStyleSheet(f"background: {COLORS['bg']};")
-        self._vbox = QVBoxLayout(container)
-        self._vbox.setSpacing(4)
-        self._vbox.setContentsMargins(8, 8, 8, 8)
+        vbox = QVBoxLayout(container)
+        vbox.setSpacing(4)
+        vbox.setContentsMargins(8, 8, 8, 8)
+        scroll.setWidget(container)
+        return scroll, vbox
+
+    def _build(self):
+        root = QWidget()
+        root.setStyleSheet(f"background: {COLORS['bg']};")
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(4)
+
         title = _label("KALEIDOSCOPIC IFS", COLORS['accent'], FONT_TITLE)
         title.setAlignment(Qt.AlignCenter)
-        self._vbox.addWidget(title)
+        root_layout.addWidget(title)
+
         sub = _label("Ray-marched fractal renderer", COLORS['fg4'], FONT_SMALL)
         sub.setAlignment(Qt.AlignCenter)
-        self._vbox.addWidget(sub)
+        root_layout.addWidget(sub)
+
         hint_text = (
             "LMB drag -> look   Scroll -> fly fwd/bwd\n"
             "W/S -> fwd/bwd   A/D -> strafe   Q/E -> up/dn\n"
@@ -1204,22 +1504,86 @@ class ControlGUI(QMainWindow):
             f"color: {COLORS['fg2']}; background: {COLORS['bg2']};"
             "padding: 6px 8px; border-radius: 4px;"
         )
-        self._vbox.addWidget(hint)
+        root_layout.addWidget(hint)
+
+        tabs = QTabWidget()
+        tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: 1px solid {COLORS['panel']};
+                background: {COLORS['bg']};
+            }}
+            QTabBar::tab {{
+                background: {COLORS['bg2']};
+                color: {COLORS['fg2']};
+                font: 8pt Consolas;
+                padding: 5px 10px;
+                border: 1px solid {COLORS['panel']};
+                border-bottom: none;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }}
+            QTabBar::tab:selected {{
+                background: {COLORS['panel']};
+                color: {COLORS['accent']};
+            }}
+            QTabBar::tab:hover {{
+                background: {COLORS['panel']};
+            }}
+        """)
+        root_layout.addWidget(tabs, 1)
+
+        tab_fractal, vbox = self._make_scroll_tab()
+        self._vbox = vbox
         self._build_fractal_section()
         self._build_ifs_section()
         self._build_transform_section()
+        self._vbox.addStretch()
+        tabs.addTab(tab_fractal, "Fractal")
+
+        tab_camera, vbox = self._make_scroll_tab()
+        self._vbox = vbox
         self._build_camera_section()
+        self._vbox.addStretch()
+        tabs.addTab(tab_camera, "Camera")
+
+        tab_color, vbox = self._make_scroll_tab()
+        self._vbox = vbox
         self._build_color_section()
         self._build_background_section()
-        self._build_glow_section()
+        self._vbox.addStretch()
+        tabs.addTab(tab_color, "Color / BG")
+
+        tab_light, vbox = self._make_scroll_tab()
+        self._vbox = vbox
         self._build_lighting_section()
         self._build_light_direction_section()
+        self._build_second_light_section()
+        self._build_glow_section()
+        self._vbox.addStretch()
+        tabs.addTab(tab_light, "Lighting")
+
+        tab_render, vbox = self._make_scroll_tab()
+        self._vbox = vbox
         self._build_raymarching_section()
+        self._build_postprocess_section()
         self._build_aa_section()
+        self._vbox.addStretch()
+        tabs.addTab(tab_render, "Rendering")
+
+        tab_perf, vbox = self._make_scroll_tab()
+        self._vbox = vbox
+        self._build_performance_section()
+        self._vbox.addStretch()
+        tabs.addTab(tab_perf, "Performance")
+
+        tab_presets, vbox = self._make_scroll_tab()
+        self._vbox = vbox
         self._build_presets_section()
         self._vbox.addStretch()
-        scroll.setWidget(container)
-        self.setCentralWidget(scroll)
+        tabs.addTab(tab_presets, "Presets")
+
+        self.setCentralWidget(root)
+
     def _add_section(self, widget):
         self._vbox.addWidget(widget)
     def _build_fractal_section(self):
@@ -1261,25 +1625,36 @@ class ControlGUI(QMainWindow):
         _params.iterations = v
         self._iter_val_lbl.setText(str(v))
     def _build_ifs_section(self):
-        # ---- Shared base params (always visible) ----
         base_grp = _section("BASE PARAMETERS")
         base_layout = QVBoxLayout(base_grp)
         base_layout.setSpacing(2)
         for label, attr, mn, mx, val, step in [
-            ("Scale",    'scale',    -3.0, 3.0,  _params.scale,    0.01),
-            ("Bailout",  'bailout',   1.0, 50.0, _params.bailout,   0.1),
-            ("Min Dist", 'min_dist',  0.1, 5.0,  _params.min_dist,  0.1),
+            ("Scale",      'scale',        -3.0, 3.0,  _params.scale,        0.01),
+            ("Bailout",    'bailout',       1.0, 50.0, _params.bailout,       0.1),
+            ("Min Dist",   'min_dist',      0.1, 5.0,  _params.min_dist,      0.1),
+            ("DE Mult",    'de_multiplier', 0.1, 3.0,  _params.de_multiplier, 0.01),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
             setattr(self, f'_sl_{attr}', sr)
             base_layout.addWidget(sr)
+        trap_lbl = _label("Orbit trap shape:", COLORS['fg3'], FONT_SMALL)
+        base_layout.addWidget(trap_lbl)
+        trap_row = QHBoxLayout()
+        self._trap_grp = QButtonGroup(self)
+        for i, name in enumerate(["Sphere", "Plane", "Cube", "Torus"]):
+            rb = QRadioButton(name)
+            rb.setFont(FONT_SMALL)
+            rb.setStyleSheet(_css_radio())
+            rb.setChecked(i == _params.orbit_trap_type)
+            self._trap_grp.addButton(rb, i)
+            trap_row.addWidget(rb)
+        self._trap_grp.idClicked.connect(lambda idx: setattr(_params, 'orbit_trap_type', idx))
+        base_layout.addLayout(trap_row)
         self._add_section(base_grp)
 
-        # ---- Per-fractal panels (only one visible at a time) ----
         self._fractal_panels = {}
 
-        # --- Mandelbox ---
         mb = _section("MANDELBOX FINE-TUNE")
         mb_l = QVBoxLayout(mb)
         mb_l.setSpacing(2)
@@ -1299,6 +1674,19 @@ class ControlGUI(QMainWindow):
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
             setattr(self, f'_sl_{attr}', sr)
             mb_l.addWidget(sr)
+        fold_mode_lbl = _label("Box fold mode:", COLORS['fg3'], FONT_SMALL)
+        mb_l.addWidget(fold_mode_lbl)
+        fold_mode_row = QHBoxLayout()
+        self._fold_mode_grp = QButtonGroup(self)
+        for i, name in enumerate(["Clamp", "Abs", "Sin"]):
+            rb = QRadioButton(name)
+            rb.setFont(FONT_SMALL)
+            rb.setStyleSheet(_css_radio())
+            rb.setChecked(i == _params.mb_fold_mode)
+            self._fold_mode_grp.addButton(rb, i)
+            fold_mode_row.addWidget(rb)
+        self._fold_mode_grp.idClicked.connect(lambda idx: setattr(_params, 'mb_fold_mode', idx))
+        mb_l.addLayout(fold_mode_row)
         folds_lbl = _label("Axis folds:", COLORS['fg3'], FONT_SMALL)
         mb_l.addWidget(folds_lbl)
         folds_row = QHBoxLayout()
@@ -1317,7 +1705,6 @@ class ControlGUI(QMainWindow):
         self._fractal_panels[0] = mb
         self._add_section(mb)
 
-        # --- Menger Sponge ---
         ms = _section("MENGER SPONGE FINE-TUNE")
         ms_l = QVBoxLayout(ms)
         ms_l.setSpacing(2)
@@ -1336,7 +1723,6 @@ class ControlGUI(QMainWindow):
         self._fractal_panels[1] = ms
         self._add_section(ms)
 
-        # --- Sierpinski ---
         si = _section("SIERPINSKI FINE-TUNE")
         si_l = QVBoxLayout(si)
         si_l.setSpacing(2)
@@ -1355,7 +1741,6 @@ class ControlGUI(QMainWindow):
         self._fractal_panels[2] = si
         self._add_section(si)
 
-        # --- Octahedron IFS ---
         oc = _section("OCTAHEDRON IFS FINE-TUNE")
         oc_l = QVBoxLayout(oc)
         oc_l.setSpacing(2)
@@ -1427,6 +1812,9 @@ class ControlGUI(QMainWindow):
         self._sl_anim_speed = SliderRow("Anim Speed", 0.0, 5.0, _params.anim_speed, 0.01)
         self._sl_anim_speed.on_change(lambda v: setattr(_params, 'anim_speed', v))
         layout.addWidget(self._sl_anim_speed)
+        self._sl_fov = SliderRow("FOV", 0.5, 3.0, _params.fov, 0.01)
+        self._sl_fov.on_change(lambda v: setattr(_params, 'fov', v))
+        layout.addWidget(self._sl_fov)
         self._add_section(grp)
     def _reset_camera(self):
         _params.cam_pos   = [0.0, 0.0, 5.0]
@@ -1513,6 +1901,7 @@ class ControlGUI(QMainWindow):
             setattr(self, f'_sl_{attr}', sr)
             layout.addWidget(sr)
         self._add_section(grp)
+        self._register_feat_section('feat_glow', grp)
 
     def _build_background_section(self):
         grp = _section("BACKGROUND")
@@ -1582,24 +1971,84 @@ class ControlGUI(QMainWindow):
         self._ss_status.setText(f"✓ {fname}")
 
     def _build_lighting_section(self):
-        grp = _section("LIGHTING")
+        grp = _section("LIGHTING & FOG")
         layout = QVBoxLayout(grp)
         layout.setSpacing(2)
+
+        ao_grp = _section("AMBIENT OCCLUSION")
+        ao_l = QVBoxLayout(ao_grp)
+        ao_l.setSpacing(2)
         for label, attr, mn, mx, val, step in [
             ("AO Strength", 'ao_strength', 0.0, 30.0, _params.ao_strength, 0.01),
-            ("Shadow Soft", 'shadow_soft', 1.0, 32.0, _params.shadow_soft, 0.5),
-            ("Spec Power",  'glow',        0.0, 10.0, _params.glow,        0.1),
+            ("AO Radius",   'ao_radius',   0.01, 1.0,  _params.ao_radius,   0.005),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
             setattr(self, f'_sl_{attr}', sr)
-            layout.addWidget(sr)
+            ao_l.addWidget(sr)
+        ao_row = QHBoxLayout()
+        ao_lbl = _label("AO samples:", COLORS['fg3'], FONT_SMALL)
+        ao_lbl.setFixedWidth(80)
+        ao_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._ao_samples_grp = QButtonGroup(self)
+        for i, n in enumerate([3, 5, 8, 12]):
+            rb = QRadioButton(str(n))
+            rb.setFont(FONT_SMALL)
+            rb.setStyleSheet(_css_radio())
+            rb.setChecked(n == _params.ao_samples)
+            self._ao_samples_grp.addButton(rb, n)
+            ao_row.addWidget(rb)
+        self._ao_samples_grp.idClicked.connect(lambda idx: setattr(_params, 'ao_samples', idx))
+        ao_row.insertWidget(0, ao_lbl)
+        ao_l.addLayout(ao_row)
+        layout.addWidget(ao_grp)
+        self._register_feat_section('feat_ao', ao_grp)
+
+        shadow_grp = _section("SOFT SHADOWS")
+        shadow_l = QVBoxLayout(shadow_grp)
+        shadow_l.setSpacing(2)
+        sr_shadow = SliderRow("Shadow Soft", 1.0, 32.0, _params.shadow_soft, 0.5)
+        sr_shadow.on_change(lambda v: setattr(_params, 'shadow_soft', v))
+        setattr(self, '_sl_shadow_soft', sr_shadow)
+        shadow_l.addWidget(sr_shadow)
         self._shadows_check = QCheckBox("Soft Shadows")
         self._shadows_check.setFont(FONT_MONO)
         self._shadows_check.setStyleSheet(_css_check())
         self._shadows_check.setChecked(_params.shadows)
         self._shadows_check.stateChanged.connect(lambda s: setattr(_params, 'shadows', bool(s)))
-        layout.addWidget(self._shadows_check)
+        shadow_l.addWidget(self._shadows_check)
+        layout.addWidget(shadow_grp)
+        self._register_feat_section('feat_shadows', shadow_grp)
+
+        fog_grp = _section("FOG")
+        fog_l = QVBoxLayout(fog_grp)
+        fog_l.setSpacing(2)
+        sr_fog_d = SliderRow("Fog Density", 0.0, 5.0, _params.fog_density, 0.01)
+        sr_fog_d.on_change(lambda v: setattr(_params, 'fog_density', v))
+        setattr(self, '_sl_fog_density', sr_fog_d)
+        fog_l.addWidget(sr_fog_d)
+        fog_row = QHBoxLayout()
+        fog_lbl = _label("Fog color:", COLORS['fg3'], FONT_SMALL)
+        self._fog_btn = QPushButton()
+        hex_col = self._rgb_to_hex(_params.fog_color)
+        self._fog_btn.setStyleSheet(
+            f"QPushButton {{ background: {hex_col}; border: none; border-radius: 4px; padding: 4px 8px; }}"
+            f"QPushButton:hover {{ border: 2px solid {COLORS['accent']}; }}"
+        )
+        self._fog_btn.setFixedHeight(24)
+        self._fog_btn.clicked.connect(lambda: self._pick_color('fog_color', self._fog_btn))
+        fog_row.addWidget(fog_lbl)
+        fog_row.addWidget(self._fog_btn)
+        fog_row.addStretch()
+        fog_l.addLayout(fog_row)
+        layout.addWidget(fog_grp)
+        self._register_feat_section('feat_fog', fog_grp)
+
+        sr_glow = SliderRow("Glow", 0.0, 10.0, _params.glow, 0.1)
+        sr_glow.on_change(lambda v: setattr(_params, 'glow', v))
+        setattr(self, '_sl_glow', sr_glow)
+        layout.addWidget(sr_glow)
+
         self._add_section(grp)
     def _build_light_direction_section(self):
         grp = _section("LIGHT & SPECULAR")
@@ -1613,6 +2062,101 @@ class ControlGUI(QMainWindow):
             ("Spec Power", 'specular_power',     1.0, 128.0, _params.specular_power,    0.5),
             ("Spec Str",   'specular_strength',  0.0, 2.0,   _params.specular_strength, 0.01),
             ("Ambient",    'ambient',            0.0, 1.0,   _params.ambient,           0.01),
+            ("Fresnel Pow","fresnel_power",       0.5, 15.0,  _params.fresnel_power,     0.1),
+        ]:
+            sr = SliderRow(label, mn, mx, val, step)
+            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            setattr(self, f'_sl_{attr}', sr)
+            layout.addWidget(sr)
+
+        sss_grp = _section("SUBSURFACE SCATTER")
+        sss_l = QVBoxLayout(sss_grp)
+        sss_l.setSpacing(2)
+        sr_sss = SliderRow("Subsurface", 0.0, 2.0, _params.subsurface, 0.01)
+        sr_sss.on_change(lambda v: setattr(_params, 'subsurface', v))
+        setattr(self, '_sl_subsurface', sr_sss)
+        sss_l.addWidget(sr_sss)
+        layout.addWidget(sss_grp)
+        self._register_feat_section('feat_subsurface', sss_grp)
+
+        self._add_section(grp)
+
+    def _build_raymarching_section(self):
+        grp = _section("RAYMARCHING & COLOR")
+        layout = QVBoxLayout(grp)
+        layout.setSpacing(2)
+        _lbl_hint(layout, "Marching step, normals, reflection, DOF and palette")
+        for label, attr, mn, mx, val, step in [
+            ("Step Scale",   'step_scale',       0.1, 1.0,    _params.step_scale,       0.005),
+            ("Normal Eps",   'normal_eps',       0.0001, 0.01, _params.normal_eps,       0.0001),
+            ("Clr Anim Spd", 'color_anim_speed', 0.0, 0.5,   _params.color_anim_speed, 0.002),
+            ("Clr Offset",   'color_offset',     0.0, 1.0,   _params.color_offset,     0.005),
+        ]:
+            sr = SliderRow(label, mn, mx, val, step)
+            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            setattr(self, f'_sl_{attr}', sr)
+            layout.addWidget(sr)
+
+        refl_grp = _section("REFLECTION")
+        refl_l = QVBoxLayout(refl_grp)
+        refl_l.setSpacing(2)
+        sr_refl = SliderRow("Reflection", 0.0, 1.0, _params.reflection, 0.005)
+        sr_refl.on_change(lambda v: setattr(_params, 'reflection', v))
+        setattr(self, '_sl_reflection', sr_refl)
+        refl_l.addWidget(sr_refl)
+        layout.addWidget(refl_grp)
+        self._register_feat_section('feat_reflection', refl_grp)
+
+        dof_grp = _section("DEPTH OF FIELD")
+        dof_l = QVBoxLayout(dof_grp)
+        dof_l.setSpacing(2)
+        for label, attr, mn, mx, val, step in [
+            ("DOF Focus", 'dof_focus', 0.1, 20.0, _params.dof_focus, 0.1),
+            ("DOF Blur",  'dof_blur',  0.0, 5.0,  _params.dof_blur,  0.01),
+        ]:
+            sr = SliderRow(label, mn, mx, val, step)
+            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            setattr(self, f'_sl_{attr}', sr)
+            dof_l.addWidget(sr)
+        layout.addWidget(dof_grp)
+        self._register_feat_section('feat_dof', dof_grp)
+
+        self._add_section(grp)
+
+    def _build_second_light_section(self):
+        grp = _section("SECOND LIGHT")
+        layout = QVBoxLayout(grp)
+        layout.setSpacing(2)
+        _lbl_hint(layout, "Fill light — set Strength > 0 to activate")
+        for label, attr, mn, mx, val, step in [
+            ("L2 Dir X",   'light2_x',        -5.0, 5.0, _params.light2_x,        0.01),
+            ("L2 Dir Y",   'light2_y',        -5.0, 5.0, _params.light2_y,        0.01),
+            ("L2 Dir Z",   'light2_z',        -5.0, 5.0, _params.light2_z,        0.01),
+            ("L2 Red",     'light2_r',         0.0, 1.0,  _params.light2_r,        0.005),
+            ("L2 Green",   'light2_g',         0.0, 1.0,  _params.light2_g,        0.005),
+            ("L2 Blue",    'light2_b',         0.0, 1.0,  _params.light2_b,        0.005),
+            ("L2 Strength",'light2_strength',  0.0, 3.0,  _params.light2_strength, 0.01),
+        ]:
+            sr = SliderRow(label, mn, mx, val, step)
+            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            setattr(self, f'_sl_{attr}', sr)
+            layout.addWidget(sr)
+        self._add_section(grp)
+        self._register_feat_section('feat_second_light', grp)
+
+    def _build_postprocess_section(self):
+        grp = _section("POST-PROCESS")
+        layout = QVBoxLayout(grp)
+        layout.setSpacing(2)
+        _lbl_hint(layout, "Gamma, exposure, saturation, vignette, chromatic aberration, bloom")
+        for label, attr, mn, mx, val, step in [
+            ("Gamma",        'gamma',           0.5, 4.0, _params.gamma,           0.01),
+            ("Exposure",     'exposure',        0.1, 5.0, _params.exposure,        0.01),
+            ("Saturation",   'saturation',      0.0, 3.0, _params.saturation,      0.01),
+            ("Vignette",     'vignette',        0.0, 2.0, _params.vignette,        0.01),
+            ("Chroma Aber",  'chroma_aber',     0.0, 5.0, _params.chroma_aber,     0.01),
+            ("Bloom Str",    'bloom_strength',  0.0, 3.0, _params.bloom_strength,  0.01),
+            ("Bloom Thresh", 'bloom_threshold', 0.0, 1.0, _params.bloom_threshold, 0.005),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
@@ -1620,22 +2164,111 @@ class ControlGUI(QMainWindow):
             layout.addWidget(sr)
         self._add_section(grp)
 
-    def _build_raymarching_section(self):
-        grp = _section("RAYMARCHING & COLOR")
+    def _build_performance_section(self):
+        grp = _section("PERFORMANCE")
         layout = QVBoxLayout(grp)
-        layout.setSpacing(2)
-        _lbl_hint(layout, "Marching step, normal precision and palette control")
-        for label, attr, mn, mx, val, step in [
-            ("Step Scale",   'step_scale',       0.1, 1.0,  _params.step_scale,       0.005),
-            ("Normal Eps",   'normal_eps',       0.0001, 0.01, _params.normal_eps,     0.0001),
-            ("Clr Anim Spd", 'color_anim_speed', 0.0, 0.5,  _params.color_anim_speed, 0.002),
-            ("Clr Offset",   'color_offset',     0.0, 1.0,  _params.color_offset,     0.005),
-        ]:
-            sr = SliderRow(label, mn, mx, val, step)
-            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
-            setattr(self, f'_sl_{attr}', sr)
-            layout.addWidget(sr)
+        layout.setSpacing(4)
+        _lbl_hint(layout, "Disable expensive features to increase FPS")
+
+        FEATURES = [
+            ('feat_ao',           'Ambient Occlusion',  '~6x sceneDist per pixel'),
+            ('feat_shadows',      'Soft Shadows',       '~32x sceneDist per pixel'),
+            ('feat_normals_full', 'Full Normals (6-tap)','3-tap when off (cheaper)'),
+            ('feat_orbit_trap',   'Orbit Trap Color',   'uses step count when off'),
+            ('feat_second_light', 'Second Light',       'fill light calculation'),
+            ('feat_fog',          'Fog',                'distance-based fog'),
+            ('feat_glow',         'Glow Halo',          'miss-ray glow effect'),
+            ('feat_reflection',   'Env Reflection',     'background env reflection'),
+            ('feat_subsurface',   'Subsurface Scatter', 'translucency effect'),
+            ('feat_dof',          'Depth of Field',     'focus blur effect'),
+        ]
+
+        self._feat_checks = {}
+        for attr, label, hint in FEATURES:
+            row = QHBoxLayout()
+            cb = QCheckBox(label)
+            cb.setFont(FONT_MONO)
+            cb.setStyleSheet(_css_check())
+            cb.setChecked(getattr(_params, attr))
+            cb.stateChanged.connect(lambda s, a=attr: self._on_feat_changed(a, bool(s)))
+            self._feat_checks[attr] = cb
+            hint_lbl = _label(hint, COLORS['fg4'], FONT_SMALL)
+            hint_lbl.setStyleSheet(
+                f"color: {COLORS['fg4']}; background: transparent;"
+                "font-style: italic; padding-left: 4px;"
+            )
+            row.addWidget(cb)
+            row.addWidget(hint_lbl, 1)
+            layout.addLayout(row)
+
+        sep = QLabel()
+        sep.setFixedHeight(6)
+        layout.addWidget(sep)
+
+        preset_lbl = _label("Quality presets:", COLORS['fg3'], FONT_SMALL)
+        layout.addWidget(preset_lbl)
+
+        PERF_PRESETS = {
+            "Ultra":  dict(feat_ao=True,  feat_shadows=True,  feat_normals_full=True,
+                           feat_orbit_trap=True,  feat_second_light=True, feat_fog=True,
+                           feat_glow=True,  feat_reflection=True,  feat_subsurface=True,
+                           feat_dof=True,   aa_samples=2),
+            "High":   dict(feat_ao=True,  feat_shadows=True,  feat_normals_full=True,
+                           feat_orbit_trap=True,  feat_second_light=True, feat_fog=True,
+                           feat_glow=True,  feat_reflection=False, feat_subsurface=False,
+                           feat_dof=False,  aa_samples=1),
+            "Medium": dict(feat_ao=True,  feat_shadows=False, feat_normals_full=True,
+                           feat_orbit_trap=True,  feat_second_light=False, feat_fog=True,
+                           feat_glow=True,  feat_reflection=False, feat_subsurface=False,
+                           feat_dof=False,  aa_samples=1),
+            "Low":    dict(feat_ao=False, feat_shadows=False, feat_normals_full=False,
+                           feat_orbit_trap=False, feat_second_light=False, feat_fog=False,
+                           feat_glow=True,  feat_reflection=False, feat_subsurface=False,
+                           feat_dof=False,  aa_samples=1),
+            "Potato": dict(feat_ao=False, feat_shadows=False, feat_normals_full=False,
+                           feat_orbit_trap=False, feat_second_light=False, feat_fog=False,
+                           feat_glow=False, feat_reflection=False, feat_subsurface=False,
+                           feat_dof=False,  aa_samples=1),
+        }
+
+        btn_row = QHBoxLayout()
+        for name, vals in PERF_PRESETS.items():
+            btn = QPushButton(name)
+            btn.setFont(FONT_SMALL)
+            col_map = {
+                'Ultra': '#4a4a8a', 'High': '#3a6a3a', 'Medium': '#5a5a2a',
+                'Low': '#6a3a1a', 'Potato': '#5a1a1a'
+            }
+            btn.setStyleSheet(
+                f"QPushButton {{ background: {col_map[name]}; color: {COLORS['fg']};"
+                "font: 8pt Consolas; border: none; border-radius: 4px; padding: 4px 6px; }}"
+                f"QPushButton:hover {{ background: {COLORS['accent']}; }}"
+            )
+            btn.clicked.connect(lambda _, v=vals: self._apply_perf_preset(v))
+            btn_row.addWidget(btn)
+        layout.addLayout(btn_row)
+
         self._add_section(grp)
+
+    def _on_feat_changed(self, attr: str, enabled: bool):
+        setattr(_params, attr, enabled)
+        sections = getattr(self, '_feat_sections', {})
+        for widget in sections.get(attr, []):
+            widget.setVisible(enabled)
+
+    def _apply_perf_preset(self, vals: dict):
+        for k, v in vals.items():
+            setattr(_params, k, v)
+        for attr, cb in self._feat_checks.items():
+            cb.blockSignals(True)
+            cb.setChecked(getattr(_params, attr))
+            cb.blockSignals(False)
+        self._aa_grp.button(_params.aa_samples).setChecked(True)
+        sections = getattr(self, '_feat_sections', {})
+        for attr, widgets in sections.items():
+            enabled = getattr(_params, attr, True)
+            for widget in widgets:
+                widget.setVisible(enabled)
 
     def _build_presets_section(self):
         grp = _section("PRESETS")
@@ -1740,6 +2373,7 @@ class ControlGUI(QMainWindow):
                 f"QPushButton:hover {{ border: 2px solid {COLORS['accent']}; }}"
             )
         for attr in [
+            'scale', 'bailout', 'min_dist', 'de_multiplier', 'fov',
             'mb_fold_limit','mb_sphere_inner','mb_sphere_outer','mb_fixed_radius',
             'mb_color_scale','mb_rot_per_iter',
             'julia_x','julia_y','julia_z',
@@ -1748,9 +2382,14 @@ class ControlGUI(QMainWindow):
             'oc_ifs_scale','oc_sharpness','oc_twist','oc_offset_uni','oc_fold_amount',
             'offset_x','offset_y','offset_z',
             'light_x','light_y','light_z',
-            'specular_power','specular_strength','ambient',
+            'specular_power','specular_strength','ambient','subsurface','fresnel_power',
+            'light2_x','light2_y','light2_z','light2_r','light2_g','light2_b','light2_strength',
             'color_anim_speed','color_offset',
-            'step_scale','normal_eps',
+            'step_scale','normal_eps','reflection',
+            'dof_focus','dof_blur',
+            'ao_strength','ao_radius','shadow_soft','fog_density','glow',
+            'gamma','exposure','saturation','vignette','chroma_aber',
+            'bloom_strength','bloom_threshold',
         ]:
             sl = getattr(self, f'_sl_{attr}', None)
             if sl is not None:
@@ -1759,7 +2398,7 @@ class ControlGUI(QMainWindow):
 def run_gl():
     mglw_settings.WINDOW = {
         'class':        'moderngl_window.context.pyglet.Window',
-        'gl_version':   (4, 6),
+        'gl_version':   (3, 3),
         'title':        'Kaleidoscopic IFS Fractal' + APP_VERSION,
         'size':         (1280, 720),
         'aspect_ratio': False,
