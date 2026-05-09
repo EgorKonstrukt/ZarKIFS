@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
 )
 from moderngl_window.conf import settings as mglw_settings
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 
 VERT_SHADER = """
 #version 330 core
@@ -1796,7 +1796,7 @@ class PlayerState:
     GRAVITY_STRENGTH = 1.0
     MOVE_SPEED       = 0.5
     JUMP_SPEED       = 0.6
-    FRICTION         = 19.0
+    FRICTION         = 10.0
     AIR_CONTROL      = 0.13
     SPEED_CAP        = 4.2
     COLLISION_BIAS   = 1.0
@@ -1806,9 +1806,9 @@ class PlayerState:
     _PROBE_STEPS     = 6
     _PUSH_ITERS      = 4
     _GROUND_PROBES   = 5
-    CAM_SPRING_K     = 120.0
-    CAM_DAMPING      = 20.0
-    BOB_FREQ         = 1.8
+    CAM_SPRING_K     = 100.0
+    CAM_DAMPING      = 10.0
+    BOB_FREQ         = 0.0
     BOB_AMP_V        = 0.006
     BOB_AMP_H        = 0.003
     BOB_SPEED_THRESH = 0.05
@@ -4536,15 +4536,15 @@ class ControlGUI(QMainWindow):
 
         PHYS_PRESETS = {
             "Default": dict(GRAVITY_STRENGTH=1.0,  MOVE_SPEED=0.5, JUMP_SPEED=0.6,
-                            FRICTION=19.0, AIR_CONTROL=0.13, SPEED_CAP=4.2,  COLLISION_BIAS=1.0),
+                            FRICTION=10.0, AIR_CONTROL=0.13, SPEED_CAP=4.2,  COLLISION_BIAS=1.0),
             "Moon":    dict(GRAVITY_STRENGTH=0.5,  MOVE_SPEED=0.7, JUMP_SPEED=0.5,
                             FRICTION=5.0,  AIR_CONTROL=0.5,  SPEED_CAP=8.0,  COLLISION_BIAS=1.0),
             "Heavy":   dict(GRAVITY_STRENGTH=4.0,  MOVE_SPEED=2.0, JUMP_SPEED=0.6,
-                            FRICTION=19.0, AIR_CONTROL=0.1,  SPEED_CAP=5.0,  COLLISION_BIAS=1.0),
+                            FRICTION=10.0, AIR_CONTROL=0.1,  SPEED_CAP=5.0,  COLLISION_BIAS=1.0),
             "Floaty":  dict(GRAVITY_STRENGTH=0.5,  MOVE_SPEED=1.0, JUMP_SPEED=0.7,
-                            FRICTION=19.0, AIR_CONTROL=0.9, SPEED_CAP=4.2,  COLLISION_BIAS=1.0),
+                            FRICTION=10.0, AIR_CONTROL=0.9, SPEED_CAP=4.2,  COLLISION_BIAS=1.0),
             "Ice":     dict(GRAVITY_STRENGTH=1.0,  MOVE_SPEED=0.5, JUMP_SPEED=0.6,
-                            FRICTION=5.0, AIR_CONTROL=0.13, SPEED_CAP=4.2,  COLLISION_BIAS=1.0),
+                            FRICTION=3.0, AIR_CONTROL=0.13, SPEED_CAP=4.2,  COLLISION_BIAS=1.0),
         }
 
         btn_row = QHBoxLayout()
