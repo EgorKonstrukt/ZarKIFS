@@ -9,18 +9,29 @@ from pathlib import Path
 import moderngl
 import moderngl_window as mglw
 import numpy as np
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont, QColor, QPalette, QIcon
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
+from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QPainter, QLinearGradient, QBrush, QPen
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QScrollArea,
     QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QSlider, QRadioButton, QCheckBox, QPushButton,
     QButtonGroup, QGroupBox, QColorDialog, QTabWidget,
-    QFileDialog, QInputDialog, QMessageBox,
+    QFileDialog, QInputDialog, QMessageBox, QProgressBar,
+    QSizePolicy,
 )
 from moderngl_window.conf import settings as mglw_settings
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
+
+_compile_event  = threading.Event()
+_compile_error  = [None]
+_ICON_PATH      = Path(__file__).parent / "icon.png"
+
+class _GLSignals(QObject):
+    ready = pyqtSignal()
+    error = pyqtSignal(str)
+_gl_signals = _GLSignals()
+
 
 VERT_SHADER = """
 #version 330 core
@@ -2103,8 +2114,14 @@ class FractalWindow(mglw.WindowConfig):
     SMOOTHING        = 12.0
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.prog = self.ctx.program(vertex_shader=VERT_SHADER,
-                                     fragment_shader=FRAG_SHADER)
+        try:
+            self.prog = self.ctx.program(vertex_shader=VERT_SHADER,
+                                         fragment_shader=FRAG_SHADER)
+        except Exception as _e:
+            _compile_error[0] = str(_e)
+            _compile_event.set()
+            raise
+        _compile_event.set()
         self._uloc = {name: self.prog[name] for name in self.prog}
         verts = np.array([-1,-1, 1,-1, -1,1, 1,1], dtype='f4')
         vbo = self.ctx.buffer(verts)
@@ -2828,6 +2845,122 @@ FONT_TITLE = QFont('Segoe UI', 13)
 FONT_TITLE.setBold(True)
 FONT_BOLD  = QFont('Segoe UI', 9)
 FONT_BOLD.setBold(True)
+
+def _make_icon() -> QIcon:
+    path = _ICON_PATH
+    if path.exists():
+        return QIcon(str(path))
+    pm = QPixmap(64, 64)
+    pm.fill(QColor('#1a1a2e'))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    grad = QLinearGradient(0, 0, 64, 64)
+    grad.setColorAt(0.0, QColor('#7b68ee'))
+    grad.setColorAt(1.0, QColor('#12122a'))
+    p.setBrush(QBrush(grad))
+    p.setPen(Qt.NoPen)
+    p.drawEllipse(8, 8, 48, 48)
+    p.end()
+    return QIcon(pm)
+
+class SplashScreen(QWidget):
+    SPLASH_W = 520
+    SPLASH_H = 300
+    ANIM_MS  = 40
+    def __init__(self):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setFixedSize(self.SPLASH_W, self.SPLASH_H)
+        self.setWindowIcon(_make_icon())
+        self._phase = 0.0
+        self._status = "Initializing OpenGL context..."
+        self._has_error = False
+        self._build_ui()
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._tick)
+        self._anim_timer.start(self.ANIM_MS)
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll_compile)
+        self._poll_timer.start(50)
+        self._center()
+    def _center(self):
+        screen = QApplication.primaryScreen().geometry()
+        self.move((screen.width() - self.SPLASH_W) // 2, (screen.height() - self.SPLASH_H) // 2)
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        inner = QWidget()
+        inner.setStyleSheet(f"background: #12122a; border: 2px solid #7b68ee; border-radius: 12px;")
+        vbox = QVBoxLayout(inner)
+        vbox.setContentsMargins(32, 28, 32, 24)
+        vbox.setSpacing(10)
+        title = QLabel("ZarKIFS")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("color: #7b68ee; font: bold 20pt 'Segoe UI'; background: transparent; border: none;")
+        vbox.addWidget(title)
+        ver = QLabel(f"v{APP_VERSION}  —  Ray-marched fractal renderer")
+        ver.setAlignment(Qt.AlignCenter)
+        ver.setStyleSheet("color: #6060aa; font: 9pt 'Segoe UI'; background: transparent; border: none;")
+        vbox.addWidget(ver)
+        vbox.addSpacing(12)
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 0)
+        self._bar.setFixedHeight(6)
+        self._bar.setTextVisible(False)
+        self._bar.setStyleSheet("""
+            QProgressBar { background: #2d2d5e; border-radius: 3px; border: none; }
+            QProgressBar::chunk { background: #7b68ee; border-radius: 3px; }
+        """)
+        vbox.addWidget(self._bar)
+        self._status_lbl = QLabel(self._status)
+        self._status_lbl.setAlignment(Qt.AlignCenter)
+        self._status_lbl.setWordWrap(True)
+        self._status_lbl.setStyleSheet("color: #aaaacc; font: 9pt 'Segoe UI'; background: transparent; border: none;")
+        vbox.addWidget(self._status_lbl)
+        vbox.addStretch()
+        hint = QLabel("Compiling GLSL shaders, please wait...")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setStyleSheet("color: #6060aa; font: 8pt 'Segoe UI'; background: transparent; border: none;")
+        vbox.addWidget(hint)
+        root.addWidget(inner)
+    def _tick(self):
+        self._phase += 0.05
+        self.update()
+    def _set_status(self, text: str, error: bool = False):
+        self._status = text
+        self._has_error = error
+        color = "#ff6666" if error else "#aaaacc"
+        self._status_lbl.setStyleSheet(f"color: {color}; font: 9pt 'Segoe UI'; background: transparent; border: none;")
+        self._status_lbl.setText(text)
+    def _poll_compile(self):
+        if not _compile_event.is_set():
+            return
+        self._poll_timer.stop()
+        self._anim_timer.stop()
+        err = _compile_error[0]
+        if err:
+            self._bar.setRange(0, 1)
+            self._bar.setValue(0)
+            self._bar.setStyleSheet("""
+                QProgressBar { background: #2d2d5e; border-radius: 3px; border: none; }
+                QProgressBar::chunk { background: #aa3333; border-radius: 3px; }
+            """)
+            self._set_status(f"Shader error:\n{err[:200]}", error=True)
+            QTimer.singleShot(4000, self.close)
+        else:
+            self._bar.setRange(0, 1)
+            self._bar.setValue(1)
+            self._bar.setStyleSheet("""
+                QProgressBar { background: #2d2d5e; border-radius: 3px; border: none; }
+                QProgressBar::chunk { background: #44bb88; border-radius: 3px; }
+            """)
+            self._set_status("Shaders compiled successfully.")
+            QTimer.singleShot(1000, self.close)
+    def close(self):
+        super().close()
+        _gl_signals.ready.emit()
+
 
 def _apply_palette(app: QApplication):
     pass
@@ -4934,11 +5067,21 @@ class ControlGUI(QMainWindow):
             f"  ({gd[0]:+.2f} {gd[1]:+.2f} {gd[2]:+.2f})"
         )
 
+def _set_pyglet_icon(wnd):
+    try:
+        import pyglet
+        icon_path = str(_ICON_PATH)
+        if _ICON_PATH.exists():
+            img = pyglet.image.load(icon_path)
+            wnd.icon = img
+    except Exception:
+        pass
+
 def run_gl():
     mglw_settings.WINDOW = {
         'class':        'moderngl_window.context.pyglet.Window',
         'gl_version':   (3, 3),
-        'title':        'Kaleidoscopic IFS Fractal' + APP_VERSION,
+        'title':        'Kaleidoscopic IFS Fractal ' + APP_VERSION,
         'size':         (1280, 720),
         'aspect_ratio': False,
         'resizable':    True,
@@ -4947,13 +5090,18 @@ def run_gl():
     mglw.run_window_config(FractalWindow)
 
 if __name__ == '__main__':
-    gl_thread = threading.Thread(target=run_gl, daemon=True)
-    gl_thread.start()
-    time.sleep(0.1)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
-    app.setWindowIcon(QIcon(str(Path(__file__).parent / "icon.png")))
+    icon = _make_icon()
+    app.setWindowIcon(icon)
     _apply_palette(app)
-    gui = ControlGUI()
-    gui.show()
+    splash = SplashScreen()
+    splash.show()
+    gl_thread = threading.Thread(target=run_gl, daemon=True)
+    gl_thread.start()
+    def _on_gl_ready():
+        gui = ControlGUI()
+        gui.setWindowIcon(icon)
+        gui.show()
+    _gl_signals.ready.connect(_on_gl_ready)
     sys.exit(app.exec_())
