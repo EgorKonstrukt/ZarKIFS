@@ -1,4 +1,6 @@
+import json
 import math
+import os
 import sys
 import threading
 import time
@@ -14,6 +16,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QSlider, QRadioButton, QCheckBox, QPushButton,
     QButtonGroup, QGroupBox, QColorDialog, QTabWidget,
+    QFileDialog, QInputDialog, QMessageBox,
 )
 from moderngl_window.conf import settings as mglw_settings
 
@@ -328,9 +331,9 @@ vec2 mengerSponge(vec3 pos) {
         if (p.x < p.y) p.xy = p.yx;
         if (p.x < p.z) p.xz = p.zx;
         if (p.y < p.z) p.yz = p.zy;
-        p.x = p.x * ms  - mo;
-        p.y = p.y * sy  - mo;
-        p.z = p.z * sz  - mo;
+        p.x = p.x * ms - mo;
+        p.y = p.y * sy - mo;
+        p.z = p.z * sz - mo;
         p.z += mo * clamp(p.z / mo * 0.5 + 0.5, 0.0, 1.0) * u_ms_cross_width;
         s *= ms;
         trap = min(trap, orbitTrap(p, s));
@@ -450,7 +453,7 @@ vec2 mandelbulb(vec3 pos) {
         }
         trap = min(trap, orbitTrap(p, r));
     }
-    return vec2(0.5 * log(r) * r / dr * u_de_multiplier, trap);
+    return vec2(0.5 * log(max(r, 1e-6)) * r / max(dr, 1e-6) * u_de_multiplier, trap);
 }
 
 vec2 pseudoKleinian(vec3 pos) {
@@ -876,6 +879,110 @@ void main() {
 }
 """
 
+DEBUG_OVERLAY_VERT = """
+#version 330 core
+in vec2 in_position;
+out vec2 v_uv;
+void main() {
+    v_uv = in_position * 0.5 + 0.5;
+    gl_Position = vec4(in_position, 0.0, 1.0);
+}
+"""
+
+DEBUG_OVERLAY_FRAG = """
+#version 330 core
+in vec2 v_uv;
+out vec4 fragColor;
+
+uniform vec2  u_res;
+uniform int   u_on_ground;
+uniform int   u_enabled;
+uniform float u_sdf_val;
+uniform float u_radius;
+uniform float u_gnd_thresh;
+uniform float u_speed;
+
+uniform vec2  u_norm_dir_ss;
+uniform vec2  u_grav_dir_ss;
+uniform float u_col_ring_px;
+uniform float u_gnd_ring_px;
+
+uniform int   u_probe_count;
+uniform vec2  u_probe_ss[32];
+uniform float u_probe_sdf[32];
+uniform float u_probe_radius;
+
+float sdSeg(vec2 p, vec2 a, vec2 b) {
+    vec2 pa = p - a, ba = b - a;
+    return length(pa - ba * clamp(dot(pa,ba)/dot(ba,ba), 0.0, 1.0));
+}
+
+float sdRing(vec2 p, vec2 c, float r) {
+    return abs(length(p - c) - r);
+}
+
+vec4 blend(vec4 dst, vec3 rgb, float a) {
+    return vec4(mix(dst.rgb, rgb, a), 1.0);
+}
+
+void main() {
+    if (u_enabled == 0) { discard; return; }
+
+    vec2 px   = v_uv * u_res;
+    vec2 ctr  = u_res * 0.5;
+    vec4 col  = vec4(0.0);
+
+    float crossR = 7.0;
+    float crossW = 1.8;
+    vec2  dc = abs(px - ctr);
+    if ((dc.x < crossR && dc.y < crossW) || (dc.y < crossR && dc.x < crossW)) {
+        vec3 cc = u_on_ground == 1 ? vec3(0.15, 1.0, 0.25) : vec3(1.0, 0.55, 0.05);
+        col = blend(col, cc, 0.95);
+    }
+
+    if (u_col_ring_px > 2.0) {
+        float dr = sdRing(px, ctr, u_col_ring_px);
+        vec3 rc = u_on_ground == 1 ? vec3(0.2, 1.0, 0.3) : vec3(1.0, 0.45, 0.05);
+        float a = clamp(1.0 - dr / 2.5, 0.0, 1.0);
+        if (dr < 3.5) col = blend(col, rc, a * 0.9);
+    }
+
+    if (u_gnd_ring_px > 2.0) {
+        float dr = sdRing(px, ctr, u_gnd_ring_px);
+        float a = clamp(1.0 - dr / 2.0, 0.0, 1.0) * 0.55;
+        if (dr < 3.0) col = blend(col, vec3(0.25, 0.6, 1.0), a);
+    }
+
+    vec2 normEnd = ctr + u_norm_dir_ss;
+    float dn = sdSeg(px, ctr, normEnd);
+    float an = clamp(1.0 - dn / 2.5, 0.0, 1.0);
+    if (dn < 3.5) col = blend(col, vec3(0.2, 0.85, 1.0), an * 0.92);
+    float dnd = length(px - normEnd);
+    if (dnd < 5.0) col = blend(col, vec3(0.2, 0.85, 1.0), 0.95);
+
+    vec2 gravEnd = ctr + u_grav_dir_ss;
+    float dg = sdSeg(px, ctr, gravEnd);
+    float ag = clamp(1.0 - dg / 2.5, 0.0, 1.0);
+    if (dg < 3.5) col = blend(col, vec3(1.0, 0.25, 0.25), ag * 0.92);
+    float dgd = length(px - gravEnd);
+    if (dgd < 5.0) col = blend(col, vec3(1.0, 0.25, 0.25), 0.95);
+
+    for (int i = 0; i < u_probe_count; i++) {
+        float d = length(px - u_probe_ss[i]);
+        if (d < 4.5) {
+            vec3 pc = u_probe_sdf[i] < u_probe_radius
+                ? vec3(1.0, 0.15, 0.15)
+                : vec3(0.15, 0.95, 0.35);
+            col = blend(col, pc, clamp(1.0 - d / 4.5, 0.0, 1.0) * 0.88);
+        }
+    }
+
+    fragColor = col;
+}
+"""
+
+_debug_overlay_enabled = False
+
 class FractalParams:
     def __init__(self):
         self.iterations   = 8
@@ -907,6 +1014,7 @@ class FractalParams:
         self.cam_pos      = [0.0, 0.0, 5.0]
         self.cam_yaw      = 0.0
         self.cam_pitch    = 0.0
+        self.cam_roll     = 0.0
         self.animate      = True
         self.anim_speed   = 2.5
         # --- Mandelbox fine-tune ---
@@ -1060,6 +1168,98 @@ class FractalParams:
         self.player_mode = False
 
 _params = FractalParams()
+
+_ZKF_VERSION = 1
+_ZKS_VERSION = 1
+_SAVES_DIR = Path(__file__).parent / "saves"
+
+_FRACTAL_FIELDS = [
+    'iterations', 'scale', 'fold_x', 'fold_y', 'fold_z',
+    'rot_x', 'rot_y', 'rot_z', 'offset_x', 'offset_y', 'offset_z',
+    'julia_x', 'julia_y', 'julia_z', 'fractal_type', 'bailout', 'min_dist',
+    'fog_density', 'color1', 'color2', 'color3', 'color_mode',
+    'ao_strength', 'shadow_soft', 'shadows', 'glow', 'animate', 'anim_speed',
+    'mb_fold_limit', 'mb_sphere_inner', 'mb_sphere_outer', 'mb_fixed_radius',
+    'mb_color_scale', 'mb_rot_per_iter', 'mb_fold_mode',
+    'ms_cross_width', 'ms_scale', 'ms_offset', 'ms_twist', 'ms_sharpness',
+    'si_vertex_spread', 'si_fold_bias', 'si_twist', 'si_squash', 'si_vertex_jitter',
+    'oc_ifs_scale', 'oc_twist', 'oc_sharpness', 'oc_offset_uni', 'oc_fold_amount',
+    'oc_offset_x', 'oc_offset_y', 'oc_offset_z', 'oc_rot_x', 'oc_rot_z',
+    'mb2_power', 'mb2_bailout', 'mb2_julia_x', 'mb2_julia_y', 'mb2_julia_z',
+    'mb2_julia_mode', 'mb2_fold_strength', 'mb2_fold_type',
+    'kl_scale', 'kl_cx', 'kl_cy', 'kl_cz', 'kl_fold_limit', 'kl_sph_radius',
+    'kl_rot_per_iter', 'kl_mix_factor',
+    'mb_fold_x', 'mb_fold_y', 'mb_fold_z', 'mb_julia_mode',
+    'ms_rot_x', 'ms_rot_z', 'ms_scale_y', 'ms_scale_z',
+    'si_rot_x', 'si_rot_z',
+    'warp_enabled', 'warp_strength', 'warp_freq', 'warp_type',
+    'twist_axis', 'twist_amount',
+    'fold_mirror_x', 'fold_mirror_y', 'fold_mirror_z',
+    'rep_enabled', 'rep_cell_x', 'rep_cell_y', 'rep_cell_z',
+    'orbit_trap_type', 'de_multiplier',
+    'light_x', 'light_y', 'light_z', 'specular_power', 'specular_strength',
+    'ambient', 'subsurface', 'fresnel_power',
+    'light2_x', 'light2_y', 'light2_z', 'light2_r', 'light2_g', 'light2_b', 'light2_strength',
+    'color_anim_speed', 'color_offset',
+    'step_scale', 'normal_eps', 'reflection', 'max_steps', 'max_dist', 'hit_eps',
+    'shadow_steps', 'shadow_mint', 'shadow_maxt', 'ao_step_scale',
+    'rm_overrelax', 'overrelax_factor', 'fov', 'ao_radius', 'ao_samples',
+    'fog_color', 'gamma', 'exposure', 'saturation',
+    'feat_ao', 'feat_shadows', 'feat_normals_full', 'feat_second_light',
+    'feat_fog', 'feat_glow', 'feat_reflection', 'feat_subsurface', 'feat_orbit_trap',
+    'glow_intensity', 'glow_falloff', 'glow_radius', 'rim_strength', 'emission',
+    'bg_color1', 'bg_color2', 'bg_mode', 'aa_samples',
+]
+_SESSION_EXTRA_FIELDS = ['cam_pos', 'cam_yaw', 'cam_pitch', 'cam_roll', 'player_mode']
+
+def _params_to_dict(fields):
+    out = {}
+    for f in fields:
+        v = getattr(_params, f)
+        if isinstance(v, tuple):
+            v = list(v)
+        elif isinstance(v, list):
+            v = list(v)
+        out[f] = v
+    return out
+
+def _dict_to_params(d):
+    for k, v in d.items():
+        if not hasattr(_params, k):
+            continue
+        cur = getattr(_params, k)
+        if isinstance(cur, tuple):
+            v = tuple(v)
+        setattr(_params, k, v)
+
+def save_zkf(path, name):
+    _SAVES_DIR.mkdir(exist_ok=True)
+    data = {'version': _ZKF_VERSION, 'name': name, 'params': _params_to_dict(_FRACTAL_FIELDS)}
+    Path(path).write_text(json.dumps(data, indent=2), encoding='utf-8')
+
+def load_zkf(path):
+    return json.loads(Path(path).read_text(encoding='utf-8'))
+
+def save_zks(path):
+    fields = _FRACTAL_FIELDS + _SESSION_EXTRA_FIELDS
+    data = {
+        'version': _ZKS_VERSION,
+        'params': _params_to_dict(fields),
+        'player': {
+            'vel': list(_player_state.vel),
+            'on_ground': _player_state.on_ground,
+        },
+    }
+    Path(path).write_text(json.dumps(data, indent=2), encoding='utf-8')
+
+def load_zks(path):
+    data = json.loads(Path(path).read_text(encoding='utf-8'))
+    _dict_to_params(data['params'])
+    ps = data.get('player', {})
+    if 'vel' in ps:
+        _player_state.vel = ps['vel']
+    if 'on_ground' in ps:
+        _player_state.on_ground = ps['on_ground']
 
 INTERP_FLOAT_ATTRS = [
     'scale', 'rot_x', 'rot_y', 'rot_z',
@@ -1299,109 +1499,181 @@ class InfiniteEvolution:
 _infinite_evo = InfiniteEvolution()
 
 
+def _rot_x(px, py, pz, a):
+    c, s = math.cos(a), math.sin(a)
+    return px, c*py - s*pz, s*py + c*pz
+
+def _rot_y(px, py, pz, a):
+    c, s = math.cos(a), math.sin(a)
+    return c*px + s*pz, py, -s*px + c*pz
+
+def _rot_z(px, py, pz, a):
+    c, s = math.cos(a), math.sin(a)
+    return c*px - s*py, s*px + c*py, pz
+
+def _apply_space_ops(px, py, pz):
+    p = _params
+    if p.rep_enabled:
+        if p.rep_cell_x > 0.001:
+            px = px - p.rep_cell_x * round(px / p.rep_cell_x)
+        if p.rep_cell_y > 0.001:
+            py = py - p.rep_cell_y * round(py / p.rep_cell_y)
+        if p.rep_cell_z > 0.001:
+            pz = pz - p.rep_cell_z * round(pz / p.rep_cell_z)
+    if p.fold_mirror_x:
+        px = abs(px)
+    if p.fold_mirror_y:
+        py = abs(py)
+    if p.fold_mirror_z:
+        pz = abs(pz)
+    if p.twist_amount > 0.0001:
+        ta = p.twist_axis
+        if ta == 0:
+            ang = py * p.twist_amount
+            c, s = math.cos(ang), math.sin(ang)
+            px, pz = c*px - s*pz, s*px + c*pz
+        elif ta == 1:
+            ang = px * p.twist_amount
+            c, s = math.cos(ang), math.sin(ang)
+            py, pz = c*py - s*pz, s*py + c*pz
+        else:
+            ang = pz * p.twist_amount
+            c, s = math.cos(ang), math.sin(ang)
+            px, py = c*px - s*py, s*px + c*py
+    if p.warp_enabled:
+        f, st = p.warp_freq, p.warp_strength
+        wt = p.warp_type
+        if wt == 0:
+            px += st * math.sin(f * py)
+            py += st * math.sin(f * pz)
+            pz += st * math.sin(f * px)
+        elif wt == 1:
+            qx = math.sin(f*px + math.sin(f*pz))
+            qy = math.sin(f*py + math.sin(f*px))
+            qz = math.sin(f*pz + math.sin(f*py))
+            px += st * qx; py += st * qy; pz += st * qz
+        else:
+            n = (math.sin(f*px)*math.cos(f*py) +
+                 math.sin(f*py)*math.cos(f*pz) +
+                 math.sin(f*pz)*math.cos(f*px))
+            px += st * n; py += st * n; pz += st * n
+    return px, py, pz
+
 def _py_sdf(pos):
     p = _params
-    px, py, pz = pos
-
-    rx, ry, rz = p.rot_x, p.rot_y, p.rot_z
-    cx, sx = math.cos(rx), math.sin(rx)
-    cy, sy = math.cos(ry), math.sin(ry)
-    cz, sz = math.cos(rz), math.sin(rz)
-    x1 = px
-    y1 = cy * py - sy * pz
-    z1 = sy * py + cy * pz
-    x2 = cz * x1 + sz * y1
-    y2 = -sz * x1 + cz * y1
-    z2 = z1
-    x3 = x2
-    y3 = cx * y2 - sx * z2
-    z3 = sx * y2 + cx * z2
-    ox, oy, oz = x3, y3, z3
-
+    px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
+    px, py, pz = _rot_y(px, py, pz, p.rot_y)
+    px, py, pz = _rot_z(px, py, pz, p.rot_z)
+    px, py, pz = _rot_x(px, py, pz, p.rot_x)
+    px, py, pz = _apply_space_ops(px, py, pz)
     ft = p.fractal_type
-    if ft == 0:
-        return _py_sdf_mandelbox(ox, oy, oz)
-    elif ft == 1:
-        return _py_sdf_menger(ox, oy, oz)
-    elif ft == 2:
-        return _py_sdf_sierpinski(ox, oy, oz)
-    else:
-        return _py_sdf_octa(ox, oy, oz)
+    if ft == 0:   return _py_sdf_mandelbox(px, py, pz)
+    elif ft == 1: return _py_sdf_menger(px, py, pz)
+    elif ft == 2: return _py_sdf_sierpinski(px, py, pz)
+    elif ft == 3: return _py_sdf_octa(px, py, pz)
+    elif ft == 4: return _py_sdf_mandelbulb(px, py, pz)
+    else:         return _py_sdf_kleinian(px, py, pz)
 
 def _py_sdf_mandelbox(ox, oy, oz):
     p = _params
     px, py, pz = ox, oy, oz
     dr = 1.0
-    fl = p.mb_fold_limit
+    fldx = p.mb_fold_x if p.mb_fold_x > 0.001 else p.mb_fold_limit
+    fldy = p.mb_fold_y if p.mb_fold_y > 0.001 else p.mb_fold_limit
+    fldz = p.mb_fold_z if p.mb_fold_z > 0.001 else p.mb_fold_limit
     si = p.mb_sphere_inner
     so = p.mb_sphere_outer * p.mb_fixed_radius
-    for _ in range(p.iterations):
-        px = max(-fl, min(fl, px)) * 2.0 - px
-        py = max(-fl, min(fl, py)) * 2.0 - py
-        pz = max(-fl, min(fl, pz)) * 2.0 - pz
+    for i in range(p.iterations):
+        if p.mb_rot_per_iter > 0.0001:
+            px, py, pz = _rot_y(px, py, pz, p.mb_rot_per_iter * i)
+        if p.mb_fold_mode == 0:
+            px = max(-fldx, min(fldx, px)) * 2.0 - px
+            py = max(-fldy, min(fldy, py)) * 2.0 - py
+            pz = max(-fldz, min(fldz, pz)) * 2.0 - pz
+        elif p.mb_fold_mode == 1:
+            px = abs(px + fldx) - abs(px - fldx) - px
+            py = abs(py + fldy) - abs(py - fldy) - py
+            pz = abs(pz + fldz) - abs(pz - fldz) - pz
+        else:
+            PI = math.pi
+            px = math.sin(px * PI / (2.0 * fldx)) * fldx
+            py = math.sin(py * PI / (2.0 * fldy)) * fldy
+            pz = math.sin(pz * PI / (2.0 * fldz)) * fldz
         r2 = px*px + py*py + pz*pz
         if r2 < si * si:
             k = so / (si * si)
-            px *= k; py *= k; pz *= k
-            dr *= k
+            px *= k; py *= k; pz *= k; dr *= k
         elif r2 < so * so:
             k = so * so / r2
-            px *= k; py *= k; pz *= k
-            dr *= k
-        px = px * p.scale + p.julia_x
-        py = py * p.scale + p.julia_y
-        pz = pz * p.scale + p.julia_z
+            px *= k; py *= k; pz *= k; dr *= k
+        if p.mb_julia_mode == 1:
+            px = px * p.scale + p.julia_x
+            py = py * p.scale + p.julia_y
+            pz = pz * p.scale + p.julia_z
+        else:
+            px = px * p.scale + ox * (1.0 - p.scale) * 0.1
+            py = py * p.scale + oy * (1.0 - p.scale) * 0.1
+            pz = pz * p.scale + oz * (1.0 - p.scale) * 0.1
         dr = dr * abs(p.scale) + 1.0
         if px*px + py*py + pz*pz > p.bailout * p.bailout:
             break
-    length = math.sqrt(px*px + py*py + pz*pz)
-    return length / abs(dr) * p.de_multiplier
+    ln = math.sqrt(px*px + py*py + pz*pz)
+    return ln / max(abs(dr), 1e-9) * p.de_multiplier
 
 def _py_sdf_menger(ox, oy, oz):
     p = _params
     px, py, pz = ox, oy, oz
     s = 1.0
-    ms, mo = p.ms_scale, p.ms_offset
+    ms = p.ms_scale
+    mo = p.ms_offset
+    sy = p.ms_scale_y if p.ms_scale_y > 0.001 else ms
+    sz = p.ms_scale_z if p.ms_scale_z > 0.001 else ms
     for _ in range(p.iterations):
+        if p.ms_twist > 0.001:   px, py, pz = _rot_y(px, py, pz, p.ms_twist)
+        if p.ms_rot_x > 0.001:   px, py, pz = _rot_x(px, py, pz, p.ms_rot_x)
+        if p.ms_rot_z > 0.001:   px, py, pz = _rot_z(px, py, pz, p.ms_rot_z)
         px, py, pz = abs(px), abs(py), abs(pz)
         if px < py: px, py = py, px
         if px < pz: px, pz = pz, px
         if py < pz: py, pz = pz, py
         px = px * ms - mo
-        py = py * ms - mo
-        pz = pz * ms - mo
+        py = py * sy - mo
+        pz = pz * sz - mo
+        pz += mo * max(0.0, min(1.0, pz / mo * 0.5 + 0.5)) * p.ms_cross_width
         s *= ms
     qx, qy, qz = abs(px) - 1.0, abs(py) - 1.0, abs(pz) - 1.0
-    d = math.sqrt(max(qx,0)**2 + max(qy,0)**2 + max(qz,0)**2) + min(max(qx, max(qy, qz)), 0.0)
+    d = (math.sqrt(max(qx,0)**2 + max(qy,0)**2 + max(qz,0)**2)
+         + min(max(qx, max(qy, qz)), 0.0))
     return d / s * p.de_multiplier
 
 def _py_sdf_sierpinski(ox, oy, oz):
     p = _params
     vs = p.si_vertex_spread
-    A = ( vs,  vs,  vs)
-    B = (-vs, -vs,  vs)
-    C = (-vs,  vs, -vs)
-    D = ( vs, -vs, -vs)
+    jt = p.si_vertex_jitter
+    A = ( vs + jt*0.5,  vs - jt*0.5,  vs + jt*0.5)
+    B = (-vs - jt*0.5, -vs + jt*0.5,  vs + jt*0.5)
+    C = (-vs + jt*0.5,  vs + jt*0.5, -vs - jt*0.5)
+    D = ( vs - jt*0.5, -vs - jt*0.5, -vs - jt*0.5)
+    verts = (A, B, C, D)
     px, py, pz = ox, oy * p.si_squash, oz
     scale = 1.0
     fb = p.si_fold_bias
     for _ in range(p.iterations):
-        verts = [A, B, C, D]
-        best = None
-        best_d = 1e18
+        if p.si_twist > 0.001: px, py, pz = _rot_y(px, py, pz, p.si_twist)
+        if p.si_rot_x > 0.001: px, py, pz = _rot_x(px, py, pz, p.si_rot_x)
+        if p.si_rot_z > 0.001: px, py, pz = _rot_z(px, py, pz, p.si_rot_z)
+        best = verts[0]; best_d = 1e18
         for v in verts:
-            dx, dy, dz = px - v[0], py - v[1], pz - v[2]
-            dd = dx*dx + dy*dy + dz*dz
+            dd = (px-v[0])**2 + (py-v[1])**2 + (pz-v[2])**2
             if dd < best_d:
-                best_d = dd
-                best = v
+                best_d = dd; best = v
         px = fb * px - best[0] * (fb - 1.0)
         py = fb * py - best[1] * (fb - 1.0)
         pz = fb * pz - best[2] * (fb - 1.0)
         scale *= fb
     md = max(max(-px-py-pz, px+py-pz), max(-px+py+pz, px-py+pz))
     r = scale * math.sqrt(3.0)
-    return (md - r) / (scale * math.sqrt(3.0)) * p.de_multiplier
+    return (md - r) / max(r, 1e-9) * p.de_multiplier
 
 def _py_sdf_octa(ox, oy, oz):
     p = _params
@@ -1409,9 +1681,20 @@ def _py_sdf_octa(ox, oy, oz):
     s = 1.0
     ifs_s = p.oc_ifs_scale
     off = p.oc_offset_uni
-    ox2, oy2, oz2 = p.offset_x * off, p.offset_y * off, p.offset_z * off
+    ox2 = p.oc_offset_x if p.oc_offset_x > 0.0001 else p.offset_x * off
+    oy2 = p.oc_offset_y if p.oc_offset_y > 0.0001 else p.offset_y * off
+    oz2 = p.oc_offset_z if p.oc_offset_z > 0.0001 else p.offset_z * off
     for _ in range(p.iterations):
-        px, py, pz = abs(px), abs(py), abs(pz)
+        if p.oc_twist > 0.001: px, py, pz = _rot_y(px, py, pz, p.oc_twist)
+        if p.oc_rot_x > 0.001: px, py, pz = _rot_x(px, py, pz, p.oc_rot_x)
+        if p.oc_rot_z > 0.001: px, py, pz = _rot_z(px, py, pz, p.oc_rot_z)
+        if p.oc_fold_amount > 0.001:
+            fa = p.oc_fold_amount
+            px = px + (abs(px) - px) * fa
+            py = py + (abs(py) - py) * fa
+            pz = pz + (abs(pz) - pz) * fa
+        else:
+            px, py, pz = abs(px), abs(py), abs(pz)
         if px < py: px, py = py, px
         if px < pz: px, pz = pz, px
         if py < pz: py, pz = pz, py
@@ -1419,16 +1702,95 @@ def _py_sdf_octa(ox, oy, oz):
         py = ifs_s * py - oy2 * (ifs_s - 1.0)
         pz = ifs_s * pz - oz2 * (ifs_s - 1.0)
         s *= ifs_s
-    r = abs(px) + abs(py) + abs(pz) - 1.0
+    sh = max(p.oc_sharpness, 0.5)
+    if sh < 1.05:
+        r = abs(px) + abs(py) + abs(pz) - 1.0
+    else:
+        r = (abs(px)**sh + abs(py)**sh + abs(pz)**sh)**(1.0/sh) - 1.0
     return r / s * p.de_multiplier
 
+def _py_sdf_mandelbulb(ox, oy, oz):
+    p = _params
+    px, py, pz = ox, oy, oz
+    dr = 1.0
+    r = 0.0
+    pw = max(p.mb2_power, 1.0)
+    bail = p.mb2_bailout
+    for _ in range(p.iterations):
+        r = math.sqrt(px*px + py*py + pz*pz)
+        if r > bail:
+            break
+        theta = math.acos(max(-1.0, min(1.0, pz / max(r, 1e-9))))
+        phi = math.atan2(py, px)
+        dr = r**(pw - 1.0) * pw * dr + 1.0
+        zr = r**pw
+        np_x = zr * math.sin(theta*pw) * math.cos(phi*pw)
+        np_y = zr * math.sin(theta*pw) * math.sin(phi*pw)
+        np_z = zr * math.cos(theta*pw)
+        fs = p.mb2_fold_strength
+        if p.mb2_fold_type == 1 and fs > 0.0:
+            np_x = max(-fs, min(fs, np_x)) * 2.0 - np_x
+            np_y = max(-fs, min(fs, np_y)) * 2.0 - np_y
+            np_z = max(-fs, min(fs, np_z)) * 2.0 - np_z
+        elif p.mb2_fold_type == 2 and fs > 0.0:
+            np_x = abs(np_x + fs) - abs(np_x - fs) - np_x
+            np_y = abs(np_y + fs) - abs(np_y - fs) - np_y
+            np_z = abs(np_z + fs) - abs(np_z - fs) - np_z
+        if p.mb2_julia_mode == 1:
+            px = np_x + p.mb2_julia_x
+            py = np_y + p.mb2_julia_y
+            pz = np_z + p.mb2_julia_z
+        else:
+            px = np_x + ox
+            py = np_y + oy
+            pz = np_z + oz
+    return 0.5 * math.log(max(r, 1e-9)) * r / max(dr, 1e-9) * p.de_multiplier
+
+def _py_sdf_kleinian(ox, oy, oz):
+    p = _params
+    px, py, pz = ox, oy, oz
+    dr = 1.0
+    ksc = p.kl_scale
+    c = (p.kl_cx, p.kl_cy, p.kl_cz)
+    fl = p.kl_fold_limit
+    sr = p.kl_sph_radius
+    for i in range(p.iterations):
+        if p.kl_rot_per_iter > 0.0001:
+            px, py, pz = _rot_y(px, py, pz, p.kl_rot_per_iter * i)
+        px = max(-fl, min(fl, px)) * 2.0 - px
+        py = max(-fl, min(fl, py)) * 2.0 - py
+        pz = max(-fl, min(fl, pz)) * 2.0 - pz
+        r2 = px*px + py*py + pz*pz
+        k = max(sr * sr / max(r2, 1e-9), 1.0)
+        px *= k; py *= k; pz *= k; dr *= k
+        px = px * ksc + c[0]
+        py = py * ksc + c[1]
+        pz = pz * ksc + c[2]
+        dr = dr * abs(ksc) + 1.0
+        if r2 > p.bailout * p.bailout:
+            break
+    ln = math.sqrt(px*px + py*py + pz*pz)
+    d = (ln - abs(ksc - 1.0)) / max(abs(dr), 1e-9)
+    mix = p.kl_mix_factor
+    return (d * (1.0 - mix) + d * 0.5 * mix) * p.de_multiplier
+
+def _py_sdf_normal(pos, eps=None):
+    if eps is None:
+        eps = max(_params.normal_eps * 2.0, 0.003)
+    d1x = _py_sdf((pos[0]+eps, pos[1], pos[2]))
+    d2x = _py_sdf((pos[0]-eps, pos[1], pos[2]))
+    d1y = _py_sdf((pos[0], pos[1]+eps, pos[2]))
+    d2y = _py_sdf((pos[0], pos[1]-eps, pos[2]))
+    d1z = _py_sdf((pos[0], pos[1], pos[2]+eps))
+    d2z = _py_sdf((pos[0], pos[1], pos[2]-eps))
+    nx, ny, nz = d1x - d2x, d1y - d2y, d1z - d2z
+    ln = math.sqrt(nx*nx + ny*ny + nz*nz)
+    if ln < 1e-9:
+        return (0.0, 1.0, 0.0)
+    return (nx/ln, ny/ln, nz/ln)
+
 def _py_sdf_gradient(pos, eps=0.005):
-    d0 = _py_sdf(pos)
-    dx = _py_sdf((pos[0]+eps, pos[1], pos[2])) - d0
-    dy = _py_sdf((pos[0], pos[1]+eps, pos[2])) - d0
-    dz = _py_sdf((pos[0], pos[1], pos[2]+eps)) - d0
-    length = math.sqrt(dx*dx + dy*dy + dz*dz) or 1.0
-    return (dx/length, dy/length, dz/length)
+    return _py_sdf_normal(pos, eps)
 
 class PlayerState:
     GRAVITY_STRENGTH = 1.0
@@ -1441,18 +1803,49 @@ class PlayerState:
     GRAVITY_MODE     = 0
     PLAYER_HEIGHT    = 0.08
     GROUND_DIST      = 0.12
+    _PROBE_STEPS     = 6
+    _PUSH_ITERS      = 4
+    _GROUND_PROBES   = 5
+    CAM_SPRING_K     = 120.0
+    CAM_DAMPING      = 20.0
+    BOB_FREQ         = 1.8
+    BOB_AMP_V        = 0.006
+    BOB_AMP_H        = 0.003
+    BOB_SPEED_THRESH = 0.05
+    NORMAL_SMOOTH    = 6.0
 
     def __init__(self):
-        self.vel = [0.0, 0.0, 0.0]
-        self.on_ground = False
-        self.jump_queued = False
-        self._gravity_dir = (0.0, -1.0, 0.0)
-        self._surface_normal = (0.0, 1.0, 0.0)
+        self.vel              = [0.0, 0.0, 0.0]
+        self.on_ground        = False
+        self.jump_queued      = False
+        self._gravity_dir     = (0.0, -1.0, 0.0)
+        self._surface_normal  = (0.0, 1.0, 0.0)
+        self._sdf_scale_cache = 1.0
+        self._smooth_pos      = None
+        self._smooth_vel      = [0.0, 0.0, 0.0]
+        self._smooth_normal   = [0.0, 1.0, 0.0]
+        self._bob_phase       = 0.0
 
-    def _effective_threshold(self):
-        raw = _params.min_dist * 0.001
-        scale_factor = max(_params.step_scale, 0.1) * max(_params.de_multiplier, 0.01)
-        return max(raw / scale_factor, 0.002) * self.COLLISION_BIAS
+    def _calibrate_sdf_scale(self, pos):
+        eps = 0.2
+        samples = [
+            _py_sdf((pos[0]+eps, pos[1], pos[2])),
+            _py_sdf((pos[0]-eps, pos[1], pos[2])),
+            _py_sdf((pos[0], pos[1]+eps, pos[2])),
+            _py_sdf((pos[0], pos[1]-eps, pos[2])),
+            _py_sdf((pos[0], pos[1], pos[2]+eps)),
+            _py_sdf((pos[0], pos[1], pos[2]-eps)),
+        ]
+        d0 = _py_sdf(pos)
+        gradients = [abs(s - d0) / eps for s in samples]
+        mean_grad = sum(gradients) / len(gradients)
+        return max(mean_grad, 0.01)
+
+    def _effective_radius(self):
+        return max(self.PLAYER_HEIGHT, 0.005) * self.COLLISION_BIAS
+
+    def _ground_threshold(self):
+        return self._effective_radius() + max(self.GROUND_DIST, 0.005)
 
     def _compute_gravity_dir(self, pos, surface_normal):
         mode = self.GRAVITY_MODE
@@ -1467,79 +1860,95 @@ class PlayerState:
         else:
             return (0.0, -1.0, 0.0)
 
-    def update(self, dt):
+    def _push_out(self, pos, radius):
+        for _ in range(self._PUSH_ITERS):
+            d = _py_sdf(pos)
+            if d >= radius:
+                break
+            nx, ny, nz = _py_sdf_normal(pos)
+            push = (radius - d) + 1e-4
+            pos[0] += nx * push
+            pos[1] += ny * push
+            pos[2] += nz * push
+        return pos
+
+    def _is_on_ground(self, pos, gd, radius, gnd_thresh):
+        d = _py_sdf(pos)
+        if d < gnd_thresh:
+            return True
+        probe_dist = gnd_thresh * 0.8
+        for i in range(self._GROUND_PROBES):
+            t = (i + 1) / self._GROUND_PROBES
+            px = pos[0] + gd[0] * probe_dist * t
+            py = pos[1] + gd[1] * probe_dist * t
+            pz = pos[2] + gd[2] * probe_dist * t
+            if _py_sdf((px, py, pz)) < radius:
+                return True
+        return False
+
+    def update(self, dt, spd_mul=1.0):
         if dt <= 0 or dt > 0.1:
             return
         pos = list(_params.cam_pos)
+        radius    = self._effective_radius()
+        gnd_thresh = self._ground_threshold()
 
-        thresh = self._effective_threshold()
-        col_radius = max(self.PLAYER_HEIGHT, thresh)
-        gnd_dist   = max(self.GROUND_DIST, thresh * 1.5)
-
-        d = _py_sdf(pos)
-        gx, gy, gz = _py_sdf_gradient(pos)
-        nlen = math.sqrt(gx*gx + gy*gy + gz*gz)
-        if nlen > 1e-6:
-            gx, gy, gz = gx/nlen, gy/nlen, gz/nlen
-            self._surface_normal = (gx, gy, gz)
-        else:
-            gx, gy, gz = self._surface_normal
-
-        self._gravity_dir = self._compute_gravity_dir(pos, (gx, gy, gz))
+        nx, ny, nz = _py_sdf_normal(pos)
+        self._surface_normal = (nx, ny, nz)
+        self._gravity_dir = self._compute_gravity_dir(pos, (nx, ny, nz))
         gd = self._gravity_dir
 
-        self.on_ground = (d < gnd_dist)
+        self.on_ground = self._is_on_ground(pos, gd, radius, gnd_thresh)
 
         fwd, right, _ = _calc_basis_from_params()
 
-        fwd_proj = [fwd[i] - (fwd[0]*gd[0]+fwd[1]*gd[1]+fwd[2]*gd[2])*gd[i] for i in range(3)]
-        flen = math.sqrt(fwd_proj[0]**2 + fwd_proj[1]**2 + fwd_proj[2]**2)
-        if flen > 1e-6:
-            fwd_proj = [f/flen for f in fwd_proj]
-        else:
-            fwd_proj = list(fwd)
+        def _proj_on_plane(vx, vy, vz, nx_, ny_, nz_):
+            dot = vx*nx_ + vy*ny_ + vz*nz_
+            return vx - dot*nx_, vy - dot*ny_, vz - dot*nz_
 
-        right_proj = [right[i] - (right[0]*gd[0]+right[1]*gd[1]+right[2]*gd[2])*gd[i] for i in range(3)]
-        rlen = math.sqrt(right_proj[0]**2 + right_proj[1]**2 + right_proj[2]**2)
-        if rlen > 1e-6:
-            right_proj = [r/rlen for r in right_proj]
+        fpx, fpy, fpz = _proj_on_plane(fwd[0], fwd[1], fwd[2], gd[0], gd[1], gd[2])
+        flen = math.sqrt(fpx*fpx + fpy*fpy + fpz*fpz)
+        if flen > 1e-6:
+            fpx /= flen; fpy /= flen; fpz /= flen
         else:
-            right_proj = list(right)
+            fpx, fpy, fpz = fwd[0], fwd[1], fwd[2]
+
+        rpx, rpy, rpz = _proj_on_plane(right[0], right[1], right[2], gd[0], gd[1], gd[2])
+        rlen = math.sqrt(rpx*rpx + rpy*rpy + rpz*rpz)
+        if rlen > 1e-6:
+            rpx /= rlen; rpy /= rlen; rpz /= rlen
+        else:
+            rpx, rpy, rpz = right[0], right[1], right[2]
 
         ci = _cam_input
         mvx, mvy, mvz = 0.0, 0.0, 0.0
-        if 'w' in ci.keys_pressed:
-            mvx += fwd_proj[0]; mvy += fwd_proj[1]; mvz += fwd_proj[2]
-        if 's' in ci.keys_pressed:
-            mvx -= fwd_proj[0]; mvy -= fwd_proj[1]; mvz -= fwd_proj[2]
-        if 'a' in ci.keys_pressed:
-            mvx -= right_proj[0]; mvy -= right_proj[1]; mvz -= right_proj[2]
-        if 'd' in ci.keys_pressed:
-            mvx += right_proj[0]; mvy += right_proj[1]; mvz += right_proj[2]
-
+        if 'w' in ci.keys_pressed: mvx += fpx; mvy += fpy; mvz += fpz
+        if 's' in ci.keys_pressed: mvx -= fpx; mvy -= fpy; mvz -= fpz
+        if 'a' in ci.keys_pressed: mvx -= rpx; mvy -= rpy; mvz -= rpz
+        if 'd' in ci.keys_pressed: mvx += rpx; mvy += rpy; mvz += rpz
         mv_len = math.sqrt(mvx*mvx + mvy*mvy + mvz*mvz)
         if mv_len > 1e-6:
             mvx /= mv_len; mvy /= mv_len; mvz /= mv_len
 
+        eff_move_spd = self.MOVE_SPEED * spd_mul
+        eff_speed_cap = self.SPEED_CAP * spd_mul
+
         if self.on_ground:
             vdot = self.vel[0]*gd[0] + self.vel[1]*gd[1] + self.vel[2]*gd[2]
-            if vdot > 0:
+            if vdot > 0.0:
                 self.vel[0] -= gd[0] * vdot
                 self.vel[1] -= gd[1] * vdot
                 self.vel[2] -= gd[2] * vdot
-
             alpha = min(self.FRICTION * dt, 1.0)
             if mv_len > 1e-6:
-                target_vx = mvx * self.MOVE_SPEED
-                target_vy = mvy * self.MOVE_SPEED
-                target_vz = mvz * self.MOVE_SPEED
+                tvx = mvx * eff_move_spd
+                tvy = mvy * eff_move_spd
+                tvz = mvz * eff_move_spd
             else:
-                target_vx = target_vy = target_vz = 0.0
-
-            self.vel[0] += (target_vx - self.vel[0]) * alpha
-            self.vel[1] += (target_vy - self.vel[1]) * alpha
-            self.vel[2] += (target_vz - self.vel[2]) * alpha
-
+                tvx = tvy = tvz = 0.0
+            self.vel[0] += (tvx - self.vel[0]) * alpha
+            self.vel[1] += (tvy - self.vel[1]) * alpha
+            self.vel[2] += (tvz - self.vel[2]) * alpha
             if self.jump_queued:
                 sn = self._surface_normal
                 self.vel[0] += sn[0] * self.JUMP_SPEED
@@ -1549,40 +1958,90 @@ class PlayerState:
             self.vel[0] += gd[0] * self.GRAVITY_STRENGTH * dt
             self.vel[1] += gd[1] * self.GRAVITY_STRENGTH * dt
             self.vel[2] += gd[2] * self.GRAVITY_STRENGTH * dt
-
             if mv_len > 1e-6:
-                self.vel[0] += mvx * self.MOVE_SPEED * self.AIR_CONTROL * dt
-                self.vel[1] += mvy * self.MOVE_SPEED * self.AIR_CONTROL * dt
-                self.vel[2] += mvz * self.MOVE_SPEED * self.AIR_CONTROL * dt
+                ac = eff_move_spd * self.AIR_CONTROL * dt
+                self.vel[0] += mvx * ac
+                self.vel[1] += mvy * ac
+                self.vel[2] += mvz * ac
 
         self.jump_queued = False
 
         spd = math.sqrt(self.vel[0]**2 + self.vel[1]**2 + self.vel[2]**2)
-        if spd > self.SPEED_CAP:
-            self.vel[0] = self.vel[0] / spd * self.SPEED_CAP
-            self.vel[1] = self.vel[1] / spd * self.SPEED_CAP
-            self.vel[2] = self.vel[2] / spd * self.SPEED_CAP
+        if spd > eff_speed_cap:
+            inv = eff_speed_cap / spd
+            self.vel[0] *= inv; self.vel[1] *= inv; self.vel[2] *= inv
 
-        steps = 8
-        sub_dt = dt / steps
-        for _ in range(steps):
-            pos[0] += self.vel[0] * sub_dt
-            pos[1] += self.vel[1] * sub_dt
-            pos[2] += self.vel[2] * sub_dt
-            d2 = _py_sdf(pos)
-            if d2 < col_radius:
-                penetration = col_radius - d2 + thresh * 0.5
-                nx, ny, nz = _py_sdf_gradient(pos)
-                pos[0] += nx * penetration
-                pos[1] += ny * penetration
-                pos[2] += nz * penetration
-                vdot = self.vel[0]*nx + self.vel[1]*ny + self.vel[2]*nz
-                if vdot < 0:
-                    self.vel[0] -= nx * vdot
-                    self.vel[1] -= ny * vdot
-                    self.vel[2] -= nz * vdot
+        n_substeps = self._PROBE_STEPS
+        sub_dt = dt / n_substeps
+        for _ in range(n_substeps):
+            dx = self.vel[0] * sub_dt
+            dy = self.vel[1] * sub_dt
+            dz = self.vel[2] * sub_dt
+            step_len = math.sqrt(dx*dx + dy*dy + dz*dz)
+            if step_len < 1e-9:
+                break
+            sdx, sdy, sdz = dx/step_len, dy/step_len, dz/step_len
+            t = 0.0
+            max_t = step_len
+            for _ in range(64):
+                d = _py_sdf((pos[0]+sdx*t, pos[1]+sdy*t, pos[2]+sdz*t))
+                safe_step = d * 0.85
+                if d < radius:
+                    break
+                t += max(safe_step, 1e-4)
+                if t >= max_t:
+                    t = max_t
+                    break
+            pos[0] += sdx * t
+            pos[1] += sdy * t
+            pos[2] += sdz * t
+            d_final = _py_sdf(pos)
+            if d_final < radius:
+                cn, cy_n, cz_n = _py_sdf_normal(pos)
+                push = (radius - d_final) + 1e-4
+                pos[0] += cn * push
+                pos[1] += cy_n * push
+                pos[2] += cz_n * push
+                vdot = self.vel[0]*cn + self.vel[1]*cy_n + self.vel[2]*cz_n
+                if vdot < 0.0:
+                    self.vel[0] -= cn * vdot
+                    self.vel[1] -= cy_n * vdot
+                    self.vel[2] -= cz_n * vdot
 
         _params.cam_pos = pos
+        sn = self._surface_normal
+        alpha_n = 1.0 - math.exp(-self.NORMAL_SMOOTH * dt)
+        for i in range(3):
+            self._smooth_normal[i] += (sn[i] - self._smooth_normal[i]) * alpha_n
+        nl = math.sqrt(sum(x*x for x in self._smooth_normal)) or 1.0
+        self._smooth_normal = [x / nl for x in self._smooth_normal]
+
+    def get_render_pos(self, dt):
+        phys_pos = _params.cam_pos
+        if self._smooth_pos is None:
+            self._smooth_pos = list(phys_pos)
+        k, d = self.CAM_SPRING_K, self.CAM_DAMPING
+        for i in range(3):
+            diff = phys_pos[i] - self._smooth_pos[i]
+            accel = k * diff - d * self._smooth_vel[i]
+            self._smooth_vel[i] += accel * dt
+            self._smooth_pos[i] += self._smooth_vel[i] * dt
+        spd = math.sqrt(sum(v*v for v in self.vel))
+        is_moving = self.on_ground and spd > self.BOB_SPEED_THRESH
+        if is_moving:
+            self._bob_phase += self.BOB_FREQ * 2.0 * math.pi * dt
+        else:
+            self._bob_phase *= max(0.0, 1.0 - dt * 8.0)
+        spd_t = min(spd / max(self.MOVE_SPEED, 1e-6), 1.0) if is_moving else 0.0
+        bob_v = math.sin(self._bob_phase) * self.BOB_AMP_V * spd_t
+        bob_h = math.sin(self._bob_phase * 0.5) * self.BOB_AMP_H * spd_t
+        sn = self._smooth_normal
+        _, right, _ = _calc_basis_from_params()
+        return [
+            self._smooth_pos[0] + sn[0] * bob_v + right[0] * bob_h,
+            self._smooth_pos[1] + sn[1] * bob_v + right[1] * bob_h,
+            self._smooth_pos[2] + sn[2] * bob_v + right[2] * bob_h,
+        ]
 
 def _calc_basis_from_params():
     yaw, pitch = _params.cam_yaw, _params.cam_pitch
@@ -1646,6 +2105,148 @@ class FractalWindow(mglw.WindowConfig):
 
         self.start = time.time()
         self._pending_screenshot = False
+        self._debug_vbo = vbo
+        self._init_debug_overlay()
+
+    def _init_debug_overlay(self):
+        self._dbg_prog = self.ctx.program(
+            vertex_shader=DEBUG_OVERLAY_VERT,
+            fragment_shader=DEBUG_OVERLAY_FRAG,
+        )
+        self._dbg_vao = self.ctx.simple_vertex_array(
+            self._dbg_prog, self._debug_vbo, 'in_position'
+        )
+        self._dbg_probe_cache = []
+
+    def _dset(self, name, val):
+        if name in self._dbg_prog:
+            self._dbg_prog[name].value = val
+
+    def _build_debug_probes(self, pos, ps):
+        probes = []
+        radius   = ps._effective_radius()
+        gnd_thr  = ps._ground_threshold()
+        gd       = ps._gravity_dir
+        sn       = ps._surface_normal
+        fwd, right, up = _calc_basis_from_params()
+        dirs = [
+            (sn[0], sn[1], sn[2]),
+            (-sn[0], -sn[1], -sn[2]),
+            (gd[0], gd[1], gd[2]),
+            (fwd[0], fwd[1], fwd[2]),
+            (-fwd[0], -fwd[1], -fwd[2]),
+            (right[0], right[1], right[2]),
+            (-right[0], -right[1], -right[2]),
+            (up[0], up[1], up[2]),
+            (-up[0], -up[1], -up[2]),
+        ]
+        diag_scale = radius * 0.85
+        for i in range(len(dirs)):
+            for j in range(i+1, len(dirs)):
+                dx = (dirs[i][0]+dirs[j][0]) * 0.5
+                dy = (dirs[i][1]+dirs[j][1]) * 0.5
+                dz = (dirs[i][2]+dirs[j][2]) * 0.5
+                ln = math.sqrt(dx*dx+dy*dy+dz*dz)
+                if ln > 1e-6:
+                    dirs.append((dx/ln, dy/ln, dz/ln))
+        for d in dirs[:32]:
+            px = pos[0] + d[0] * radius
+            py = pos[1] + d[1] * radius
+            pz = pos[2] + d[2] * radius
+            sdf_v = _py_sdf((px, py, pz))
+            probes.append(((px, py, pz), sdf_v))
+        return probes[:32], radius
+
+    def _render_debug_overlay(self):
+        global _debug_overlay_enabled
+        if not _debug_overlay_enabled or not _params.player_mode:
+            return
+        ps  = _player_state
+        pos = list(_params.cam_pos)
+        fwd, right, up = self._calc_basis()
+        w, h = self.wnd.size
+        cw, ch = w * 0.5, h * 0.5
+        fov   = _params.fov
+        import math as _m
+
+        def _world_to_2d_offset(wx, wy, wz):
+            dx, dy, dz = wx - pos[0], wy - pos[1], wz - pos[2]
+            z = dx*fwd[0] + dy*fwd[1] + dz*fwd[2]
+            if z < 0.001:
+                return None
+            half_tan = _m.tan(fov * 0.5)
+            sx = (dx*right[0] + dy*right[1] + dz*right[2]) / (z * half_tan)
+            sy = (dx*up[0]    + dy*up[1]    + dz*up[2])    / (z * half_tan)
+            return (sx * cw, sy * ch)
+
+        sn   = ps._surface_normal
+        gd   = ps._gravity_dir
+        rad  = ps._effective_radius()
+        gnd  = ps._ground_threshold()
+
+        sn_off = _world_to_2d_offset(
+            pos[0] + sn[0] * rad * 4.0,
+            pos[1] + sn[1] * rad * 4.0,
+            pos[2] + sn[2] * rad * 4.0,
+        )
+        gd_off = _world_to_2d_offset(
+            pos[0] + gd[0] * gnd * 3.0,
+            pos[1] + gd[1] * gnd * 3.0,
+            pos[2] + gd[2] * gnd * 3.0,
+        )
+
+        norm_ss = (float(sn_off[0]), float(sn_off[1])) if sn_off else (0.0, -80.0)
+        grav_ss = (float(gd_off[0]), float(gd_off[1])) if gd_off else (0.0,  80.0)
+
+        sdf_v = float(_py_sdf(pos))
+        ref_z = max(rad, sdf_v) if sdf_v > 0 else rad
+        half_tan = _m.tan(fov * 0.5)
+        col_ring_px = float(rad  / (ref_z * half_tan) * ch) if ref_z > 1e-6 else 0.0
+        gnd_ring_px = float(gnd  / (ref_z * half_tan) * ch) if ref_z > 1e-6 else 0.0
+        col_ring_px = max(0.0, min(col_ring_px, float(min(w, h)) * 0.9))
+        gnd_ring_px = max(0.0, min(gnd_ring_px, float(min(w, h)) * 0.9))
+
+        probes, probe_r = self._build_debug_probes(pos, ps)
+        n_probes = min(len(probes), 32)
+
+        probe_ss_list  = []
+        probe_sdf_list = []
+        for (px2, py2, pz2), sv in probes[:n_probes]:
+            off = _world_to_2d_offset(px2, py2, pz2)
+            if off is not None:
+                probe_ss_list.append((cw + off[0], ch + off[1]))
+            else:
+                probe_ss_list.append((-9999.0, -9999.0))
+            probe_sdf_list.append(float(sv))
+
+        self._dset('u_res',          (float(w), float(h)))
+        self._dset('u_on_ground',    1 if ps.on_ground else 0)
+        self._dset('u_enabled',      1)
+        self._dset('u_sdf_val',      sdf_v)
+        self._dset('u_radius',       float(rad))
+        self._dset('u_gnd_thresh',   float(gnd))
+        self._dset('u_speed',        float(_m.sqrt(sum(v*v for v in ps.vel))))
+        self._dset('u_norm_dir_ss',  norm_ss)
+        self._dset('u_grav_dir_ss',  grav_ss)
+        self._dset('u_col_ring_px',  col_ring_px)
+        self._dset('u_gnd_ring_px',  gnd_ring_px)
+        self._dset('u_probe_count',  n_probes)
+        self._dset('u_probe_radius', float(probe_r))
+
+        for i in range(32):
+            kp = f'u_probe_ss[{i}]'
+            ks = f'u_probe_sdf[{i}]'
+            if i < n_probes:
+                if kp in self._dbg_prog: self._dbg_prog[kp].value = (float(probe_ss_list[i][0]), float(probe_ss_list[i][1]))
+                if ks in self._dbg_prog: self._dbg_prog[ks].value = probe_sdf_list[i]
+            else:
+                if kp in self._dbg_prog: self._dbg_prog[kp].value = (-9999.0, -9999.0)
+                if ks in self._dbg_prog: self._dbg_prog[ks].value = 0.0
+
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        self._dbg_vao.render(moderngl.TRIANGLE_STRIP)
+        self.ctx.disable(moderngl.BLEND)
 
     def _ensure_fbo(self):
         w, h = self.wnd.size
@@ -1656,6 +2257,7 @@ class FractalWindow(mglw.WindowConfig):
             self._scene_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
             self._scene_fbo = self.ctx.framebuffer(color_attachments=[self._scene_tex])
             self._fbo_size  = (w, h)
+
     def _set(self, name, val):
         if name in self.prog:
             self.prog[name].value = val
@@ -1678,24 +2280,43 @@ class FractalWindow(mglw.WindowConfig):
         if 'alt' in _cam_input.keys_pressed:
             return self.ALT_MUL
         return 1.0
+    def _set_mouse_exclusive(self, exclusive: bool):
+        try:
+            pw = getattr(self.wnd, '_window', None)
+            if pw is not None:
+                pw.set_exclusive_mouse(exclusive)
+        except Exception:
+            pass
     def key_event(self, key, action, modifiers):
         from moderngl_window.context.pyglet.keys import Keys
         import pyglet
         km = pyglet.window.key
         PRESS   = self.wnd.keys.ACTION_PRESS
         RELEASE = self.wnd.keys.ACTION_RELEASE
-        if key in (km.LSHIFT, km.RSHIFT):
-            if action == PRESS:   _cam_input.keys_pressed.add('shift')
-            elif action == RELEASE: _cam_input.keys_pressed.discard('shift')
-        if key in (km.LALT, km.RALT):
-            if action == PRESS:   _cam_input.keys_pressed.add('alt')
-            elif action == RELEASE: _cam_input.keys_pressed.discard('alt')
+        mod_keys = {
+            (km.LSHIFT, km.RSHIFT): 'shift',
+            (km.LALT,   km.RALT):   'alt',
+            (km.LCTRL,  km.RCTRL):  'ctrl',
+        }
+        for key_pair, name in mod_keys.items():
+            if key in key_pair:
+                if action == PRESS:   _cam_input.keys_pressed.add(name)
+                elif action == RELEASE: _cam_input.keys_pressed.discard(name)
         if key == km.V and action == PRESS:
             _params.player_mode = not _params.player_mode
             if _params.player_mode:
                 _player_state.vel = [0.0, 0.0, 0.0]
                 _player_state.on_ground = False
                 _player_state.jump_queued = False
+                _player_state._smooth_pos = list(_params.cam_pos)
+                _player_state._smooth_vel = [0.0, 0.0, 0.0]
+                _player_state._smooth_normal = list(_player_state._surface_normal)
+                _player_state._bob_phase  = 0.0
+            self._set_mouse_exclusive(_params.player_mode)
+            return
+        if key == km.F1 and action == PRESS:
+            global _debug_overlay_enabled
+            _debug_overlay_enabled = not _debug_overlay_enabled
             return
         if key == km.SPACE and action == PRESS and _params.player_mode:
             _player_state.jump_queued = True
@@ -1705,6 +2326,12 @@ class FractalWindow(mglw.WindowConfig):
             Keys.A: 'a', Keys.D: 'd',
             Keys.Q: 'q', Keys.E: 'e',
         }
+        try:
+            name_map[km.SPACE]    = 'space'
+            name_map[km.X]        = 'x'
+            name_map[km.RBRACKET] = 'rbracket'
+        except Exception:
+            pass
         k = name_map.get(key)
         if k is None:
             try:
@@ -1712,13 +2339,17 @@ class FractalWindow(mglw.WindowConfig):
                 km2 = pyglet.window.key
                 if key == km2.F12 and action == PRESS:
                     self._pending_screenshot = True
+                if key == km2.SPACE:
+                    k = 'space'
+                if key == km2.X:
+                    k = 'x'
+                if key == km2.RBRACKET:
+                    k = 'rbracket'
             except Exception:
                 pass
-            return
-        if action == PRESS:
-            _cam_input.keys_pressed.add(k)
-        elif action == RELEASE:
-            _cam_input.keys_pressed.discard(k)
+        if k is not None:
+            if action == PRESS:   _cam_input.keys_pressed.add(k)
+            elif action == RELEASE: _cam_input.keys_pressed.discard(k)
     def mouse_press_event(self, x, y, button):
         if button == 1:
             _cam_input.mouse_dragging = True
@@ -1726,7 +2357,15 @@ class FractalWindow(mglw.WindowConfig):
         if button == 1:
             _cam_input.mouse_dragging = False
     def mouse_drag_event(self, x, y, dx, dy):
+        if _params.player_mode:
+            return
         if not _cam_input.mouse_dragging:
+            return
+        _params.cam_yaw   += dx * self.MOUSE_SENS_YAW
+        _params.cam_pitch  = max(-self.PITCH_LIMIT, min(self.PITCH_LIMIT,
+            _params.cam_pitch - dy * self.MOUSE_SENS_PITCH))
+    def mouse_position_event(self, x, y, dx, dy):
+        if not _params.player_mode:
             return
         _params.cam_yaw   += dx * self.MOUSE_SENS_YAW
         _params.cam_pitch  = max(-self.PITCH_LIMIT, min(self.PITCH_LIMIT,
@@ -1738,7 +2377,7 @@ class FractalWindow(mglw.WindowConfig):
         spd = y_offset * self.MOUSE_SCROLL_SPD * mul
         _params.cam_pos = [p[0]+fwd[0]*spd, p[1]+fwd[1]*spd, p[2]+fwd[2]*spd]
     def _calc_basis(self):
-        yaw, pitch = _params.cam_yaw, _params.cam_pitch
+        yaw, pitch, roll = _params.cam_yaw, _params.cam_pitch, _params.cam_roll
         fx =  math.cos(pitch) * math.sin(yaw)
         fy =  math.sin(pitch)
         fz = -math.cos(pitch) * math.cos(yaw)
@@ -1751,13 +2390,24 @@ class FractalWindow(mglw.WindowConfig):
         uz = right[0]*fwd[1] - right[1]*fwd[0]
         ulen = math.sqrt(ux*ux + uy*uy + uz*uz) or 1.0
         up = (ux/ulen, uy/ulen, uz/ulen)
+        if roll != 0.0:
+            cr, sr = math.cos(roll), math.sin(roll)
+            rx2 = right[0]*cr + up[0]*sr
+            ry2 = right[1]*cr + up[1]*sr
+            rz2 = right[2]*cr + up[2]*sr
+            ux2 = -right[0]*sr + up[0]*cr
+            uy2 = -right[1]*sr + up[1]*cr
+            uz2 = -right[2]*sr + up[2]*cr
+            right = (rx2, ry2, rz2)
+            up    = (ux2, uy2, uz2)
         return fwd, right, up
     def _update_camera_keys(self, dt):
         global _cam_vel
-        if _params.player_mode:
-            _player_state.update(dt)
-            return
         ci = _cam_input
+        if _params.player_mode:
+            spd_mul = self.SHIFT_MUL if 'shift' in ci.keys_pressed else (self.ALT_MUL if 'alt' in ci.keys_pressed else 1.0)
+            _player_state.update(dt, spd_mul)
+            return
         mul = self._speed_mul()
         fwd, right, up = self._calc_basis()
         target = [0.0, 0.0, 0.0]
@@ -1770,10 +2420,15 @@ class FractalWindow(mglw.WindowConfig):
             target = [target[i] - right[i] * spd for i in range(3)]
         if 'd' in ci.keys_pressed:
             target = [target[i] + right[i] * spd for i in range(3)]
-        if 'q' in ci.keys_pressed:
-            target = [target[i] - up[i]    * spd for i in range(3)]
-        if 'e' in ci.keys_pressed:
+        if 'space' in ci.keys_pressed:
             target = [target[i] + up[i]    * spd for i in range(3)]
+        if 'ctrl' in ci.keys_pressed:
+            target = [target[i] - up[i]    * spd for i in range(3)]
+        ROLL_SPD = 1.2
+        if 'x' in ci.keys_pressed:
+            _params.cam_roll -= ROLL_SPD * dt * mul
+        if 'rbracket' in ci.keys_pressed:
+            _params.cam_roll += ROLL_SPD * dt * mul
         alpha = 1.0 - math.exp(-self.SMOOTHING * dt)
         _cam_vel = [_cam_vel[i] + (target[i] - _cam_vel[i]) * alpha for i in range(3)]
         p = _params.cam_pos
@@ -1784,6 +2439,12 @@ class FractalWindow(mglw.WindowConfig):
         p = _params
         fwd, right, up = self._calc_basis()
         elapsed = time.time() - self.start
+
+        render_pos = (
+            _player_state.get_render_pos(ft)
+            if p.player_mode
+            else list(p.cam_pos)
+        )
 
         self._scene_fbo.use()
         self._scene_fbo.clear(0, 0, 0)
@@ -1815,7 +2476,7 @@ class FractalWindow(mglw.WindowConfig):
         self._set('u_shadow_soft',  p.shadow_soft)
         self._set('u_shadows',      1 if p.shadows else 0)
         self._set('u_glow',         p.glow)
-        self._set('u_cam_pos',      tuple(p.cam_pos))
+        self._set('u_cam_pos',      tuple(render_pos))
         self._set('u_cam_fwd',      fwd)
         self._set('u_cam_right',    right)
         self._set('u_cam_up',       up)
@@ -1975,6 +2636,8 @@ class FractalWindow(mglw.WindowConfig):
             self._pending_screenshot  = False
             p.screenshot_requested    = False
             self._save_screenshot()
+
+        self._render_debug_overlay()
 
     def _save_screenshot(self):
         try:
@@ -2317,6 +2980,13 @@ class ControlGUI(QMainWindow):
         self._vbox.addStretch()
         tabs.addTab(tab_presets, "Presets")
 
+
+        tab_saves, vbox = self._make_scroll_tab()
+        self._vbox = vbox
+        self._build_saves_section()
+        self._vbox.addStretch()
+        tabs.addTab(tab_saves, "Saves")
+
         tab_player, vbox = self._make_scroll_tab()
         self._vbox = vbox
         self._build_player_section()
@@ -2339,7 +3009,7 @@ class ControlGUI(QMainWindow):
         layout.setSpacing(2)
         self._type_grp = QButtonGroup(self)
         row = QHBoxLayout()
-        for i, name in enumerate(["Mandelbox", "Menger Sponge", "Sierpinski", "Octahedron IFS"]):
+        for i, name in enumerate(["Mandelbox", "Menger Sponge", "Sierpinski", "Octahedron IFS", "Mandelbulb", "Kleinian"]):
             rb = QRadioButton(name)
             rb.setFont(FONT_MONO)
             rb.setStyleSheet(_css_radio())
@@ -2405,11 +3075,14 @@ class ControlGUI(QMainWindow):
         mb = _section("MANDELBOX FINE-TUNE")
         mb_l = QVBoxLayout(mb)
         mb_l.setSpacing(2)
-        _lbl_hint(mb_l, "Box fold & sphere fold radii")
+        _lbl_hint(mb_l, "Box fold per axis, sphere fold radii, Julia mode")
         for label, attr, mn, mx, val, step in [
             ("Fold Limit",    'mb_fold_limit',   0.1, 3.0,  _params.mb_fold_limit,   0.01),
-            ("Sph Inner r²",  'mb_sphere_inner', 0.01,1.0,  _params.mb_sphere_inner, 0.005),
-            ("Sph Outer r²",  'mb_sphere_outer', 0.1, 4.0,  _params.mb_sphere_outer, 0.01),
+            ("Fold X",        'mb_fold_x',       0.0, 3.0,  _params.mb_fold_x,       0.01),
+            ("Fold Y",        'mb_fold_y',       0.0, 3.0,  _params.mb_fold_y,       0.01),
+            ("Fold Z",        'mb_fold_z',       0.0, 3.0,  _params.mb_fold_z,       0.01),
+            ("Sph Inner r²",  'mb_sphere_inner', 0.01,2.0,  _params.mb_sphere_inner, 0.005),
+            ("Sph Outer r²",  'mb_sphere_outer', 0.1, 5.0,  _params.mb_sphere_outer, 0.01),
             ("Fixed Radius",  'mb_fixed_radius', 0.1, 4.0,  _params.mb_fixed_radius, 0.01),
             ("Color Scale",   'mb_color_scale',  0.01,5.0,  _params.mb_color_scale,  0.01),
             ("Rot/Iter",      'mb_rot_per_iter', 0.0, 0.5,  _params.mb_rot_per_iter, 0.002),
@@ -2434,6 +3107,19 @@ class ControlGUI(QMainWindow):
             fold_mode_row.addWidget(rb)
         self._fold_mode_grp.idClicked.connect(lambda idx: setattr(_params, 'mb_fold_mode', idx))
         mb_l.addLayout(fold_mode_row)
+        julia_mode_lbl = _label("Julia mode:", COLORS['fg3'], FONT_SMALL)
+        mb_l.addWidget(julia_mode_lbl)
+        julia_mode_row = QHBoxLayout()
+        self._mb_julia_mode_grp = QButtonGroup(self)
+        for i, name in enumerate(["Orbit (free)", "Fixed Julia"]):
+            rb = QRadioButton(name)
+            rb.setFont(FONT_SMALL)
+            rb.setStyleSheet(_css_radio())
+            rb.setChecked(i == _params.mb_julia_mode)
+            self._mb_julia_mode_grp.addButton(rb, i)
+            julia_mode_row.addWidget(rb)
+        self._mb_julia_mode_grp.idClicked.connect(lambda idx: setattr(_params, 'mb_julia_mode', idx))
+        mb_l.addLayout(julia_mode_row)
         folds_lbl = _label("Axis folds:", COLORS['fg3'], FONT_SMALL)
         mb_l.addWidget(folds_lbl)
         folds_row = QHBoxLayout()
@@ -2455,12 +3141,16 @@ class ControlGUI(QMainWindow):
         ms = _section("MENGER SPONGE FINE-TUNE")
         ms_l = QVBoxLayout(ms)
         ms_l.setSpacing(2)
-        _lbl_hint(ms_l, "IFS scale, cross gap & per-level twist")
+        _lbl_hint(ms_l, "IFS scale per axis, cross gap, twist per axis")
         for label, attr, mn, mx, val, step in [
             ("IFS Scale",    'ms_scale',       2.0, 5.0, _params.ms_scale,       0.01),
+            ("Scale Y",      'ms_scale_y',     0.0, 5.0, _params.ms_scale_y,     0.01),
+            ("Scale Z",      'ms_scale_z',     0.0, 5.0, _params.ms_scale_z,     0.01),
             ("IFS Offset",   'ms_offset',      1.0, 4.0, _params.ms_offset,      0.01),
             ("Cross Width",  'ms_cross_width', 0.0, 4.0, _params.ms_cross_width, 0.01),
-            ("Level Twist",  'ms_twist',       0.0, 0.3, _params.ms_twist,       0.001),
+            ("Twist Y",      'ms_twist',       0.0, 1.3, _params.ms_twist,       0.001),
+            ("Twist X",      'ms_rot_x',       0.0, 1.3, _params.ms_rot_x,       0.001),
+            ("Twist Z",      'ms_rot_z',       0.0, 1.3, _params.ms_rot_z,       0.001),
             ("Edge Sharp",   'ms_sharpness',   0.1, 1.0, _params.ms_sharpness,   0.01),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
@@ -2473,12 +3163,14 @@ class ControlGUI(QMainWindow):
         si = _section("SIERPINSKI FINE-TUNE")
         si_l = QVBoxLayout(si)
         si_l.setSpacing(2)
-        _lbl_hint(si_l, "Vertex spread, fold bias, squash & twist")
+        _lbl_hint(si_l, "Vertex spread, fold bias, squash, twist per axis")
         for label, attr, mn, mx, val, step in [
             ("Vertex Spread", 'si_vertex_spread', 0.2, 3.0, _params.si_vertex_spread, 0.01),
             ("Fold Bias",     'si_fold_bias',      1.2, 4.0, _params.si_fold_bias,     0.01),
             ("Y Squash",      'si_squash',         0.2, 3.0, _params.si_squash,        0.01),
-            ("Level Twist",   'si_twist',          0.0, 0.3, _params.si_twist,         0.001),
+            ("Twist Y",       'si_twist',          0.0, 1.3, _params.si_twist,         0.001),
+            ("Twist X",       'si_rot_x',          0.0, 1.3, _params.si_rot_x,         0.001),
+            ("Twist Z",       'si_rot_z',          0.0, 1.3, _params.si_rot_z,         0.001),
             ("Vtx Jitter",    'si_vertex_jitter',  0.0, 1.0, _params.si_vertex_jitter, 0.005),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
@@ -2491,16 +3183,18 @@ class ControlGUI(QMainWindow):
         oc = _section("OCTAHEDRON IFS FINE-TUNE")
         oc_l = QVBoxLayout(oc)
         oc_l.setSpacing(2)
-        _lbl_hint(oc_l, "IFS scale, offset, norm sharpness & twist")
+        _lbl_hint(oc_l, "IFS scale, per-axis offset, rotation per axis, norm sharpness")
         for label, attr, mn, mx, val, step in [
-            ("IFS Scale",     'oc_ifs_scale',  1.2, 4.0, _params.oc_ifs_scale,  0.01),
-            ("Offset X",      'offset_x',      0.1, 4.0, _params.offset_x,      0.01),
-            ("Offset Y",      'offset_y',      0.1, 4.0, _params.offset_y,      0.01),
-            ("Offset Z",      'offset_z',      0.1, 4.0, _params.offset_z,      0.01),
-            ("Offset Uni",    'oc_offset_uni', 0.1, 3.0, _params.oc_offset_uni, 0.01),
-            ("Norm Sharp",    'oc_sharpness',  0.5, 4.0, _params.oc_sharpness,  0.05),
-            ("Level Twist",   'oc_twist',      0.0, 0.3, _params.oc_twist,      0.001),
-            ("Fold Amount",   'oc_fold_amount',0.0, 1.0, _params.oc_fold_amount,0.01),
+            ("IFS Scale",     'oc_ifs_scale',   1.2, 4.0,  _params.oc_ifs_scale,   0.01),
+            ("Offset Uni",    'oc_offset_uni',  0.1, 3.0,  _params.oc_offset_uni,  0.01),
+            ("Offset X",      'oc_offset_x',    0.0, 4.0,  _params.oc_offset_x,    0.01),
+            ("Offset Y",      'oc_offset_y',    0.0, 4.0,  _params.oc_offset_y,    0.01),
+            ("Offset Z",      'oc_offset_z',    0.0, 4.0,  _params.oc_offset_z,    0.01),
+            ("Twist Y",       'oc_twist',       0.0, 1.55,  _params.oc_twist,       0.001),
+            ("Twist X",       'oc_rot_x',       0.0, 1.55,  _params.oc_rot_x,       0.001),
+            ("Twist Z",       'oc_rot_z',       0.0, 1.55,  _params.oc_rot_z,       0.001),
+            ("Norm Sharp",    'oc_sharpness',   0.5, 4.0,  _params.oc_sharpness,   0.05),
+            ("Fold Amount",   'oc_fold_amount', 0.0, 1.0,  _params.oc_fold_amount, 0.01),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
@@ -2508,6 +3202,170 @@ class ControlGUI(QMainWindow):
             oc_l.addWidget(sr)
         self._fractal_panels[3] = oc
         self._add_section(oc)
+
+        mb2 = _section("MANDELBULB FINE-TUNE")
+        mb2_l = QVBoxLayout(mb2)
+        mb2_l.setSpacing(2)
+        _lbl_hint(mb2_l, "Power N (2=sphere, 8=classic), Julia mode, pre-fold")
+        for label, attr, mn, mx, val, step in [
+            ("Power N",       'mb2_power',        2.0, 16.0, _params.mb2_power,        0.05),
+            ("Bailout",       'mb2_bailout',       1.0, 10.0, _params.mb2_bailout,      0.1),
+            ("Julia X",       'mb2_julia_x',      -2.0, 2.0,  _params.mb2_julia_x,      0.005),
+            ("Julia Y",       'mb2_julia_y',      -2.0, 2.0,  _params.mb2_julia_y,      0.005),
+            ("Julia Z",       'mb2_julia_z',      -2.0, 2.0,  _params.mb2_julia_z,      0.005),
+            ("Fold Strength", 'mb2_fold_strength', 0.0, 2.0,  _params.mb2_fold_strength, 0.01),
+        ]:
+            sr = SliderRow(label, mn, mx, val, step)
+            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            setattr(self, f'_sl_{attr}', sr)
+            mb2_l.addWidget(sr)
+        julia_lbl = _label("Julia mode:", COLORS['fg3'], FONT_SMALL)
+        mb2_l.addWidget(julia_lbl)
+        julia_row = QHBoxLayout()
+        self._mb2_julia_grp = QButtonGroup(self)
+        for i, name in enumerate(["Mandelbulb", "Julia set"]):
+            rb = QRadioButton(name)
+            rb.setFont(FONT_SMALL)
+            rb.setStyleSheet(_css_radio())
+            rb.setChecked(i == _params.mb2_julia_mode)
+            self._mb2_julia_grp.addButton(rb, i)
+            julia_row.addWidget(rb)
+        self._mb2_julia_grp.idClicked.connect(lambda idx: setattr(_params, 'mb2_julia_mode', idx))
+        mb2_l.addLayout(julia_row)
+        fold_lbl2 = _label("Pre-fold type:", COLORS['fg3'], FONT_SMALL)
+        mb2_l.addWidget(fold_lbl2)
+        fold_row2 = QHBoxLayout()
+        self._mb2_fold_grp = QButtonGroup(self)
+        for i, name in enumerate(["None", "Box", "Abs"]):
+            rb = QRadioButton(name)
+            rb.setFont(FONT_SMALL)
+            rb.setStyleSheet(_css_radio())
+            rb.setChecked(i == _params.mb2_fold_type)
+            self._mb2_fold_grp.addButton(rb, i)
+            fold_row2.addWidget(rb)
+        self._mb2_fold_grp.idClicked.connect(lambda idx: setattr(_params, 'mb2_fold_type', idx))
+        mb2_l.addLayout(fold_row2)
+        self._fractal_panels[4] = mb2
+        self._add_section(mb2)
+
+        kl = _section("PSEUDO-KLEINIAN FINE-TUNE")
+        kl_l = QVBoxLayout(kl)
+        kl_l.setSpacing(2)
+        _lbl_hint(kl_l, "Sphere inversion IFS. Scale, C offset, fold limit, sphere radius.")
+        for label, attr, mn, mx, val, step in [
+            ("Scale",        'kl_scale',        0.5,  3.0,  _params.kl_scale,        0.01),
+            ("C x",          'kl_cx',          -2.0,  2.0,  _params.kl_cx,           0.005),
+            ("C y",          'kl_cy',          -2.0,  2.0,  _params.kl_cy,           0.005),
+            ("C z",          'kl_cz',          -2.0,  2.0,  _params.kl_cz,           0.005),
+            ("Fold Limit",   'kl_fold_limit',   0.1,  3.0,  _params.kl_fold_limit,   0.01),
+            ("Sph Radius",   'kl_sph_radius',   0.05, 2.0,  _params.kl_sph_radius,   0.005),
+            ("Rot/Iter",     'kl_rot_per_iter', 0.0,  1.5,  _params.kl_rot_per_iter, 0.002),
+            ("DE Mix",       'kl_mix_factor',   0.0,  1.0,  _params.kl_mix_factor,   0.01),
+        ]:
+            sr = SliderRow(label, mn, mx, val, step)
+            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            setattr(self, f'_sl_{attr}', sr)
+            kl_l.addWidget(sr)
+        self._fractal_panels[5] = kl
+        self._add_section(kl)
+
+        space_grp = _section("SPACE OPERATORS")
+        space_l = QVBoxLayout(space_grp)
+        space_l.setSpacing(4)
+        _lbl_hint(space_l, "Applied before the fractal. Stacks: repetition then mirrors then twist then warp.")
+
+        rep_hdr = _label("INFINITE REPETITION", COLORS['fg3'], FONT_SMALL)
+        space_l.addWidget(rep_hdr)
+        rep_en_row = QHBoxLayout()
+        self._rep_check = QCheckBox("Enable repetition")
+        self._rep_check.setFont(FONT_SMALL)
+        self._rep_check.setStyleSheet(_css_check())
+        self._rep_check.setChecked(_params.rep_enabled)
+        self._rep_check.stateChanged.connect(lambda s: setattr(_params, 'rep_enabled', bool(s)))
+        rep_en_row.addWidget(self._rep_check)
+        space_l.addLayout(rep_en_row)
+        for label, attr, mn, mx, val, step in [
+            ("Cell X", 'rep_cell_x', 0.5, 20.0, _params.rep_cell_x, 0.1),
+            ("Cell Y", 'rep_cell_y', 0.5, 20.0, _params.rep_cell_y, 0.1),
+            ("Cell Z", 'rep_cell_z', 0.5, 20.0, _params.rep_cell_z, 0.1),
+        ]:
+            sr = SliderRow(label, mn, mx, val, step)
+            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            setattr(self, f'_sl_{attr}', sr)
+            space_l.addWidget(sr)
+
+        mir_hdr = _label("MIRROR PLANES", COLORS['fg3'], FONT_SMALL)
+        space_l.addWidget(mir_hdr)
+        mir_row = QHBoxLayout()
+        for axis in ['x', 'y', 'z']:
+            cb = QCheckBox(f'Mirror {axis.upper()}')
+            cb.setFont(FONT_SMALL)
+            cb.setStyleSheet(_css_check())
+            cb.setChecked(getattr(_params, f'fold_mirror_{axis}'))
+            cb.stateChanged.connect(
+                lambda s, a=axis: setattr(_params, f'fold_mirror_{a}', bool(s))
+            )
+            setattr(self, f'_mir_{axis}', cb)
+            mir_row.addWidget(cb)
+        space_l.addLayout(mir_row)
+
+        twist_hdr = _label("TWIST", COLORS['fg3'], FONT_SMALL)
+        space_l.addWidget(twist_hdr)
+        _lbl_hint(space_l, "Twists space around the chosen axis by amount * coordinate.")
+        twist_axis_row = QHBoxLayout()
+        twist_axis_lbl = _label("Axis:", COLORS['fg3'], FONT_SMALL)
+        twist_axis_lbl.setFixedWidth(36)
+        self._twist_axis_grp = QButtonGroup(self)
+        for i, name in enumerate(["Y", "X", "Z"]):
+            rb = QRadioButton(name)
+            rb.setFont(FONT_SMALL)
+            rb.setStyleSheet(_css_radio())
+            rb.setChecked(i == _params.twist_axis)
+            self._twist_axis_grp.addButton(rb, i)
+            twist_axis_row.addWidget(rb)
+        self._twist_axis_grp.idClicked.connect(lambda idx: setattr(_params, 'twist_axis', idx))
+        twist_axis_row.insertWidget(0, twist_axis_lbl)
+        space_l.addLayout(twist_axis_row)
+        sr_tw = SliderRow("Amount", 0.0, 2.0, _params.twist_amount, 0.005)
+        sr_tw.on_change(lambda v: setattr(_params, 'twist_amount', v))
+        setattr(self, '_sl_twist_amount', sr_tw)
+        space_l.addWidget(sr_tw)
+
+        warp_hdr = _label("DOMAIN WARP", COLORS['fg3'], FONT_SMALL)
+        space_l.addWidget(warp_hdr)
+        _lbl_hint(space_l, "Sine-based space distortion before fractal evaluation.")
+        warp_en_row = QHBoxLayout()
+        self._warp_check = QCheckBox("Enable warp")
+        self._warp_check.setFont(FONT_SMALL)
+        self._warp_check.setStyleSheet(_css_check())
+        self._warp_check.setChecked(_params.warp_enabled)
+        self._warp_check.stateChanged.connect(lambda s: setattr(_params, 'warp_enabled', bool(s)))
+        warp_en_row.addWidget(self._warp_check)
+        space_l.addLayout(warp_en_row)
+        warp_type_row = QHBoxLayout()
+        warp_type_lbl = _label("Type:", COLORS['fg3'], FONT_SMALL)
+        warp_type_lbl.setFixedWidth(36)
+        self._warp_type_grp = QButtonGroup(self)
+        for i, name in enumerate(["Sine", "FBM", "Curl"]):
+            rb = QRadioButton(name)
+            rb.setFont(FONT_SMALL)
+            rb.setStyleSheet(_css_radio())
+            rb.setChecked(i == _params.warp_type)
+            self._warp_type_grp.addButton(rb, i)
+            warp_type_row.addWidget(rb)
+        self._warp_type_grp.idClicked.connect(lambda idx: setattr(_params, 'warp_type', idx))
+        warp_type_row.insertWidget(0, warp_type_lbl)
+        space_l.addLayout(warp_type_row)
+        for label, attr, mn, mx, val, step in [
+            ("Strength", 'warp_strength', 0.0, 2.0, _params.warp_strength, 0.01),
+            ("Frequency","warp_freq",     0.1, 8.0, _params.warp_freq,     0.05),
+        ]:
+            sr = SliderRow(label, mn, mx, val, step)
+            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            setattr(self, f'_sl_{attr}', sr)
+            space_l.addWidget(sr)
+
+        self._add_section(space_grp)
 
         # Wire fractal-type selector to show/hide panels
         self._type_grp.idClicked.connect(self._on_fractal_type_changed)
@@ -2567,6 +3425,7 @@ class ControlGUI(QMainWindow):
         _params.cam_pos   = [0.0, 0.0, 5.0]
         _params.cam_yaw   = 0.0
         _params.cam_pitch = 0.0
+        _params.cam_roll  = 0.0
     def _sync_camera_ui(self):
         try:
             px, py, pz = _params.cam_pos
@@ -3115,6 +3974,237 @@ class ControlGUI(QMainWindow):
             for widget in widgets:
                 widget.setVisible(enabled)
 
+    def _build_saves_section(self):
+        self._zkf_buttons = {}
+        grp_fractal = _section("FRACTAL PRESETS (.zkf)")
+        lf = QVBoxLayout(grp_fractal)
+        lf.setSpacing(4)
+        hint = _label(
+            "Save current fractal parameters as a named preset.\n"
+            "Files are stored in saves/ folder next to main.py.",
+            COLORS['fg3'], FONT_SMALL
+        )
+        hint.setWordWrap(True)
+        lf.addWidget(hint)
+        row_btns = QHBoxLayout()
+        btn_save_zkf = QPushButton("Save Fractal (.zkf)")
+        btn_save_zkf.setFont(FONT_SMALL)
+        btn_save_zkf.setStyleSheet(_css_button())
+        btn_save_zkf.clicked.connect(self._save_zkf_dialog)
+        btn_load_zkf = QPushButton("Load Fractal (.zkf)")
+        btn_load_zkf.setFont(FONT_SMALL)
+        btn_load_zkf.setStyleSheet(_css_button())
+        btn_load_zkf.clicked.connect(self._load_zkf_dialog)
+        row_btns.addWidget(btn_save_zkf)
+        row_btns.addWidget(btn_load_zkf)
+        lf.addLayout(row_btns)
+        self._zkf_list_layout = QVBoxLayout()
+        self._zkf_list_layout.setSpacing(2)
+        lf.addLayout(self._zkf_list_layout)
+        self._add_section(grp_fractal)
+        self._refresh_zkf_list()
+        grp_session = _section("SESSION SAVE (.zks)")
+        ls = QVBoxLayout(grp_session)
+        ls.setSpacing(4)
+        hint2 = _label(
+            "Save/load complete session: all parameters + camera\n"
+            "position, yaw, pitch and player state.",
+            COLORS['fg3'], FONT_SMALL
+        )
+        hint2.setWordWrap(True)
+        ls.addWidget(hint2)
+        row_sess = QHBoxLayout()
+        btn_save_zks = QPushButton("Save Session (.zks)")
+        btn_save_zks.setFont(FONT_SMALL)
+        btn_save_zks.setStyleSheet(_css_button())
+        btn_save_zks.clicked.connect(self._save_zks_dialog)
+        btn_load_zks = QPushButton("Load Session (.zks)")
+        btn_load_zks.setFont(FONT_SMALL)
+        btn_load_zks.setStyleSheet(_css_button())
+        btn_load_zks.clicked.connect(self._load_zks_dialog)
+        row_sess.addWidget(btn_save_zks)
+        row_sess.addWidget(btn_load_zks)
+        ls.addLayout(row_sess)
+        self._zks_list_layout = QVBoxLayout()
+        self._zks_list_layout.setSpacing(2)
+        ls.addLayout(self._zks_list_layout)
+        self._add_section(grp_session)
+        self._refresh_zks_list()
+
+    def _refresh_zkf_list(self):
+        while self._zkf_list_layout.count():
+            item = self._zkf_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        _SAVES_DIR.mkdir(exist_ok=True)
+        files = sorted(_SAVES_DIR.glob("*.zkf"))
+        if not files:
+            lbl = _label("No saved fractals yet.", COLORS['fg4'], FONT_SMALL)
+            self._zkf_list_layout.addWidget(lbl)
+            return
+        for fp in files:
+            row = QHBoxLayout()
+            try:
+                data = load_zkf(fp)
+                name = data.get('name', fp.stem)
+            except Exception:
+                name = fp.stem
+            btn = QPushButton(name)
+            btn.setFont(FONT_SMALL)
+            btn.setStyleSheet(_css_button())
+            btn.clicked.connect(lambda _, p=fp, n=name: self._apply_zkf(p, n))
+            del_btn = QPushButton("x")
+            del_btn.setFont(FONT_SMALL)
+            del_btn.setFixedWidth(24)
+            del_btn.setStyleSheet(
+                f"QPushButton {{ background: {COLORS['bg2']}; color: {COLORS['fg4']};"
+                "border: none; border-radius: 3px; padding: 2px; }}"
+                f"QPushButton:hover {{ color: #ff6060; }}"
+            )
+            del_btn.clicked.connect(lambda _, p=fp: self._delete_zkf(p))
+            row.addWidget(btn, 1)
+            row.addWidget(del_btn)
+            w = QWidget()
+            w.setLayout(row)
+            w.setStyleSheet("background: transparent;")
+            self._zkf_list_layout.addWidget(w)
+
+    def _refresh_zks_list(self):
+        while self._zks_list_layout.count():
+            item = self._zks_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        _SAVES_DIR.mkdir(exist_ok=True)
+        files = sorted(_SAVES_DIR.glob("*.zks"))
+        if not files:
+            lbl = _label("No saved sessions yet.", COLORS['fg4'], FONT_SMALL)
+            self._zks_list_layout.addWidget(lbl)
+            return
+        for fp in files:
+            row = QHBoxLayout()
+            btn = QPushButton(fp.stem)
+            btn.setFont(FONT_SMALL)
+            btn.setStyleSheet(_css_button())
+            btn.clicked.connect(lambda _, p=fp: self._apply_zks(p))
+            del_btn = QPushButton("x")
+            del_btn.setFont(FONT_SMALL)
+            del_btn.setFixedWidth(24)
+            del_btn.setStyleSheet(
+                f"QPushButton {{ background: {COLORS['bg2']}; color: {COLORS['fg4']};"
+                "border: none; border-radius: 3px; padding: 2px; }}"
+                f"QPushButton:hover {{ color: #ff6060; }}"
+            )
+            del_btn.clicked.connect(lambda _, p=fp: self._delete_zks(p))
+            row.addWidget(btn, 1)
+            row.addWidget(del_btn)
+            w = QWidget()
+            w.setLayout(row)
+            w.setStyleSheet("background: transparent;")
+            self._zks_list_layout.addWidget(w)
+
+    def _save_zkf_dialog(self):
+        name, ok = QInputDialog.getText(self, "Save Fractal", "Preset name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        safe = "".join(c for c in name if c.isalnum() or c in ' _-').strip()
+        if not safe:
+            safe = "fractal"
+        path = _SAVES_DIR / f"{safe}.zkf"
+        try:
+            save_zkf(path, name)
+            self._refresh_zkf_list()
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", str(e))
+
+    def _load_zkf_dialog(self):
+        _SAVES_DIR.mkdir(exist_ok=True)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Fractal", str(_SAVES_DIR), "Fractal Files (*.zkf)"
+        )
+        if not path:
+            return
+        self._apply_zkf(Path(path), Path(path).stem)
+
+    def _apply_zkf(self, path, name):
+        try:
+            data = load_zkf(path)
+            vals = data.get('params', {})
+            snap_keys = {'fractal_type', 'iterations', 'color_mode', 'shadows',
+                         'animate', 'bg_mode', 'fold_x', 'fold_y', 'fold_z',
+                         'mb_fold_mode', 'mb_julia_mode', 'mb2_julia_mode', 'mb2_fold_type',
+                         'warp_type', 'warp_enabled', 'twist_axis',
+                         'fold_mirror_x', 'fold_mirror_y', 'fold_mirror_z',
+                         'rep_enabled', 'orbit_trap_type', 'rm_overrelax',
+                         'feat_ao', 'feat_shadows', 'feat_normals_full', 'feat_second_light',
+                         'feat_fog', 'feat_glow', 'feat_reflection', 'feat_subsurface',
+                         'feat_orbit_trap', 'aa_samples', 'max_steps', 'shadow_steps', 'ao_samples'}
+            for k, v in vals.items():
+                if k in snap_keys:
+                    cur = getattr(_params, k, None)
+                    if isinstance(cur, tuple):
+                        v = tuple(v) if isinstance(v, list) else v
+                    setattr(_params, k, v)
+            if 'fractal_type' in vals:
+                self._type_grp.button(_params.fractal_type).setChecked(True)
+                self._on_fractal_type_changed(_params.fractal_type)
+            if 'iterations' in vals:
+                self._iter_slider.setValue(_params.iterations)
+            if 'color_mode' in vals:
+                self._cmode_grp.button(_params.color_mode).setChecked(True)
+            _interpolator.set_gui_sync(self._sync_all_sliders)
+            _interpolator.start(vals)
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", str(e))
+
+    def _delete_zkf(self, path):
+        try:
+            path.unlink()
+            self._refresh_zkf_list()
+        except Exception as e:
+            QMessageBox.critical(self, "Delete Error", str(e))
+
+    def _save_zks_dialog(self):
+        name, ok = QInputDialog.getText(self, "Save Session", "Session name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        safe = "".join(c for c in name if c.isalnum() or c in ' _-').strip() or "session"
+        path = _SAVES_DIR / f"{safe}.zks"
+        try:
+            save_zks(path)
+            self._refresh_zks_list()
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", str(e))
+
+    def _load_zks_dialog(self):
+        _SAVES_DIR.mkdir(exist_ok=True)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Session", str(_SAVES_DIR), "Session Files (*.zks)"
+        )
+        if not path:
+            return
+        self._apply_zks(Path(path))
+
+    def _apply_zks(self, path):
+        try:
+            load_zks(path)
+            self._sync_all_sliders()
+            ft = _params.fractal_type
+            self._type_grp.button(ft).setChecked(True)
+            self._on_fractal_type_changed(ft)
+            self._iter_slider.setValue(_params.iterations)
+            self._cmode_grp.button(_params.color_mode).setChecked(True)
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", str(e))
+
+    def _delete_zks(self, path):
+        try:
+            path.unlink()
+            self._refresh_zks_list()
+        except Exception as e:
+            QMessageBox.critical(self, "Delete Error", str(e))
+
     def _build_presets_section(self):
         grp = _section("PRESETS")
         layout = QGridLayout(grp)
@@ -3368,6 +4458,26 @@ class ControlGUI(QMainWindow):
         reset_btn.clicked.connect(self._reset_player_velocity)
         layout_mode.addWidget(reset_btn)
 
+        dbg_row = QHBoxLayout()
+        self._dbg_lbl = _label("COLLIDER DEBUG: OFF", COLORS['fg4'], FONT_SMALL)
+        self._dbg_lbl.setStyleSheet(
+            f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
+            "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+        )
+        dbg_btn = QPushButton("Toggle (F1)")
+        dbg_btn.setFont(FONT_SMALL)
+        dbg_btn.setStyleSheet(_css_button())
+        dbg_btn.clicked.connect(self._toggle_debug_overlay)
+        dbg_row.addWidget(self._dbg_lbl, 1)
+        dbg_row.addWidget(dbg_btn)
+        layout_mode.addLayout(dbg_row)
+
+        _lbl_hint(layout_mode,
+            "Blue ring = collision radius  |  Cyan line = surface normal\n"
+            "Red arrow = gravity dir  |  Green/Red dots = SDF probes\n"
+            "Blue ring (outer) = ground detection threshold"
+        )
+
         self._add_section(grp_mode)
 
         grp_grav = _section("GRAVITY MODE")
@@ -3476,14 +4586,35 @@ class ControlGUI(QMainWindow):
         if _params.player_mode:
             _player_state.vel = [0.0, 0.0, 0.0]
             _player_state.jump_queued = False
+            _player_state._smooth_pos    = list(_params.cam_pos)
+            _player_state._smooth_vel    = [0.0, 0.0, 0.0]
+            _player_state._smooth_normal = list(_player_state._surface_normal)
+            _player_state._bob_phase     = 0.0
             self._player_mode_lbl.setText("PLAYER MODE: ON")
             self._player_mode_lbl.setStyleSheet(
                 f"color: {COLORS['accent']}; background: {COLORS['bg2']};"
                 "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
             )
         else:
+            _params.player_mode = False
             self._player_mode_lbl.setText("PLAYER MODE: OFF")
             self._player_mode_lbl.setStyleSheet(
+                f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
+                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+            )
+
+    def _toggle_debug_overlay(self):
+        global _debug_overlay_enabled
+        _debug_overlay_enabled = not _debug_overlay_enabled
+        if _debug_overlay_enabled:
+            self._dbg_lbl.setText("COLLIDER DEBUG: ON")
+            self._dbg_lbl.setStyleSheet(
+                f"color: {COLORS['accent']}; background: {COLORS['bg2']};"
+                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+            )
+        else:
+            self._dbg_lbl.setText("COLLIDER DEBUG: OFF")
+            self._dbg_lbl.setStyleSheet(
                 f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
                 "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
             )
@@ -3514,9 +4645,10 @@ class ControlGUI(QMainWindow):
         spd = math.sqrt(vel[0]**2 + vel[1]**2 + vel[2]**2)
         try:
             d = _py_sdf(pos)
-            thresh = _player_state._effective_threshold()
-            sdf_str   = f"{d:.5f}"
-            thresh_str = f"{thresh:.5f}  (col={thresh*4:.5f}  gnd={thresh*6:.5f})"
+            radius = _player_state._effective_radius()
+            gnd = _player_state._ground_threshold()
+            sdf_str    = f"{d:.5f}"
+            thresh_str = f"r={radius:.5f}  gnd={gnd:.5f}"
         except Exception:
             sdf_str = thresh_str = "err"
         self._pl_pos_lbl.setText(
