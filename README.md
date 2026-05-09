@@ -37,15 +37,11 @@ The renderer is designed more like a sandbox than a fixed viewer: almost every p
 
 # Gallery
 
-Add screenshots here.
 
-```text
-screenshots/
-├── mandelbox.png
-├── pseudo_kleinian.png
-├── octahedron_ifs.png
-└── starfield.png
-```
+![1.jpg](Screenshots/1.jpg)
+![2.jpg](Screenshots/2.jpg)
+![3.jpg](Screenshots/3.jpg)
+![4.jpg](Screenshots/4.jpg)
 
 ---
 
