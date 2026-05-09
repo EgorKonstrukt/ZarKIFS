@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
 )
 from moderngl_window.conf import settings as mglw_settings
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 
 VERT_SHADER = """
 #version 330 core
@@ -47,6 +47,7 @@ uniform float u_fold_z;
 uniform float u_rot_x;
 uniform float u_rot_y;
 uniform float u_rot_z;
+uniform mat3  u_rot_mat;
 uniform float u_offset_x;
 uniform float u_offset_y;
 uniform float u_offset_z;
@@ -524,8 +525,7 @@ vec3 applySpaceOps(vec3 p) {
 }
 
 vec2 sceneDist(vec3 p) {
-    mat3 rx = rotX(u_rot_x), ry = rotY(u_rot_y), rz = rotZ(u_rot_z);
-    p = rz * ry * rx * p;
+    p = u_rot_mat * p;
     p = applySpaceOps(p);
     if (u_fractal_type == 0) return mandelbox(p);
     if (u_fractal_type == 1) return mengerSponge(p);
@@ -1166,6 +1166,11 @@ class FractalParams:
         # --- Screenshot ---
         self.screenshot_requested = False
         self.player_mode = False
+        # --- Render resolution ---
+        self.render_scale        = 100
+        self.dyn_res_enabled     = False
+        self.dyn_res_target_fps  = 60
+        self.dyn_res_min_fps     = 30
 
 _params = FractalParams()
 
@@ -1307,9 +1312,13 @@ class PresetInterpolator:
         self._dst_col: dict = {}
         self._elapsed: float = 0.0
         self._gui_sync_cb = None
+        self._smooth_color_source_cb = None
 
     def set_gui_sync(self, cb):
         self._gui_sync_cb = cb
+
+    def set_smooth_color_source(self, cb):
+        self._smooth_color_source_cb = cb
 
     def _ease(self, t: float) -> float:
         t = max(0.0, min(1.0, t))
@@ -1320,13 +1329,20 @@ class PresetInterpolator:
     def start(self, target: dict):
         self._timer.stop()
         self._elapsed = 0.0
+        smooth_colors = {}
+        if self._smooth_color_source_cb is not None:
+            smooth_colors = self._smooth_color_source_cb()
         for a in INTERP_FLOAT_ATTRS:
             self._src_f[a] = float(getattr(_params, a, 0.0))
             self._dst_f[a] = float(target.get(a, self._src_f[a]))
         for a in INTERP_COLOR_ATTRS:
-            src = getattr(_params, a, (0.0, 0.0, 0.0))
-            self._src_col[a] = tuple(float(c) for c in src)
+            if a in smooth_colors:
+                self._src_col[a] = smooth_colors[a]
+            else:
+                src = getattr(_params, a, (0.0, 0.0, 0.0))
+                self._src_col[a] = tuple(float(c) for c in src)
             self._dst_col[a] = tuple(float(c) for c in target.get(a, self._src_col[a]))
+            setattr(_params, a, self._src_col[a])
         self._timer.start()
 
     def _tick(self):
@@ -2089,12 +2105,14 @@ class FractalWindow(mglw.WindowConfig):
         super().__init__(**kwargs)
         self.prog = self.ctx.program(vertex_shader=VERT_SHADER,
                                      fragment_shader=FRAG_SHADER)
+        self._uloc = {name: self.prog[name] for name in self.prog}
         verts = np.array([-1,-1, 1,-1, -1,1, 1,1], dtype='f4')
         vbo = self.ctx.buffer(verts)
         self.vao = self.ctx.simple_vertex_array(self.prog, vbo, 'in_position')
 
         self.post_prog = self.ctx.program(vertex_shader=POST_VERT,
                                           fragment_shader=POST_FRAG)
+        self._post_uloc = {name: self.post_prog[name] for name in self.post_prog}
         self.post_vao  = self.ctx.simple_vertex_array(self.post_prog, vbo, 'in_position')
 
         w, h = self.wnd.size
@@ -2107,20 +2125,50 @@ class FractalWindow(mglw.WindowConfig):
         self._pending_screenshot = False
         self._debug_vbo = vbo
         self._init_debug_overlay()
+        self._dyn_res_scale        = float(_params.render_scale)
+        self._dyn_last_scale_int   = int(_params.render_scale)
+        self._dyn_bucket_time      = 0.0
+        self._dyn_bucket_count     = 0
+        self._dyn_bucket_sum_ft    = 0.0
+        self._dyn_cooldown         = 0.0
+        self._title_accum          = 0.0
+        self._title_interval       = 0.35
+        self._display_fps          = 0.0
+        self._smooth_color1   = list(_params.color1)
+        self._smooth_color2   = list(_params.color2)
+        self._smooth_color3   = list(_params.color3)
+        self._smooth_bg_color1 = list(_params.bg_color1)
+        self._smooth_bg_color2 = list(_params.bg_color2)
+        self._smooth_fog_color = list(_params.fog_color)
+        self._COLOR_SMOOTH     = 8.0
+        _interpolator.set_smooth_color_source(self._get_smooth_colors)
 
     def _init_debug_overlay(self):
         self._dbg_prog = self.ctx.program(
             vertex_shader=DEBUG_OVERLAY_VERT,
             fragment_shader=DEBUG_OVERLAY_FRAG,
         )
+        self._dbg_uloc = {name: self._dbg_prog[name] for name in self._dbg_prog}
         self._dbg_vao = self.ctx.simple_vertex_array(
             self._dbg_prog, self._debug_vbo, 'in_position'
         )
         self._dbg_probe_cache = []
 
     def _dset(self, name, val):
-        if name in self._dbg_prog:
-            self._dbg_prog[name].value = val
+        try:
+            self._dbg_uloc[name].value = val
+        except KeyError:
+            pass
+
+    def _get_smooth_colors(self) -> dict:
+        return {
+            'color1':    tuple(self._smooth_color1),
+            'color2':    tuple(self._smooth_color2),
+            'color3':    tuple(self._smooth_color3),
+            'bg_color1': tuple(self._smooth_bg_color1),
+            'bg_color2': tuple(self._smooth_bg_color2),
+            'fog_color': tuple(self._smooth_fog_color),
+        }
 
     def _build_debug_probes(self, pos, ps):
         probes = []
@@ -2237,30 +2285,106 @@ class FractalWindow(mglw.WindowConfig):
             kp = f'u_probe_ss[{i}]'
             ks = f'u_probe_sdf[{i}]'
             if i < n_probes:
-                if kp in self._dbg_prog: self._dbg_prog[kp].value = (float(probe_ss_list[i][0]), float(probe_ss_list[i][1]))
-                if ks in self._dbg_prog: self._dbg_prog[ks].value = probe_sdf_list[i]
+                if kp in self._dbg_uloc: self._dbg_uloc[kp].value = (float(probe_ss_list[i][0]), float(probe_ss_list[i][1]))
+                if ks in self._dbg_uloc: self._dbg_uloc[ks].value = probe_sdf_list[i]
             else:
-                if kp in self._dbg_prog: self._dbg_prog[kp].value = (-9999.0, -9999.0)
-                if ks in self._dbg_prog: self._dbg_prog[ks].value = 0.0
+                if kp in self._dbg_uloc: self._dbg_uloc[kp].value = (-9999.0, -9999.0)
+                if ks in self._dbg_uloc: self._dbg_uloc[ks].value = 0.0
 
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
         self._dbg_vao.render(moderngl.TRIANGLE_STRIP)
         self.ctx.disable(moderngl.BLEND)
 
+    def _get_render_size(self):
+        ww, wh = self.wnd.size
+        scale = max(10, min(200, self._dyn_res_scale)) / 100.0
+        rw = max(1, int(ww * scale))
+        rh = max(1, int(wh * scale))
+        return rw, rh
+
+    def _update_dyn_res(self, ft):
+        p = _params
+
+        if not p.dyn_res_enabled:
+            self._dyn_res_scale    = float(p.render_scale)
+            self._dyn_last_scale_int = int(p.render_scale)
+            self._dyn_bucket_time  = 0.0
+            self._dyn_bucket_count = 0
+            self._dyn_bucket_sum_ft = 0.0
+            self._dyn_cooldown     = 0.0
+            return
+
+        if ft <= 0.0 or ft > 1.0:
+            return
+
+        MEASURE_WINDOW = 0.4
+        COOLDOWN_DOWN  = 0.3
+        COOLDOWN_UP    = 3.0
+
+        self._dyn_bucket_time   += ft
+        self._dyn_bucket_count  += 1
+        self._dyn_bucket_sum_ft += ft
+
+        if self._dyn_cooldown > 0.0:
+            self._dyn_cooldown -= ft
+
+        if self._dyn_bucket_time < MEASURE_WINDOW:
+            return
+
+        avg_ft  = self._dyn_bucket_sum_ft / self._dyn_bucket_count
+        avg_fps = 1.0 / avg_ft if avg_ft > 0.0 else 0.0
+
+        self._dyn_bucket_time   = 0.0
+        self._dyn_bucket_count  = 0
+        self._dyn_bucket_sum_ft = 0.0
+
+        target  = float(p.dyn_res_target_fps)
+        min_fps = float(p.dyn_res_min_fps)
+        cap     = float(p.render_scale)
+        current = self._dyn_res_scale
+
+        if avg_fps < min_fps:
+            ratio     = avg_fps / max(min_fps, 1.0)
+            step      = (1.0 - ratio) * current * 0.5
+            new_scale = max(10.0, current - max(step, 5.0))
+            self._dyn_res_scale    = new_scale
+            self._dyn_last_scale_int = int(round(new_scale))
+            self._dyn_cooldown     = COOLDOWN_DOWN
+
+        elif avg_fps < target * 0.97:
+            if self._dyn_cooldown <= 0.0:
+                ratio     = avg_fps / target
+                step      = (1.0 - ratio) * current * 0.35
+                new_scale = max(10.0, current - max(step, 2.0))
+                self._dyn_res_scale    = new_scale
+                self._dyn_last_scale_int = int(round(new_scale))
+                self._dyn_cooldown     = COOLDOWN_DOWN
+
+        elif avg_fps > target * 1.15 and current < cap:
+            if self._dyn_cooldown <= 0.0:
+                headroom  = (avg_fps / target) - 1.0
+                step      = headroom * (cap - current) * 0.15
+                new_scale = min(cap, current + max(step, 1.0))
+                self._dyn_res_scale    = new_scale
+                self._dyn_last_scale_int = int(round(new_scale))
+                self._dyn_cooldown     = COOLDOWN_UP
+
     def _ensure_fbo(self):
-        w, h = self.wnd.size
-        if (w, h) != self._fbo_size:
+        rw, rh = self._get_render_size()
+        if (rw, rh) != self._fbo_size:
             self._scene_tex.release()
             self._scene_fbo.release()
-            self._scene_tex = self.ctx.texture((w, h), 3, dtype='f4')
+            self._scene_tex = self.ctx.texture((rw, rh), 3, dtype='f4')
             self._scene_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
             self._scene_fbo = self.ctx.framebuffer(color_attachments=[self._scene_tex])
-            self._fbo_size  = (w, h)
+            self._fbo_size  = (rw, rh)
 
     def _set(self, name, val):
-        if name in self.prog:
-            self.prog[name].value = val
+        try:
+            self._uloc[name].value = val
+        except KeyError:
+            pass
     def _speed_mul(self):
         try:
             import pyglet
@@ -2434,6 +2558,19 @@ class FractalWindow(mglw.WindowConfig):
         p = _params.cam_pos
         _params.cam_pos = [p[i] + _cam_vel[i] * dt for i in range(3)]
     def render(self, t, ft):
+        self._update_dyn_res(ft)
+        self._title_accum += ft
+        if self._title_accum >= self._title_interval:
+            if ft > 0.0:
+                self._display_fps = 1.0 / ft
+            scale_str = f' | {int(round(self._dyn_res_scale))}%' if _params.dyn_res_enabled else (f' | {_params.render_scale}%' if _params.render_scale != 100 else '')
+            try:
+                pw = getattr(self.wnd, '_window', None)
+                if pw is not None:
+                    pw.set_caption(f'Kaleidoscopic IFS Fractal {APP_VERSION} | {self._display_fps:.1f} FPS{scale_str}')
+            except Exception:
+                pass
+            self._title_accum = 0.0
         self._update_camera_keys(ft)
         self._ensure_fbo()
         p = _params
@@ -2446,10 +2583,11 @@ class FractalWindow(mglw.WindowConfig):
             else list(p.cam_pos)
         )
 
+        rw, rh = self._fbo_size
         self._scene_fbo.use()
         self._scene_fbo.clear(0, 0, 0)
         self._set('u_time',         elapsed)
-        self._set('u_resolution',   self.wnd.size)
+        self._set('u_resolution',   (rw, rh))
         self._set('u_iterations',   p.iterations)
         self._set('u_scale',        p.scale)
         self._set('u_fold_x',       1.0 if p.fold_x else 0.0)
@@ -2458,6 +2596,20 @@ class FractalWindow(mglw.WindowConfig):
         self._set('u_rot_x',        p.rot_x)
         self._set('u_rot_y',        p.rot_y)
         self._set('u_rot_z',        p.rot_z)
+
+        cx, sx = math.cos(p.rot_x), math.sin(p.rot_x)
+        cy, sy = math.cos(p.rot_y), math.sin(p.rot_y)
+        cz, sz = math.cos(p.rot_z), math.sin(p.rot_z)
+        rx = (1,0,0, 0,cx,-sx, 0,sx,cx)
+        ry = (cy,0,sy, 0,1,0, -sy,0,cy)
+        rz = (cz,-sz,0, sz,cz,0, 0,0,1)
+        def _mat3mul(a, b):
+            return tuple(
+                a[r*3+0]*b[0*3+c] + a[r*3+1]*b[1*3+c] + a[r*3+2]*b[2*3+c]
+                for r in range(3) for c in range(3)
+            )
+        rot_mat = _mat3mul(_mat3mul(rz, ry), rx)
+        self._set('u_rot_mat', rot_mat)
         self._set('u_offset_x',     p.offset_x)
         self._set('u_offset_y',     p.offset_y)
         self._set('u_offset_z',     p.offset_z)
@@ -2468,9 +2620,17 @@ class FractalWindow(mglw.WindowConfig):
         self._set('u_bailout',      p.bailout)
         self._set('u_min_dist',     p.min_dist)
         self._set('u_fog_density',  p.fog_density)
-        self._set('u_color1',       p.color1)
-        self._set('u_color2',       p.color2)
-        self._set('u_color3',       p.color3)
+        _ca = 1.0 - math.exp(-self._COLOR_SMOOTH * ft) if ft > 0.0 else 1.0
+        for i in range(3):
+            self._smooth_color1[i]    += (p.color1[i]    - self._smooth_color1[i])    * _ca
+            self._smooth_color2[i]    += (p.color2[i]    - self._smooth_color2[i])    * _ca
+            self._smooth_color3[i]    += (p.color3[i]    - self._smooth_color3[i])    * _ca
+            self._smooth_bg_color1[i] += (p.bg_color1[i] - self._smooth_bg_color1[i]) * _ca
+            self._smooth_bg_color2[i] += (p.bg_color2[i] - self._smooth_bg_color2[i]) * _ca
+            self._smooth_fog_color[i] += (p.fog_color[i] - self._smooth_fog_color[i]) * _ca
+        self._set('u_color1',       tuple(self._smooth_color1))
+        self._set('u_color2',       tuple(self._smooth_color2))
+        self._set('u_color3',       tuple(self._smooth_color3))
         self._set('u_color_mode',   p.color_mode)
         self._set('u_ao_strength',  p.ao_strength)
         self._set('u_shadow_soft',  p.shadow_soft)
@@ -2486,7 +2646,7 @@ class FractalWindow(mglw.WindowConfig):
         self._set('u_de_multiplier', p.de_multiplier)
         self._set('u_orbit_trap_type', p.orbit_trap_type)
         # Fog
-        self._set('u_fog_color',    p.fog_color)
+        self._set('u_fog_color',    tuple(self._smooth_fog_color))
         # AO
         self._set('u_ao_radius',    p.ao_radius)
         self._set('u_ao_samples',   p.ao_samples)
@@ -2497,8 +2657,8 @@ class FractalWindow(mglw.WindowConfig):
         self._set('u_rim_strength',   p.rim_strength)
         self._set('u_emission',       p.emission)
         # Background
-        self._set('u_bg_color1',  p.bg_color1)
-        self._set('u_bg_color2',  p.bg_color2)
+        self._set('u_bg_color1',  tuple(self._smooth_bg_color1))
+        self._set('u_bg_color2',  tuple(self._smooth_bg_color2))
         self._set('u_bg_mode',    p.bg_mode)
         # AA
         self._set('u_aa_samples', p.aa_samples)
@@ -2620,16 +2780,12 @@ class FractalWindow(mglw.WindowConfig):
         self.ctx.screen.use()
         self.ctx.clear(0, 0, 0)
         self._scene_tex.use(location=0)
-        if 'u_scene' in self.post_prog:
-            self.post_prog['u_scene'].value = 0
-        if 'u_resolution' in self.post_prog:
-            self.post_prog['u_resolution'].value = self.wnd.size
-        def _pset(name, val):
-            if name in self.post_prog:
-                self.post_prog[name].value = val
-        _pset('u_gamma',           p.gamma)
-        _pset('u_exposure',        p.exposure)
-        _pset('u_saturation',      p.saturation)
+        pl = self._post_uloc
+        if 'u_scene' in pl:      pl['u_scene'].value      = 0
+        if 'u_resolution' in pl: pl['u_resolution'].value = self.wnd.size
+        if 'u_gamma'      in pl: pl['u_gamma'].value      = p.gamma
+        if 'u_exposure'   in pl: pl['u_exposure'].value   = p.exposure
+        if 'u_saturation' in pl: pl['u_saturation'].value = p.saturation
         self.post_vao.render(moderngl.TRIANGLE_STRIP)
 
         if self._pending_screenshot or p.screenshot_requested:
@@ -2695,7 +2851,7 @@ def _css_groupbox() -> str:
     return f"""
         QGroupBox {{
             color: {COLORS['accent']};
-            font: bold 9pt Consolas;
+            font: bold 9pt Segoe UI;
             border: 1px solid {COLORS['panel']};
             border-radius: 4px;
             margin-top: 8px;
@@ -2709,7 +2865,7 @@ def _css_groupbox() -> str:
 
 def _css_check() -> str:
     return f"""
-        QCheckBox {{ color: {COLORS['fg']}; font: 9pt Consolas; spacing: 6px; }}
+        QCheckBox {{ color: {COLORS['fg']}; font: 9pt Segoe UI; spacing: 6px; }}
         QCheckBox::indicator {{
             width: 14px; height: 14px;
             background: {COLORS['panel']};
@@ -2721,7 +2877,7 @@ def _css_check() -> str:
 
 def _css_radio() -> str:
     return f"""
-        QRadioButton {{ color: {COLORS['fg']}; font: 9pt Consolas; spacing: 6px; }}
+        QRadioButton {{ color: {COLORS['fg']}; font: 9pt Segoe UI; spacing: 6px; }}
         QRadioButton::indicator {{
             width: 14px; height: 14px;
             background: {COLORS['panel']};
@@ -2737,7 +2893,7 @@ def _css_button(bg=None, hover=None) -> str:
     return f"""
         QPushButton {{
             background: {bg}; color: {COLORS['fg']};
-            font: 8pt Consolas; border: none;
+            font: 8pt Segoe UI; border: none;
             border-radius: 4px; padding: 4px 8px;
         }}
         QPushButton:hover {{ background: {hover}; }}
@@ -2913,7 +3069,6 @@ class ControlGUI(QMainWindow):
             QTabBar::tab {{
                 background: {COLORS['bg2']};
                 color: {COLORS['fg2']};
-                font: 8pt Consolas;
                 padding: 5px 10px;
                 border: 1px solid {COLORS['panel']};
                 border-bottom: none;
@@ -3443,13 +3598,13 @@ class ControlGUI(QMainWindow):
                 lbl.setText("PLAYER MODE: ON")
                 lbl.setStyleSheet(
                     f"color: {COLORS['accent']}; background: {COLORS['bg2']};"
-                    "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+                    "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
                 )
             else:
                 lbl.setText("PLAYER MODE: OFF")
                 lbl.setStyleSheet(
                     f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
-                    "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+                    "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
                 )
         except Exception:
             pass
@@ -3486,7 +3641,7 @@ class ControlGUI(QMainWindow):
         hex_col = self._rgb_to_hex(rgb)
         btn.setStyleSheet(
             f"QPushButton {{ background: {hex_col}; color: white; border: none;"
-            "border-radius: 4px; padding: 4px 8px; font: bold 8pt Consolas; }}"
+            "border-radius: 4px; padding: 4px 8px; font: bold 8pt Segoe UI; }}"
             f"QPushButton:hover {{ border: 2px solid {COLORS['accent']}; }}"
         )
         btn.clicked.connect(lambda _, a=attr, b=btn: self._pick_color(a, b))
@@ -3503,7 +3658,7 @@ class ControlGUI(QMainWindow):
             hex_col = self._rgb_to_hex(rgb)
             btn.setStyleSheet(
                 f"QPushButton {{ background: {hex_col}; color: white; border: none;"
-                "border-radius: 4px; padding: 4px 8px; font: bold 8pt Consolas; }}"
+                "border-radius: 4px; padding: 4px 8px; font: bold 8pt Segoe UI; }}"
                 f"QPushButton:hover {{ border: 2px solid {COLORS['accent']}; }}"
             )
     def _build_glow_section(self):
@@ -3875,6 +4030,116 @@ class ControlGUI(QMainWindow):
         layout.setSpacing(4)
         _lbl_hint(layout, "Disable expensive features to increase FPS")
 
+        res_grp = _section("RENDER RESOLUTION")
+        res_l = QVBoxLayout(res_grp)
+        res_l.setSpacing(4)
+        _lbl_hint(res_l,
+            "Render at a fraction of window size, then upscale.\n"
+            "100% = native. Lower = faster but blurrier.")
+
+        scale_row = QWidget()
+        scale_row_l = QHBoxLayout(scale_row)
+        scale_row_l.setContentsMargins(4, 2, 4, 2)
+        scale_row_l.setSpacing(6)
+        scale_lbl = _label("Scale %", COLORS['fg2'], FONT_SMALL)
+        scale_lbl.setFixedWidth(80)
+        scale_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._res_slider = QSlider(Qt.Horizontal)
+        self._res_slider.setRange(10, 200)
+        self._res_slider.setValue(_params.render_scale)
+        self._res_val_lbl = _label(f'{_params.render_scale}%', COLORS['fg'], FONT_SMALL)
+        self._res_val_lbl.setFixedWidth(50)
+        self._res_val_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        scale_row_l.addWidget(scale_lbl)
+        scale_row_l.addWidget(self._res_slider, 1)
+        scale_row_l.addWidget(self._res_val_lbl)
+        res_l.addWidget(scale_row)
+
+        def _on_res_scale(v):
+            _params.render_scale = v
+            self._res_val_lbl.setText(f'{v}%')
+
+        self._res_slider.valueChanged.connect(_on_res_scale)
+
+        dyn_row = QHBoxLayout()
+        self._dyn_res_cb = QCheckBox("Dynamic Resolution")
+        self._dyn_res_cb.setFont(FONT_MONO)
+        self._dyn_res_cb.setStyleSheet(_css_check())
+        self._dyn_res_cb.setChecked(_params.dyn_res_enabled)
+        dyn_hint = _label("auto-adjust scale to hit target FPS", COLORS['fg4'], FONT_SMALL)
+        dyn_hint.setStyleSheet(
+            f"color: {COLORS['fg4']}; background: transparent;"
+            "font-style: italic; padding-left: 4px;"
+        )
+        dyn_row.addWidget(self._dyn_res_cb)
+        dyn_row.addWidget(dyn_hint, 1)
+        res_l.addLayout(dyn_row)
+
+        target_row = QWidget()
+        target_row_l = QHBoxLayout(target_row)
+        target_row_l.setContentsMargins(4, 2, 4, 2)
+        target_row_l.setSpacing(6)
+        target_lbl = _label("Target FPS", COLORS['fg2'], FONT_SMALL)
+        target_lbl.setFixedWidth(80)
+        target_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._target_fps_slider = QSlider(Qt.Horizontal)
+        self._target_fps_slider.setRange(10, 240)
+        self._target_fps_slider.setValue(_params.dyn_res_target_fps)
+        self._target_fps_val_lbl = _label(f'{_params.dyn_res_target_fps}', COLORS['fg'], FONT_SMALL)
+        self._target_fps_val_lbl.setFixedWidth(50)
+        self._target_fps_val_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        target_row_l.addWidget(target_lbl)
+        target_row_l.addWidget(self._target_fps_slider, 1)
+        target_row_l.addWidget(self._target_fps_val_lbl)
+        res_l.addWidget(target_row)
+
+        minfps_row = QWidget()
+        minfps_row_l = QHBoxLayout(minfps_row)
+        minfps_row_l.setContentsMargins(4, 2, 4, 2)
+        minfps_row_l.setSpacing(6)
+        minfps_lbl = _label("Min FPS", COLORS['fg2'], FONT_SMALL)
+        minfps_lbl.setFixedWidth(80)
+        minfps_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._min_fps_slider = QSlider(Qt.Horizontal)
+        self._min_fps_slider.setRange(5, 120)
+        self._min_fps_slider.setValue(_params.dyn_res_min_fps)
+        self._min_fps_val_lbl = _label(f'{_params.dyn_res_min_fps}', COLORS['fg'], FONT_SMALL)
+        self._min_fps_val_lbl.setFixedWidth(50)
+        self._min_fps_val_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        minfps_row_l.addWidget(minfps_lbl)
+        minfps_row_l.addWidget(self._min_fps_slider, 1)
+        minfps_row_l.addWidget(self._min_fps_val_lbl)
+        res_l.addWidget(minfps_row)
+
+        _lbl_hint(res_l,
+            "Dynamic res adjusts scale between 10% and Scale %.\n"
+            "Below Min FPS: scale drops rapidly. Below Target: scale drops slowly.")
+
+        def _on_dyn_res_toggled(state):
+            _params.dyn_res_enabled = bool(state)
+
+        def _on_target_fps(v):
+            _params.dyn_res_target_fps = v
+            self._target_fps_val_lbl.setText(str(v))
+            if v <= _params.dyn_res_min_fps:
+                _params.dyn_res_min_fps = max(5, v - 5)
+                self._min_fps_slider.setValue(_params.dyn_res_min_fps)
+                self._min_fps_val_lbl.setText(str(_params.dyn_res_min_fps))
+
+        def _on_min_fps(v):
+            _params.dyn_res_min_fps = v
+            self._min_fps_val_lbl.setText(str(v))
+            if v >= _params.dyn_res_target_fps:
+                _params.dyn_res_target_fps = min(240, v + 5)
+                self._target_fps_slider.setValue(_params.dyn_res_target_fps)
+                self._target_fps_val_lbl.setText(str(_params.dyn_res_target_fps))
+
+        self._dyn_res_cb.stateChanged.connect(_on_dyn_res_toggled)
+        self._target_fps_slider.valueChanged.connect(_on_target_fps)
+        self._min_fps_slider.valueChanged.connect(_on_min_fps)
+
+        layout.addWidget(res_grp)
+
         FEATURES = [
             ('feat_ao',           'Ambient Occlusion',  '~6x sceneDist per pixel'),
             ('feat_shadows',      'Soft Shadows',       '~32x sceneDist per pixel'),
@@ -3945,7 +4210,7 @@ class ControlGUI(QMainWindow):
             }
             btn.setStyleSheet(
                 f"QPushButton {{ background: {col_map[name]}; color: {COLORS['fg']};"
-                "font: 8pt Consolas; border: none; border-radius: 4px; padding: 4px 6px; }}"
+                "font: 8pt Segoe UI; border: none; border-radius: 4px; padding: 4px 6px; }}"
                 f"QPushButton:hover {{ background: {COLORS['accent']}; }}"
             )
             btn.clicked.connect(lambda _, v=vals: self._apply_perf_preset(v))
@@ -4304,7 +4569,7 @@ class ControlGUI(QMainWindow):
             hex_col = self._rgb_to_hex(getattr(_params, attr))
             btn.setStyleSheet(
                 f"QPushButton {{ background: {hex_col}; color: white; border: none;"
-                "border-radius: 4px; padding: 4px 8px; font: bold 8pt Consolas; }}"
+                "border-radius: 4px; padding: 4px 8px; font: bold 8pt Segoe UI; }}"
                 f"QPushButton:hover {{ border: 2px solid {COLORS['accent']}; }}"
             )
         for attr in [
@@ -4365,7 +4630,7 @@ class ControlGUI(QMainWindow):
 
         self._evo_status_lbl = _label("Status: stopped   t = 0.00", COLORS['fg4'], FONT_SMALL)
         self._evo_status_lbl.setStyleSheet(
-            f"color: {COLORS['fg4']}; background: transparent; font: 8pt Consolas;"
+            f"color: {COLORS['fg4']}; background: transparent; font: 8pt Segoe UI;"
         )
         layout_ctrl.addWidget(self._evo_status_lbl)
         _infinite_evo._status_cb = self._on_evo_tick
@@ -4442,7 +4707,7 @@ class ControlGUI(QMainWindow):
         self._player_mode_lbl = _label("PLAYER MODE: OFF", COLORS['fg4'], FONT_SMALL)
         self._player_mode_lbl.setStyleSheet(
             f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
-            "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+            "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
         )
         toggle_btn = QPushButton("Toggle (V)")
         toggle_btn.setFont(FONT_SMALL)
@@ -4462,7 +4727,7 @@ class ControlGUI(QMainWindow):
         self._dbg_lbl = _label("COLLIDER DEBUG: OFF", COLORS['fg4'], FONT_SMALL)
         self._dbg_lbl.setStyleSheet(
             f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
-            "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+            "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
         )
         dbg_btn = QPushButton("Toggle (F1)")
         dbg_btn.setFont(FONT_SMALL)
@@ -4571,7 +4836,7 @@ class ControlGUI(QMainWindow):
                     self._pl_sdf_lbl, self._pl_thresh_lbl, self._pl_grav_lbl):
             lbl.setStyleSheet(
                 f"color: {COLORS['fg3']}; background: transparent;"
-                "font: 8pt Consolas;"
+                "font: 8pt Segoe UI;"
             )
             layout_status.addWidget(lbl)
 
@@ -4593,14 +4858,14 @@ class ControlGUI(QMainWindow):
             self._player_mode_lbl.setText("PLAYER MODE: ON")
             self._player_mode_lbl.setStyleSheet(
                 f"color: {COLORS['accent']}; background: {COLORS['bg2']};"
-                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
             )
         else:
             _params.player_mode = False
             self._player_mode_lbl.setText("PLAYER MODE: OFF")
             self._player_mode_lbl.setStyleSheet(
                 f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
-                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
             )
 
     def _toggle_debug_overlay(self):
@@ -4610,13 +4875,13 @@ class ControlGUI(QMainWindow):
             self._dbg_lbl.setText("COLLIDER DEBUG: ON")
             self._dbg_lbl.setStyleSheet(
                 f"color: {COLORS['accent']}; background: {COLORS['bg2']};"
-                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
             )
         else:
             self._dbg_lbl.setText("COLLIDER DEBUG: OFF")
             self._dbg_lbl.setStyleSheet(
                 f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
-                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Consolas;"
+                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
             )
 
     def _reset_player_velocity(self):
@@ -4684,7 +4949,7 @@ def run_gl():
 if __name__ == '__main__':
     gl_thread = threading.Thread(target=run_gl, daemon=True)
     gl_thread.start()
-    time.sleep(0.5)
+    time.sleep(0.1)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setWindowIcon(QIcon(str(Path(__file__).parent / "icon.png")))
