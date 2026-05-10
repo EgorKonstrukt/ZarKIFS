@@ -17,11 +17,20 @@ from PyQt5.QtWidgets import (
     QSlider, QRadioButton, QCheckBox, QPushButton,
     QButtonGroup, QGroupBox, QColorDialog, QTabWidget,
     QFileDialog, QInputDialog, QMessageBox, QProgressBar,
-    QSizePolicy,
+    QSizePolicy, QComboBox,
 )
 from moderngl_window.conf import settings as mglw_settings
 
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.0"
+
+try:
+    from animation_editor import (
+        _anim_state, open_animation_editor, apply_anim_to_params, AnimationEditorWindow,
+        set_params_ref,
+    )
+    _ANIM_AVAILABLE = True
+except ImportError:
+    _ANIM_AVAILABLE = False
 
 _compile_event  = threading.Event()
 _compile_error  = [None]
@@ -1184,6 +1193,9 @@ class FractalParams:
         self.dyn_res_min_fps     = 30
 
 _params = FractalParams()
+
+if _ANIM_AVAILABLE:
+    set_params_ref(_params)
 
 _ZKF_VERSION = 1
 _ZKS_VERSION = 1
@@ -2549,27 +2561,32 @@ class FractalWindow(mglw.WindowConfig):
             spd_mul = self.SHIFT_MUL if 'shift' in ci.keys_pressed else (self.ALT_MUL if 'alt' in ci.keys_pressed else 1.0)
             _player_state.update(dt, spd_mul)
             return
+        anim_active = _ANIM_AVAILABLE and _anim_state.playing
         mul = self._speed_mul()
         fwd, right, up = self._calc_basis()
         target = [0.0, 0.0, 0.0]
         spd = self.KEY_MOVE_SPD * mul
+        any_move = False
         if 'w' in ci.keys_pressed:
-            target = [target[i] + fwd[i]   * spd for i in range(3)]
+            target = [target[i] + fwd[i]   * spd for i in range(3)]; any_move = True
         if 's' in ci.keys_pressed:
-            target = [target[i] - fwd[i]   * spd for i in range(3)]
+            target = [target[i] - fwd[i]   * spd for i in range(3)]; any_move = True
         if 'a' in ci.keys_pressed:
-            target = [target[i] - right[i] * spd for i in range(3)]
+            target = [target[i] - right[i] * spd for i in range(3)]; any_move = True
         if 'd' in ci.keys_pressed:
-            target = [target[i] + right[i] * spd for i in range(3)]
+            target = [target[i] + right[i] * spd for i in range(3)]; any_move = True
         if 'space' in ci.keys_pressed:
-            target = [target[i] + up[i]    * spd for i in range(3)]
+            target = [target[i] + up[i]    * spd for i in range(3)]; any_move = True
         if 'ctrl' in ci.keys_pressed:
-            target = [target[i] - up[i]    * spd for i in range(3)]
+            target = [target[i] - up[i]    * spd for i in range(3)]; any_move = True
         ROLL_SPD = 1.2
         if 'x' in ci.keys_pressed:
             _params.cam_roll -= ROLL_SPD * dt * mul
         if 'rbracket' in ci.keys_pressed:
             _params.cam_roll += ROLL_SPD * dt * mul
+        if anim_active and not any_move:
+            _cam_vel = [0.0, 0.0, 0.0]
+            return
         alpha = 1.0 - math.exp(-self.SMOOTHING * dt)
         _cam_vel = [_cam_vel[i] + (target[i] - _cam_vel[i]) * alpha for i in range(3)]
         p = _params.cam_pos
@@ -3287,10 +3304,120 @@ class ControlGUI(QMainWindow):
         self._vbox.addStretch()
         tabs.addTab(tab_infinite, "Infinite")
 
+        if _ANIM_AVAILABLE:
+            tab_anim, vbox = self._make_scroll_tab()
+            self._vbox = vbox
+            self._build_animation_section()
+            self._vbox.addStretch()
+            tabs.addTab(tab_anim, "Animation")
+
         self.setCentralWidget(root)
 
     def _add_section(self, widget):
         self._vbox.addWidget(widget)
+
+    def _build_animation_section(self):
+        grp_open = _section("ANIMATION EDITOR")
+        layout_open = QVBoxLayout(grp_open)
+        layout_open.setSpacing(6)
+        hint = _label(
+            "Timeline-based keyframe animation.\n"
+            "Animate any fractal, render, or camera property.\n"
+            "Supports float, color, bool and int tracks.",
+            COLORS['fg2'], FONT_SMALL
+        )
+        hint.setStyleSheet(
+            f"color: {COLORS['fg2']}; background: {COLORS['bg2']};"
+            "padding: 6px 8px; border-radius: 4px;"
+        )
+        layout_open.addWidget(hint)
+        open_btn = QPushButton("Open Animation Editor")
+        open_btn.setFont(FONT_BOLD)
+        open_btn.setStyleSheet(_css_button(COLORS['accent'], COLORS['panel']))
+        open_btn.setFixedHeight(34)
+        open_btn.clicked.connect(self._open_anim_editor)
+        layout_open.addWidget(open_btn)
+        self._add_section(grp_open)
+
+        grp_clip = _section("CLIP SELECTION")
+        layout_clip = QVBoxLayout(grp_clip)
+        layout_clip.setSpacing(4)
+        self._clip_combo = QComboBox()
+        self._clip_combo.setStyleSheet(
+            f"QComboBox {{ background: {COLORS['panel']}; color: {COLORS['fg']};"
+            f" border: 1px solid {COLORS['fg4']}; border-radius: 3px; padding: 3px 6px; }}"
+            f"QComboBox::drop-down {{ border: none; }}"
+            f"QComboBox QAbstractItemView {{ background: {COLORS['panel']}; color: {COLORS['fg']};"
+            f" selection-background-color: {COLORS['accent']}; border: 1px solid {COLORS['fg4']}; }}"
+        )
+        self._clip_combo.currentIndexChanged.connect(self._on_clip_combo_changed)
+        layout_clip.addWidget(self._clip_combo)
+        self._add_section(grp_clip)
+
+        grp_ctl = _section("PLAYBACK CONTROL")
+        layout_ctl = QVBoxLayout(grp_ctl)
+        layout_ctl.setSpacing(4)
+        row1 = QHBoxLayout()
+        self._anim_play_btn = QPushButton("Play")
+        self._anim_play_btn.setStyleSheet(_css_button())
+        self._anim_play_btn.clicked.connect(self._anim_toggle_play)
+        self._anim_stop_btn = QPushButton("Stop")
+        self._anim_stop_btn.setStyleSheet(_css_button())
+        self._anim_stop_btn.clicked.connect(_anim_state.stop)
+        row1.addWidget(self._anim_play_btn)
+        row1.addWidget(self._anim_stop_btn)
+        layout_ctl.addLayout(row1)
+        self._anim_time_lbl = _label("t = 0.000s  |  clip: —", COLORS['fg3'], FONT_SMALL)
+        layout_ctl.addWidget(self._anim_time_lbl)
+        self._add_section(grp_ctl)
+
+        _anim_state.time_changed.connect(self._on_anim_time)
+        _anim_state.playback_changed.connect(self._on_anim_play)
+        _anim_state.clip_changed.connect(self._on_anim_clip)
+        self._refresh_clip_combo()
+
+    def _open_anim_editor(self):
+        if _ANIM_AVAILABLE:
+            open_animation_editor()
+
+    def _anim_toggle_play(self):
+        _anim_state.toggle_play()
+
+    def _refresh_clip_combo(self):
+        if not hasattr(self, '_clip_combo'):
+            return
+        self._clip_combo.blockSignals(True)
+        self._clip_combo.clear()
+        for c in _anim_state.clips:
+            self._clip_combo.addItem(c.name)
+        idx = _anim_state._cur_idx
+        if 0 <= idx < self._clip_combo.count():
+            self._clip_combo.setCurrentIndex(idx)
+        self._clip_combo.blockSignals(False)
+
+    def _on_clip_combo_changed(self, idx):
+        if idx >= 0 and idx != _anim_state._cur_idx:
+            _anim_state.select_clip(idx)
+
+    def _on_anim_time(self, t: float):
+        clip = _anim_state.current_clip
+        cname = clip.name if clip else '—'
+        dur = f'/{clip.duration:.1f}s' if clip else ''
+        self._anim_time_lbl.setText(f't = {t:.3f}s{dur}  |  {cname}')
+
+    def _on_anim_play(self, playing: bool):
+        self._anim_play_btn.setText("Pause" if playing else "Play")
+        self._anim_play_btn.setStyleSheet(
+            _css_button(COLORS['accent'], COLORS['panel']) if playing
+            else _css_button()
+        )
+
+    def _on_anim_clip(self):
+        clip = _anim_state.current_clip
+        if clip and hasattr(self, '_anim_time_lbl'):
+            self._anim_time_lbl.setText(f't = 0.000s/{clip.duration:.1f}s  |  {clip.name}')
+        self._refresh_clip_combo()
+
     def _build_fractal_section(self):
         grp = _section("FRACTAL TYPE")
         layout = QVBoxLayout(grp)
