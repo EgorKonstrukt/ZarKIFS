@@ -1728,6 +1728,24 @@ def _rot_z(px, py, pz, a):
 
 def _apply_space_ops(px, py, pz):
     p = _params
+    if p.sph_inv_enabled:
+        qx = px - p.sph_inv_cx
+        qy = py - p.sph_inv_cy
+        qz = pz - p.sph_inv_cz
+        r2 = qx*qx + qy*qy + qz*qz
+        ir = p.sph_inv_radius
+        k  = (ir * ir) / max(r2, 1e-6)
+        px = p.sph_inv_cx + qx * k
+        py = p.sph_inv_cy + qy * k
+        pz = p.sph_inv_cz + qz * k
+    if p.lattice_fold_enabled:
+        lx, ly, lz = p.lattice_fold_x, p.lattice_fold_y, p.lattice_fold_z
+        px = px - lx * round(px / lx)
+        py = py - ly * round(py / ly)
+        pz = pz - lz * round(pz / lz)
+        px = abs(px) - lx * 0.5
+        py = abs(py) - ly * 0.5
+        pz = abs(pz) - lz * 0.5
     if p.rep_enabled:
         if p.rep_cell_x > 0.001:
             px = px - p.rep_cell_x * round(px / p.rep_cell_x)
@@ -1777,9 +1795,9 @@ def _apply_space_ops(px, py, pz):
 def _py_sdf(pos):
     p = _params
     px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
+    px, py, pz = _rot_x(px, py, pz, p.rot_x)
     px, py, pz = _rot_y(px, py, pz, p.rot_y)
     px, py, pz = _rot_z(px, py, pz, p.rot_z)
-    px, py, pz = _rot_x(px, py, pz, p.rot_x)
     px, py, pz = _apply_space_ops(px, py, pz)
     ft = p.fractal_type
     if ft == 0:   return _py_sdf_mandelbox(px, py, pz)
@@ -1816,7 +1834,7 @@ def _py_sdf_mandelbox(ox, oy, oz):
             pz = math.sin(pz * PI / (2.0 * fldz)) * fldz
         r2 = px*px + py*py + pz*pz
         if r2 < si * si:
-            k = so / (si * si)
+            k = so / si
             px *= k; py *= k; pz *= k; dr *= k
         elif r2 < so * so:
             k = so * so / r2
@@ -2105,8 +2123,10 @@ class PlayerState:
         if dt <= 0 or dt > 0.1:
             return
         pos = list(_params.cam_pos)
-        radius    = self._effective_radius()
+        radius     = self._effective_radius()
         gnd_thresh = self._ground_threshold()
+
+        pos = self._push_out(pos, radius)
 
         nx, ny, nz = _py_sdf_normal(pos)
         self._surface_normal = (nx, ny, nz)
@@ -2145,8 +2165,8 @@ class PlayerState:
         if mv_len > 1e-6:
             mvx /= mv_len; mvy /= mv_len; mvz /= mv_len
 
-        eff_move_spd = self.MOVE_SPEED * spd_mul
-        eff_speed_cap = self.SPEED_CAP * spd_mul
+        eff_move_spd  = self.MOVE_SPEED * spd_mul
+        eff_speed_cap = self.SPEED_CAP  * spd_mul
 
         if self.on_ground:
             vdot = self.vel[0]*gd[0] + self.vel[1]*gd[1] + self.vel[2]*gd[2]
@@ -2187,44 +2207,63 @@ class PlayerState:
             self.vel[0] *= inv; self.vel[1] *= inv; self.vel[2] *= inv
 
         n_substeps = self._PROBE_STEPS
-        sub_dt = dt / n_substeps
+        sub_dt     = dt / n_substeps
         for _ in range(n_substeps):
             dx = self.vel[0] * sub_dt
             dy = self.vel[1] * sub_dt
             dz = self.vel[2] * sub_dt
             step_len = math.sqrt(dx*dx + dy*dy + dz*dz)
             if step_len < 1e-9:
-                break
-            sdx, sdy, sdz = dx/step_len, dy/step_len, dz/step_len
-            t = 0.0
+                continue
+            sdx, sdy, sdz = dx / step_len, dy / step_len, dz / step_len
+            t   = 0.0
             max_t = step_len
-            for _ in range(64):
-                d = _py_sdf((pos[0]+sdx*t, pos[1]+sdy*t, pos[2]+sdz*t))
-                safe_step = d * 0.85
+            hit   = False
+            for _ in range(96):
+                cx_ = pos[0] + sdx * t
+                cy_ = pos[1] + sdy * t
+                cz_ = pos[2] + sdz * t
+                d   = _py_sdf((cx_, cy_, cz_))
                 if d < radius:
+                    hit = True
                     break
-                t += max(safe_step, 1e-4)
+                safe_step = d * 0.8
+                t += max(safe_step, 1e-5)
                 if t >= max_t:
                     t = max_t
                     break
-            pos[0] += sdx * t
-            pos[1] += sdy * t
-            pos[2] += sdz * t
-            d_final = _py_sdf(pos)
-            if d_final < radius:
-                cn, cy_n, cz_n = _py_sdf_normal(pos)
-                push = (radius - d_final) + 1e-4
-                pos[0] += cn * push
-                pos[1] += cy_n * push
-                pos[2] += cz_n * push
-                vdot = self.vel[0]*cn + self.vel[1]*cy_n + self.vel[2]*cz_n
+            if not hit:
+                pos[0] += sdx * t
+                pos[1] += sdy * t
+                pos[2] += sdz * t
+            else:
+                t = max(t - radius * 0.5, 0.0)
+                pos[0] += sdx * t
+                pos[1] += sdy * t
+                pos[2] += sdz * t
+                cn, cny, cnz = _py_sdf_normal(pos)
+                vdot = self.vel[0]*cn + self.vel[1]*cny + self.vel[2]*cnz
                 if vdot < 0.0:
-                    self.vel[0] -= cn * vdot
-                    self.vel[1] -= cy_n * vdot
-                    self.vel[2] -= cz_n * vdot
+                    self.vel[0] -= cn  * vdot
+                    self.vel[1] -= cny * vdot
+                    self.vel[2] -= cnz * vdot
+            for _ in range(self._PUSH_ITERS):
+                d_now = _py_sdf(pos)
+                if d_now >= radius:
+                    break
+                pn, pny, pnz = _py_sdf_normal(pos)
+                push = (radius - d_now) + 2e-4
+                pos[0] += pn  * push
+                pos[1] += pny * push
+                pos[2] += pnz * push
+                vd2 = self.vel[0]*pn + self.vel[1]*pny + self.vel[2]*pnz
+                if vd2 < 0.0:
+                    self.vel[0] -= pn  * vd2
+                    self.vel[1] -= pny * vd2
+                    self.vel[2] -= pnz * vd2
 
         _params.cam_pos = pos
-        sn = self._surface_normal
+        sn      = self._surface_normal
         alpha_n = 1.0 - math.exp(-self.NORMAL_SMOOTH * dt)
         for i in range(3):
             self._smooth_normal[i] += (sn[i] - self._smooth_normal[i]) * alpha_n
@@ -2376,32 +2415,32 @@ class FractalWindow(mglw.WindowConfig):
         }
 
     def _build_debug_probes(self, pos, ps):
-        probes = []
-        radius   = ps._effective_radius()
-        gnd_thr  = ps._ground_threshold()
-        gd       = ps._gravity_dir
-        sn       = ps._surface_normal
+        probes  = []
+        radius  = ps._effective_radius()
+        sn      = ps._surface_normal
+        gd      = ps._gravity_dir
         fwd, right, up = _calc_basis_from_params()
-        dirs = [
-            (sn[0], sn[1], sn[2]),
-            (-sn[0], -sn[1], -sn[2]),
-            (gd[0], gd[1], gd[2]),
-            (fwd[0], fwd[1], fwd[2]),
-            (-fwd[0], -fwd[1], -fwd[2]),
-            (right[0], right[1], right[2]),
-            (-right[0], -right[1], -right[2]),
-            (up[0], up[1], up[2]),
-            (-up[0], -up[1], -up[2]),
+        base_dirs = [
+            ( sn[0],    sn[1],    sn[2]),
+            (-sn[0],   -sn[1],   -sn[2]),
+            ( gd[0],    gd[1],    gd[2]),
+            ( fwd[0],   fwd[1],   fwd[2]),
+            (-fwd[0],  -fwd[1],  -fwd[2]),
+            ( right[0], right[1], right[2]),
+            (-right[0],-right[1],-right[2]),
+            ( up[0],    up[1],    up[2]),
+            (-up[0],   -up[1],   -up[2]),
         ]
-        diag_scale = radius * 0.85
-        for i in range(len(dirs)):
-            for j in range(i+1, len(dirs)):
-                dx = (dirs[i][0]+dirs[j][0]) * 0.5
-                dy = (dirs[i][1]+dirs[j][1]) * 0.5
-                dz = (dirs[i][2]+dirs[j][2]) * 0.5
-                ln = math.sqrt(dx*dx+dy*dy+dz*dz)
+        dirs = list(base_dirs)
+        n_base = len(base_dirs)
+        for i in range(n_base):
+            for j in range(i + 1, n_base):
+                dx = base_dirs[i][0] + base_dirs[j][0]
+                dy = base_dirs[i][1] + base_dirs[j][1]
+                dz = base_dirs[i][2] + base_dirs[j][2]
+                ln = math.sqrt(dx*dx + dy*dy + dz*dz)
                 if ln > 1e-6:
-                    dirs.append((dx/ln, dy/ln, dz/ln))
+                    dirs.append((dx / ln, dy / ln, dz / ln))
         for d in dirs[:32]:
             px = pos[0] + d[0] * radius
             py = pos[1] + d[1] * radius
@@ -2422,40 +2461,47 @@ class FractalWindow(mglw.WindowConfig):
         fov   = _params.fov
         import math as _m
 
-        def _world_to_2d_offset(wx, wy, wz):
-            dx, dy, dz = wx - pos[0], wy - pos[1], wz - pos[2]
-            z = dx*fwd[0] + dy*fwd[1] + dz*fwd[2]
-            if z < 0.001:
+        half_tan = _m.tan(fov * 0.5)
+
+        def _dir_to_ss_offset(dx, dy, dz):
+            ln = _m.sqrt(dx*dx + dy*dy + dz*dz)
+            if ln < 1e-9:
                 return None
-            half_tan = _m.tan(fov * 0.5)
-            sx = (dx*right[0] + dy*right[1] + dz*right[2]) / (z * half_tan)
-            sy = (dx*up[0]    + dy*up[1]    + dz*up[2])    / (z * half_tan)
+            dx /= ln; dy /= ln; dz /= ln
+            fd = dx*fwd[0] + dy*fwd[1] + dz*fwd[2]
+            if fd < 0.01:
+                return None
+            sx = (dx*right[0] + dy*right[1] + dz*right[2]) / (fd * half_tan)
+            sy = (dx*up[0]    + dy*up[1]    + dz*up[2])    / (fd * half_tan)
             return (sx * cw, sy * ch)
 
-        sn   = ps._surface_normal
-        gd   = ps._gravity_dir
-        rad  = ps._effective_radius()
-        gnd  = ps._ground_threshold()
+        def _clamp_ss(ox, oy):
+            return (max(-cw * 0.9, min(cw * 0.9, ox)),
+                    max(-ch * 0.9, min(ch * 0.9, oy)))
 
-        sn_off = _world_to_2d_offset(
-            pos[0] + sn[0] * rad * 4.0,
-            pos[1] + sn[1] * rad * 4.0,
-            pos[2] + sn[2] * rad * 4.0,
-        )
-        gd_off = _world_to_2d_offset(
-            pos[0] + gd[0] * gnd * 3.0,
-            pos[1] + gd[1] * gnd * 3.0,
-            pos[2] + gd[2] * gnd * 3.0,
-        )
+        sn  = ps._surface_normal
+        gd  = ps._gravity_dir
+        rad = ps._effective_radius()
+        gnd = ps._ground_threshold()
 
-        norm_ss = (float(sn_off[0]), float(sn_off[1])) if sn_off else (0.0, -80.0)
-        grav_ss = (float(gd_off[0]), float(gd_off[1])) if gd_off else (0.0,  80.0)
+        sn_off = _dir_to_ss_offset(sn[0], sn[1], sn[2])
+        if sn_off is None:
+            sn_off = (0.0, -80.0)
+        else:
+            sn_off = _clamp_ss(*sn_off)
+        norm_ss = (float(sn_off[0]), float(sn_off[1]))
+
+        gd_off = _dir_to_ss_offset(gd[0], gd[1], gd[2])
+        if gd_off is None:
+            gd_off = (0.0, 80.0)
+        else:
+            gd_off = _clamp_ss(*gd_off)
+        grav_ss = (float(gd_off[0]), float(gd_off[1]))
 
         sdf_v = float(_py_sdf(pos))
-        ref_z = max(rad, sdf_v) if sdf_v > 0 else rad
-        half_tan = _m.tan(fov * 0.5)
-        col_ring_px = float(rad  / (ref_z * half_tan) * ch) if ref_z > 1e-6 else 0.0
-        gnd_ring_px = float(gnd  / (ref_z * half_tan) * ch) if ref_z > 1e-6 else 0.0
+        ref_z = max(rad, abs(sdf_v)) if sdf_v != 0.0 else rad
+        col_ring_px = float(rad / (ref_z * half_tan) * ch) if ref_z > 1e-6 else 0.0
+        gnd_ring_px = float(gnd / (ref_z * half_tan) * ch) if ref_z > 1e-6 else 0.0
         col_ring_px = max(0.0, min(col_ring_px, float(min(w, h)) * 0.9))
         gnd_ring_px = max(0.0, min(gnd_ring_px, float(min(w, h)) * 0.9))
 
@@ -2465,9 +2511,13 @@ class FractalWindow(mglw.WindowConfig):
         probe_ss_list  = []
         probe_sdf_list = []
         for (px2, py2, pz2), sv in probes[:n_probes]:
-            off = _world_to_2d_offset(px2, py2, pz2)
+            dx = px2 - pos[0]
+            dy = py2 - pos[1]
+            dz = pz2 - pos[2]
+            off = _dir_to_ss_offset(dx, dy, dz)
             if off is not None:
-                probe_ss_list.append((cw + off[0], ch + off[1]))
+                ox, oy = _clamp_ss(*off)
+                probe_ss_list.append((cw + ox, ch + oy))
             else:
                 probe_ss_list.append((-9999.0, -9999.0))
             probe_sdf_list.append(float(sv))

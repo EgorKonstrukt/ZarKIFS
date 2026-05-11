@@ -3,6 +3,15 @@
 Real-time GPU fractal renderer built with Python, ModernGL and PyQt5.
 The project focuses on interactive exploration of 3D distance-estimated fractals, procedural lighting, volumetric effects and experimental Kaleidoscopic IFS transformations.
 
+Tested on:
+
+| GPU | OS | Result |
+| :--- | :--- | :--- |
+| RTX 3090 24Gb | Windows 10 22H2 | Working |
+| GT 740 2Gb | Windows 10 22H2 | Working |
+| Intel HD4000 | Windows 10 22H2 | GLSL Compile error |
+| AMD RX580 4Gb | Windows 10 21H2 | GLSL Compile error |
+
 The renderer is designed more like a sandbox than a fixed viewer: almost every part of the fractal pipeline can be modified in real time — folds, rotations, orbit traps, spatial warping, raymarch settings, lighting, post-processing and animation.
 ![img.png](Screenshots/img.png)
 ---
