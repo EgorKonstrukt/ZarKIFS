@@ -2,8 +2,9 @@ from __future__ import annotations
 import json
 import math
 import time
+import bisect as _bisect
 from pathlib import Path
-from PyQt5.QtCore import Qt, QTimer, QPointF, QRectF, QRect, pyqtSignal, QObject, QSize
+from PyQt5.QtCore import Qt, QTimer, QPointF, QRectF, QRect, pyqtSignal, QObject
 from PyQt5.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -11,9 +12,14 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QMenu, QInputDialog, QMessageBox,
     QFileDialog, QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox,
     QSizePolicy, QAbstractItemView, QFrame, QGridLayout,
-    QDialog, QDialogButtonBox, QLineEdit, QTreeWidget,
+    QDialog, QDialogButtonBox, QLineEdit, QTreeWidget, QSlider,
     QTreeWidgetItem, QHeaderView, QStyle,
 )
+
+try:
+    import app_config as _app_config
+except ImportError:
+    _app_config = None
 
 ANIM_VERSION = 1
 
@@ -40,11 +46,42 @@ COLORS = {
     'fg4':      '#5050a0',
 }
 
-FONT_SMALL = QFont('Segoe UI', 8)
-FONT_NORM  = QFont('Segoe UI', 9)
-FONT_BOLD  = QFont('Segoe UI', 9)
-FONT_BOLD.setBold(True)
-FONT_MONO  = QFont('Courier New', 8)
+def _pal(widget, role):
+    return widget.palette().color(role)
+
+def _canvas_bg(widget):
+    return _pal(widget, widget.palette().Base)
+
+def _canvas_bg_alt(widget):
+    return _pal(widget, widget.palette().AlternateBase)
+
+def _canvas_text(widget):
+    return _pal(widget, widget.palette().Text)
+
+def _canvas_mid(widget):
+    return _pal(widget, widget.palette().Mid)
+
+def _canvas_midlight(widget):
+    return _pal(widget, widget.palette().Midlight)
+
+def _canvas_highlight(widget):
+    return _pal(widget, widget.palette().Highlight)
+
+def _is_dark_theme():
+    app = QApplication.instance()
+    if app is None:
+        return True
+    bg = app.palette().color(app.palette().Window)
+    return bg.lightness() < 128
+
+def _canvas_font(size=8, bold=False, mono=False):
+    f = QFont('Courier New' if mono else 'Segoe UI', size)
+    if bold:
+        f.setBold(True)
+    return f
+
+def _c(key):
+    return QColor(COLORS[key])
 
 INTERP_NONE      = 0
 INTERP_LIN       = 1
@@ -57,31 +94,21 @@ INTERP_ELASTIC   = 7
 INTERP_BACK      = 8
 INTERP_EXPO      = 9
 
-INTERP_LABELS = {
-    INTERP_NONE:     'Step',
-    INTERP_LIN:      'Linear',
-    INTERP_CUBIC:    'Smooth (Catmull-Rom)',
-    INTERP_EASE_IN:  'Ease In',
-    INTERP_EASE_OUT: 'Ease Out',
-    INTERP_EASE_IO:  'Ease In-Out',
-    INTERP_BOUNCE:   'Bounce',
-    INTERP_ELASTIC:  'Elastic',
-    INTERP_BACK:     'Back',
-    INTERP_EXPO:     'Exponential',
+INTERP_TABLE = {
+    INTERP_NONE:     ('Step',               COLORS['key_step'], None),
+    INTERP_LIN:      ('Linear',             COLORS['key_lin'],  None),
+    INTERP_CUBIC:    ('Smooth (Catmull-Rom)',COLORS['key_free'], None),
+    INTERP_EASE_IN:  ('Ease In',            '#aa88ff',          None),
+    INTERP_EASE_OUT: ('Ease Out',           '#88ffcc',          None),
+    INTERP_EASE_IO:  ('Ease In-Out',        '#ffcc55',          None),
+    INTERP_BOUNCE:   ('Bounce',             '#ff8844',          None),
+    INTERP_ELASTIC:  ('Elastic',            '#ff55aa',          None),
+    INTERP_BACK:     ('Back',               '#55ddff',          None),
+    INTERP_EXPO:     ('Exponential',        '#aaffaa',          None),
 }
 
-INTERP_COLORS = {
-    INTERP_NONE:     COLORS['key_step'],
-    INTERP_LIN:      COLORS['key_lin'],
-    INTERP_CUBIC:    COLORS['key_free'],
-    INTERP_EASE_IN:  '#aa88ff',
-    INTERP_EASE_OUT: '#88ffcc',
-    INTERP_EASE_IO:  '#ffcc55',
-    INTERP_BOUNCE:   '#ff8844',
-    INTERP_ELASTIC:  '#ff55aa',
-    INTERP_BACK:     '#55ddff',
-    INTERP_EXPO:     '#aaffaa',
-}
+INTERP_LABELS = {k: v[0] for k, v in INTERP_TABLE.items()}
+INTERP_COLORS = {k: v[1] for k, v in INTERP_TABLE.items()}
 
 PROP_FLOAT = 'float'
 PROP_COLOR = 'color'
@@ -164,6 +191,44 @@ ALL_PROPERTIES = {
     'kl_fold_limit':     (PROP_FLOAT, 0.1,   3.0),
     'kl_sph_radius':     (PROP_FLOAT, 0.1,   2.0),
     'kl_mix_factor':     (PROP_FLOAT, 0.0,   1.0),
+    'kl_fold_limit_x':   (PROP_FLOAT, 0.0,   3.0),
+    'kl_fold_limit_y':   (PROP_FLOAT, 0.0,   3.0),
+    'kl_fold_limit_z':   (PROP_FLOAT, 0.0,   3.0),
+    'kl_offset_x':       (PROP_FLOAT, -3.0,  3.0),
+    'kl_offset_y':       (PROP_FLOAT, -3.0,  3.0),
+    'kl_offset_z':       (PROP_FLOAT, -3.0,  3.0),
+    'mb_scale_x':        (PROP_FLOAT, 0.0,   5.0),
+    'mb_scale_y':        (PROP_FLOAT, 0.0,   5.0),
+    'mb_scale_z':        (PROP_FLOAT, 0.0,   5.0),
+    'mb_offset_x':       (PROP_FLOAT, -5.0,  5.0),
+    'mb_offset_y':       (PROP_FLOAT, -5.0,  5.0),
+    'mb_offset_z':       (PROP_FLOAT, -5.0,  5.0),
+    'mb_inversion_radius': (PROP_FLOAT, 0.0, 4.0),
+    'mb2_polar_mix':     (PROP_FLOAT, 0.0,   1.0),
+    'mb2_rot_per_iter':  (PROP_FLOAT, 0.0,   0.5),
+    'ms_offset_x':       (PROP_FLOAT, -4.0,  4.0),
+    'ms_offset_y':       (PROP_FLOAT, -4.0,  4.0),
+    'ms_offset_z':       (PROP_FLOAT, -4.0,  4.0),
+    'ms_fold_abs_amount':(PROP_FLOAT, 0.0,   3.0),
+    'si_scale_x':        (PROP_FLOAT, 0.0,   4.0),
+    'si_scale_y':        (PROP_FLOAT, 0.0,   4.0),
+    'si_scale_z':        (PROP_FLOAT, 0.0,   4.0),
+    'si_offset_x':       (PROP_FLOAT, -3.0,  3.0),
+    'si_offset_y':       (PROP_FLOAT, -3.0,  3.0),
+    'si_offset_z':       (PROP_FLOAT, -3.0,  3.0),
+    'si_rot_y':          (PROP_FLOAT, 0.0,   1.3),
+    'oc_scale_y':        (PROP_FLOAT, 0.0,   4.0),
+    'oc_scale_z':        (PROP_FLOAT, 0.0,   4.0),
+    'oc_julia_x':        (PROP_FLOAT, -3.0,  3.0),
+    'oc_julia_y':        (PROP_FLOAT, -3.0,  3.0),
+    'oc_julia_z':        (PROP_FLOAT, -3.0,  3.0),
+    'sph_inv_radius':    (PROP_FLOAT, 0.1,   5.0),
+    'sph_inv_cx':        (PROP_FLOAT, -3.0,  3.0),
+    'sph_inv_cy':        (PROP_FLOAT, -3.0,  3.0),
+    'sph_inv_cz':        (PROP_FLOAT, -3.0,  3.0),
+    'lattice_fold_x':    (PROP_FLOAT, 0.2,   8.0),
+    'lattice_fold_y':    (PROP_FLOAT, 0.2,   8.0),
+    'lattice_fold_z':    (PROP_FLOAT, 0.2,   8.0),
     'cam_pos_x':         (PROP_FLOAT, -50.0, 50.0),
     'cam_pos_y':         (PROP_FLOAT, -50.0, 50.0),
     'cam_pos_z':         (PROP_FLOAT, -50.0, 50.0),
@@ -183,12 +248,20 @@ ALL_PROPERTIES = {
     'fold_mirror_x':     (PROP_BOOL,  None,  None),
     'fold_mirror_y':     (PROP_BOOL,  None,  None),
     'fold_mirror_z':     (PROP_BOOL,  None,  None),
+    'sph_inv_enabled':   (PROP_BOOL,  None,  None),
+    'lattice_fold_enabled': (PROP_BOOL, None, None),
+    'mb2_abs_x':         (PROP_BOOL,  None,  None),
+    'mb2_abs_y':         (PROP_BOOL,  None,  None),
+    'mb2_abs_z':         (PROP_BOOL,  None,  None),
     'fractal_type':      (PROP_INT,   0,     5),
     'color_mode':        (PROP_INT,   0,     3),
     'bg_mode':           (PROP_INT,   0,     3),
     'aa_samples':        (PROP_INT,   1,     3),
     'max_steps':         (PROP_INT,   32,    512),
     'shadow_steps':      (PROP_INT,   4,     64),
+    'ms_fold_type':      (PROP_INT,   0,     2),
+    'oc_julia_mode':     (PROP_INT,   0,     1),
+    'kl_julia_mode':     (PROP_INT,   0,     1),
 }
 
 PROP_GROUPS = {
@@ -271,7 +344,7 @@ def _expo_out(t):
     t = max(0.0, min(1.0, t))
     return 1.0 if t >= 1.0 else 1.0 - 2.0 ** (-10.0 * t)
 
-_EASING_FN = {
+_EASING_FUNCS = {
     INTERP_EASE_IN:  _ease_in,
     INTERP_EASE_OUT: _ease_out,
     INTERP_EASE_IO:  _smootherstep,
@@ -280,6 +353,12 @@ _EASING_FN = {
     INTERP_BACK:     _back_out,
     INTERP_EXPO:     _expo_out,
 }
+
+for _k, _fn in _EASING_FUNCS.items():
+    _lbl, _col, _ = INTERP_TABLE[_k]
+    INTERP_TABLE[_k] = (_lbl, _col, _fn)
+
+_EASING_FN = {k: v[2] for k, v in INTERP_TABLE.items() if v[2] is not None}
 
 def _catmull_rom_timed(p0, p1, p2, p3, t0, t1, t2, t3, t):
     dt12 = max(t2 - t1, 1e-9)
@@ -299,61 +378,64 @@ def _hermite(p0, p1, m0, m1, t):
     h11 =    t**3 -   t**2
     return h00*p0 + h10*m0 + h01*p1 + h11*m1
 
-def _interp_value(keys, time_sec, ptype):
-    if not keys:
+
+
+def _interp_value(keys, times, time_sec, ptype):
+    n = len(keys)
+    if not n:
         return None
-    if len(keys) == 1:
-        return keys[0][1]
-    before = [k for k in keys if k[0] <= time_sec]
-    after  = [k for k in keys if k[0] >  time_sec]
-    if not before:
-        return keys[0][1]
-    if not after:
-        return keys[-1][1]
-    k0     = before[-1]
-    k1     = after[0]
-    interp = k0[2] if len(k0) > 2 else INTERP_LIN
-    dt     = k1[0] - k0[0]
+    if n == 1:
+        return keys[0].value
+    idx1 = _bisect.bisect_right(times, time_sec)
+    if idx1 == 0:
+        return keys[0].value
+    if idx1 == n:
+        return keys[-1].value
+    idx0   = idx1 - 1
+    k0     = keys[idx0]
+    k1     = keys[idx1]
+    interp = k0.interp
+    dt     = k1.time - k0.time
     if dt < 1e-9:
-        return k1[1]
-    t = (time_sec - k0[0]) / dt
+        return k1.value
+    t = (time_sec - k0.time) / dt
     if ptype in (PROP_BOOL, PROP_INT) or interp == INTERP_NONE:
-        return k0[1]
+        return k0.value
     easing_fn = _EASING_FN.get(interp)
     if easing_fn is not None:
         t_eased = easing_fn(t)
         if ptype == PROP_COLOR:
-            return tuple(_lerp(k0[1][i], k1[1][i], t_eased) for i in range(3))
-        return _lerp(k0[1], k1[1], t_eased)
+            v0, v1 = k0.value, k1.value
+            return (v0[0] + (v1[0] - v0[0]) * t_eased,
+                    v0[1] + (v1[1] - v0[1]) * t_eased,
+                    v0[2] + (v1[2] - v0[2]) * t_eased)
+        return _lerp(k0.value, k1.value, t_eased)
     if ptype == PROP_COLOR:
         if interp == INTERP_CUBIC:
             t = _smoothstep(t)
-        return tuple(_lerp(k0[1][i], k1[1][i], t) for i in range(3))
+        v0, v1 = k0.value, k1.value
+        return (v0[0] + (v1[0] - v0[0]) * t,
+                v0[1] + (v1[1] - v0[1]) * t,
+                v0[2] + (v1[2] - v0[2]) * t)
     if interp == INTERP_CUBIC:
-        idx0 = next(i for i, k in enumerate(keys) if k[0] == k0[0])
-        idx1 = idx0 + 1
-        kf0_obj = keys[idx0]
-        kf1_obj = keys[idx1]
-        tan_out = kf0_obj[3] if len(kf0_obj) > 3 and kf0_obj[3] is not None else None
-        tan_in  = kf1_obj[4] if len(kf1_obj) > 4 and kf1_obj[4] is not None else None
-        if tan_out is not None and tan_in is not None:
-            return _hermite(k0[1], k1[1], tan_out * dt, tan_in * dt, t)
         if idx0 > 0:
-            km1 = keys[idx0 - 1]
-            t0_g, p0v = km1[0], km1[1]
+            km1  = keys[idx0 - 1]
+            t0_g = km1.time
+            p0v  = km1.value
         else:
-            t0_g = k0[0] - (k1[0] - k0[0])
-            p0v  = k0[1] + (k0[1] - k1[1])
-        if idx1 < len(keys) - 1:
-            kp1 = keys[idx1 + 1]
-            t3_g, p3v = kp1[0], kp1[1]
+            t0_g = k0.time - (k1.time - k0.time)
+            p0v  = k0.value + (k0.value - k1.value)
+        if idx1 < n - 1:
+            kp1  = keys[idx1 + 1]
+            t3_g = kp1.time
+            p3v  = kp1.value
         else:
-            t3_g = k1[0] + (k1[0] - k0[0])
-            p3v  = k1[1] + (k1[1] - k0[1])
-        return _catmull_rom_timed(p0v, k0[1], k1[1], p3v,
-                                  t0_g, k0[0], k1[0], t3_g,
+            t3_g = k1.time + (k1.time - k0.time)
+            p3v  = k1.value + (k1.value - k0.value)
+        return _catmull_rom_timed(p0v, k0.value, k1.value, p3v,
+                                  t0_g, k0.time, k1.time, t3_g,
                                   time_sec)
-    return _lerp(k0[1], k1[1], t)
+    return _lerp(k0.value, k1.value, t)
 
 
 class Keyframe:
@@ -374,6 +456,12 @@ class AnimTrack:
         self.prop    = prop
         self.keys    = []
         self.enabled = True
+        self._ptype  = ALL_PROPERTIES.get(prop, (PROP_FLOAT,))[0]
+        self._times  = []
+
+    def _rebuild_times(self):
+        self._times = [k.time for k in self.keys]
+
     def add_key(self, t, value, interp=INTERP_CUBIC):
         for k in self.keys:
             if abs(k.time - t) < 1e-6:
@@ -383,22 +471,27 @@ class AnimTrack:
         kf = Keyframe(t, value, interp)
         self.keys.append(kf)
         self.keys.sort(key=lambda k: k.time)
+        self._rebuild_times()
         return kf
+
     def remove_key(self, kf):
         if kf in self.keys:
             self.keys.remove(kf)
+            self._rebuild_times()
+
     def evaluate(self, t):
-        ptype = ALL_PROPERTIES.get(self.prop, (PROP_FLOAT,))[0]
-        raw   = [(k.time, k.value, k.interp) for k in self.keys]
-        return _interp_value(raw, t, ptype)
+        return _interp_value(self.keys, self._times, t, self._ptype)
+
     def to_dict(self):
         return {'prop': self.prop, 'enabled': self.enabled,
                 'keys': [k.to_list() for k in self.keys]}
+
     @classmethod
     def from_dict(cls, d):
         tr = cls(d['prop'])
         tr.enabled = d.get('enabled', True)
         tr.keys    = [Keyframe.from_list(lst) for lst in d.get('keys', [])]
+        tr._rebuild_times()
         return tr
 
 
@@ -619,13 +712,21 @@ class MoveKeysCommand(UndoCommand):
     def __init__(self, moves):
         self._moves = [(tr, kf, old_t, new_t) for tr, kf, old_t, new_t in moves]
     def redo(self):
+        dirty = set()
         for tr, kf, _, new_t in self._moves:
             kf.time = new_t
+            dirty.add(tr)
+        for tr in dirty:
             tr.keys.sort(key=lambda k: k.time)
+            tr._rebuild_times()
     def undo(self):
+        dirty = set()
         for tr, kf, old_t, _ in self._moves:
             kf.time = old_t
+            dirty.add(tr)
+        for tr in dirty:
             tr.keys.sort(key=lambda k: k.time)
+            tr._rebuild_times()
 
 class SetInterpCommand(UndoCommand):
     def __init__(self, keys_modes, new_mode):
@@ -646,9 +747,11 @@ class EditKeyCommand(UndoCommand):
     def redo(self):
         self._kf.time, self._kf.value, self._kf.interp = self._new
         self._track.keys.sort(key=lambda k: k.time)
+        self._track._rebuild_times()
     def undo(self):
         self._kf.time, self._kf.value, self._kf.interp = self._old
         self._track.keys.sort(key=lambda k: k.time)
+        self._track._rebuild_times()
 
 
 class UndoStack(QObject):
@@ -687,35 +790,59 @@ class UndoStack(QObject):
 _undo_stack = UndoStack()
 
 
-def _btn_css(bg=None, fg=None, hover=None, border=None, radius=4, pad='4px 10px'):
-    bg     = bg     or COLORS['panel2']
-    fg     = fg     or COLORS['fg']
-    hover  = hover  or COLORS['sel']
-    border = border or COLORS['border']
-    return (
-        f"QPushButton {{ background: {bg}; color: {fg}; border: 1px solid {border};"
-        f" border-radius: {radius}px; padding: {pad}; font: 9pt 'Segoe UI'; }}"
-        f"QPushButton:hover {{ background: {hover}; border-color: {COLORS['accent']}; }}"
-        f"QPushButton:pressed {{ background: {COLORS['accent2']}; }}"
-        f"QPushButton:disabled {{ color: {COLORS['fg4']}; background: {COLORS['panel']}; }}"
-    )
-
 def _icon_btn(std_icon, tooltip=''):
     btn = QPushButton()
     btn.setIcon(QApplication.style().standardIcon(std_icon))
-    btn.setIconSize(QSize(16, 16))
-    btn.setFixedSize(28, 26)
     btn.setToolTip(tooltip)
-    btn.setStyleSheet(_btn_css(pad='2px 4px'))
     return btn
 
-def _menu_css():
-    return (
-        f"QMenu {{ background: {COLORS['panel2']}; color: {COLORS['fg']};"
-        f" border: 1px solid {COLORS['border']}; }}"
-        f"QMenu::item {{ padding: 4px 20px; }}"
-        f"QMenu::item:selected {{ background: {COLORS['sel']}; }}"
-    )
+
+class SliderSpinBox(QWidget):
+    valueChanged = pyqtSignal(float)
+    STEPS = 1000
+    def __init__(self, lo, hi, decimals=3, parent=None):
+        super().__init__(parent)
+        self._lo       = float(lo)
+        self._hi       = float(hi)
+        self._decimals = decimals
+        self._updating = False
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._slider = QSlider(Qt.Horizontal)
+        self._slider.setRange(0, self.STEPS)
+        self._spin = QDoubleSpinBox()
+        self._spin.setRange(lo, hi)
+        self._spin.setDecimals(decimals)
+        self._spin.setSingleStep((hi - lo) / 100.0)
+        row.addWidget(self._slider, 1)
+        row.addWidget(self._spin, 0)
+        self._slider.valueChanged.connect(self._slider_changed)
+        self._spin.valueChanged.connect(self._spin_changed)
+    def _slider_changed(self, v):
+        if self._updating:
+            return
+        val = self._lo + (self._hi - self._lo) * v / self.STEPS
+        self._updating = True
+        self._spin.setValue(val)
+        self._updating = False
+        self.valueChanged.emit(val)
+    def _spin_changed(self, v):
+        if self._updating:
+            return
+        sv = int(round((v - self._lo) / (self._hi - self._lo) * self.STEPS))
+        self._updating = True
+        self._slider.setValue(max(0, min(self.STEPS, sv)))
+        self._updating = False
+        self.valueChanged.emit(v)
+    def value(self):
+        return self._spin.value()
+    def setValue(self, v):
+        self._updating = True
+        self._spin.setValue(v)
+        sv = int(round((v - self._lo) / (self._hi - self._lo) * self.STEPS))
+        self._slider.setValue(max(0, min(self.STEPS, sv)))
+        self._updating = False
 
 
 class ClipListPanel(QWidget):
@@ -727,23 +854,12 @@ class ClipListPanel(QWidget):
         state.clip_changed.connect(self._refresh)
 
     def _build(self):
-        self.setFixedWidth(200)
-        self.setStyleSheet(f"background: {COLORS['bg2']}; color: {COLORS['fg']};")
         root = QVBoxLayout(self)
         root.setContentsMargins(4, 4, 4, 4)
         root.setSpacing(4)
         hdr = QLabel("CLIPS")
-        hdr.setFont(FONT_BOLD)
-        hdr.setStyleSheet(f"color: {COLORS['accent']}; background: transparent; padding: 2px 0px;")
         root.addWidget(hdr)
         self._list = QListWidget()
-        self._list.setStyleSheet(
-            f"QListWidget {{ background: {COLORS['panel']}; color: {COLORS['fg']};"
-            f" border: 1px solid {COLORS['border']}; border-radius: 4px; }}"
-            f"QListWidget::item {{ padding: 6px 8px; border-bottom: 1px solid {COLORS['bg2']}; }}"
-            f"QListWidget::item:selected {{ background: {COLORS['sel']}; color: {COLORS['fg']}; }}"
-            f"QListWidget::item:hover {{ background: {COLORS['panel2']}; }}"
-        )
         self._list.currentRowChanged.connect(self._on_select)
         self._list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._ctx_menu)
@@ -780,7 +896,6 @@ class ClipListPanel(QWidget):
 
     def _ctx_menu(self, pos):
         menu = QMenu(self)
-        menu.setStyleSheet(_menu_css())
         row = self._list.currentRow()
         actions = [
             (QStyle.SP_FileDialogNewFolder,    'Add Clip',  self._add_clip),
@@ -829,18 +944,6 @@ class PropSelectorDialog(QDialog):
     def __init__(self, existing, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Add Property Track')
-        self.setMinimumSize(380, 500)
-        self.setStyleSheet(
-            f"QDialog {{ background: {COLORS['bg2']}; color: {COLORS['fg']}; }}"
-            f"QTreeWidget {{ background: {COLORS['panel']}; color: {COLORS['fg']};"
-            f" border: 1px solid {COLORS['border']}; border-radius: 4px; }}"
-            f"QTreeWidget::item {{ padding: 3px 4px; }}"
-            f"QTreeWidget::item:selected {{ background: {COLORS['sel']}; }}"
-            f"QHeaderView::section {{ background: {COLORS['panel2']}; color: {COLORS['fg2']};"
-            f" border: none; padding: 3px; }}"
-            f"QLineEdit {{ background: {COLORS['panel']}; color: {COLORS['fg']};"
-            f" border: 1px solid {COLORS['border']}; border-radius: 3px; padding: 3px 6px; }}"
-        )
         self._existing = set(existing)
         root = QVBoxLayout(self)
         root.setSpacing(6)
@@ -858,11 +961,6 @@ class PropSelectorDialog(QDialog):
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
-        btns.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['panel2']}; color: {COLORS['fg']};"
-            f" border: 1px solid {COLORS['border']}; border-radius: 3px; padding: 4px 16px; }}"
-            f"QPushButton:hover {{ background: {COLORS['sel']}; }}"
-        )
         root.addWidget(btns)
 
     def _populate(self, filt):
@@ -870,8 +968,6 @@ class PropSelectorDialog(QDialog):
         filt = filt.lower()
         for group, props in PROP_GROUPS.items():
             g_item = QTreeWidgetItem([group, ''])
-            g_item.setFont(0, FONT_BOLD)
-            g_item.setForeground(0, QColor(COLORS['accent']))
             added = 0
             for p in props:
                 if p in self._existing or p not in ALL_PROPERTIES:
@@ -880,7 +976,6 @@ class PropSelectorDialog(QDialog):
                     continue
                 ptype = ALL_PROPERTIES[p][0]
                 child = QTreeWidgetItem([p, ptype])
-                child.setForeground(1, QColor(COLORS['fg4']))
                 child.setData(0, Qt.UserRole, p)
                 g_item.addChild(child)
                 added += 1
@@ -935,8 +1030,15 @@ class TimeRuler(QWidget):
 
     def paintEvent(self, _):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor(COLORS['bg3']))
-        p.setPen(QPen(QColor(COLORS['border']), 1))
+        pal   = self.palette()
+        dark  = _is_dark_theme()
+        c_bg  = QColor(COLORS['bg3'])  if dark else pal.color(pal.Window)
+        c_bdr = QColor(COLORS['border']) if dark else pal.color(pal.Mid)
+        c_fg  = QColor(COLORS['fg3']) if dark else pal.color(pal.Text)
+        c_dim = QColor(COLORS['fg4']) if dark else pal.color(pal.Midlight)
+        c_ph  = QColor(COLORS['playhead'])
+        p.fillRect(self.rect(), c_bg)
+        p.setPen(QPen(c_bdr, 1))
         p.drawLine(0, self.RULER_H - 1, self.width(), self.RULER_H - 1)
         span = self._view_end - self._view_start
         if span > 0:
@@ -946,17 +1048,17 @@ class TimeRuler(QWidget):
                 x        = int(self._t_to_x(t))
                 is_major = abs(round(t / step) * step - t) < step * 0.01
                 if is_major:
-                    p.setPen(QPen(QColor(COLORS['fg3']), 1))
+                    p.setPen(QPen(c_fg, 1))
                     p.drawLine(x, self.RULER_H - 10, x, self.RULER_H - 1)
-                    p.setFont(FONT_SMALL)
+                    p.setFont(_canvas_font(8))
                     lbl = f'{t:.1f}s' if step < 1.0 else f'{int(t)}s'
                     p.drawText(x + 2, self.RULER_H - 10, lbl)
                 else:
-                    p.setPen(QPen(QColor(COLORS['fg4']), 1))
+                    p.setPen(QPen(c_dim, 1))
                     p.drawLine(x, self.RULER_H - 5, x, self.RULER_H - 1)
                 t += step
         ph_x = int(self._t_to_x(self._time))
-        p.setPen(QPen(QColor(COLORS['playhead']), 2))
+        p.setPen(QPen(c_ph, 2))
         p.drawLine(ph_x, 0, ph_x, self.RULER_H)
         p.end()
 
@@ -1007,6 +1109,10 @@ class TrackWidget(QWidget):
         self._box_select      = False
         self._box_start       = None
         self._box_end         = None
+        self._mmb_pan_active  = False
+        self._mmb_pan_x       = 0
+        self._mmb_pan_vs      = 0.0
+        self._mmb_pan_ve      = 0.0
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -1077,32 +1183,46 @@ class TrackWidget(QWidget):
         clip   = self._clip()
         tracks = self._tracks()
         h      = max(self.TRACK_H, len(tracks) * self.TRACK_H, self.height())
+        dark   = _is_dark_theme()
+        pal    = self.palette()
+        c_bg0      = QColor(COLORS['track'])   if dark else pal.color(pal.Base)
+        c_bg1      = QColor(COLORS['track2'])  if dark else pal.color(pal.AlternateBase)
+        c_sel_bg   = QColor(COLORS['sel']).lighter(60) if dark else pal.color(pal.Highlight).lighter(170)
+        c_lbl_bg   = QColor(COLORS['panel'])   if dark else pal.color(pal.Window)
+        c_lbl_sel  = QColor(COLORS['panel2'])  if dark else pal.color(pal.Highlight).lighter(150)
+        c_border   = QColor(COLORS['border'])  if dark else pal.color(pal.Mid)
+        c_accent   = QColor(COLORS['accent'])  if dark else pal.color(pal.Highlight)
+        c_fg       = QColor(COLORS['fg'])      if dark else pal.color(pal.Text)
+        c_fg2      = QColor(COLORS['fg2'])     if dark else pal.color(pal.WindowText)
+        c_fg4      = QColor(COLORS['fg4'])     if dark else pal.color(pal.Midlight)
+        c_key_bg   = QColor(COLORS['bg'])      if dark else pal.color(pal.Base)
+        c_ph       = QColor(COLORS['playhead'])
         for i, track in enumerate(tracks):
             ry       = i * self.TRACK_H
             is_sel   = (track is self._selected_track)
-            bg_color = QColor(COLORS['sel']).lighter(60) if is_sel else QColor(COLORS['track'] if i % 2 == 0 else COLORS['track2'])
+            bg_color = c_sel_bg if is_sel else (c_bg0 if i % 2 == 0 else c_bg1)
             p.fillRect(QRect(0, ry, self.width(), self.TRACK_H), bg_color)
-            lbl_bg = QColor(COLORS['panel2']) if is_sel else QColor(COLORS['panel'])
+            lbl_bg = c_lbl_sel if is_sel else c_lbl_bg
             p.fillRect(QRect(0, ry, self.LABEL_W, self.TRACK_H), lbl_bg)
             if is_sel:
-                p.setPen(QPen(QColor(COLORS['accent']), 1))
+                p.setPen(QPen(c_accent, 1))
                 p.drawRect(QRect(0, ry, self.LABEL_W - 1, self.TRACK_H - 1))
-            p.setPen(QPen(QColor(COLORS['border']), 1))
+            p.setPen(QPen(c_border, 1))
             p.drawLine(0, ry + self.TRACK_H - 1, self.width(), ry + self.TRACK_H - 1)
             p.drawLine(self.LABEL_W, ry, self.LABEL_W, ry + self.TRACK_H)
-            p.setPen(QColor(COLORS['fg'] if is_sel else (COLORS['fg2'] if track.enabled else COLORS['fg4'])))
-            p.setFont(FONT_NORM)
+            p.setPen(c_fg if is_sel else (c_fg2 if track.enabled else c_fg4))
+            p.setFont(_canvas_font(9))
             lbl_r = QRect(8, ry, self.LABEL_W - 12, self.TRACK_H)
             p.drawText(lbl_r, Qt.AlignVCenter | Qt.AlignLeft, track.prop)
-            p.setPen(QColor(COLORS['fg4']))
-            p.setFont(FONT_SMALL)
+            p.setPen(c_fg4)
+            p.setFont(_canvas_font(8))
             ptype = ALL_PROPERTIES.get(track.prop, (PROP_FLOAT,))[0]
             p.drawText(QRect(0, ry, self.LABEL_W - 6, self.TRACK_H), Qt.AlignVCenter | Qt.AlignRight, ptype)
             if not track.enabled:
                 continue
             cy = ry + self.TRACK_H // 2
             if len(track.keys) > 1:
-                p.setPen(QPen(QColor(COLORS['border']), 1, Qt.DotLine))
+                p.setPen(QPen(c_border, 1, Qt.DotLine))
                 x0 = max(self._t_to_x(track.keys[0].time), self.LABEL_W)
                 x1 = self._t_to_x(track.keys[-1].time)
                 p.drawLine(int(x0), cy, int(x1), cy)
@@ -1127,15 +1247,15 @@ class TrackWidget(QWidget):
                     p.setPen(QPen(QColor('#ffffff'), 1))
                 else:
                     p.setBrush(QBrush(icolor))
-                    p.setPen(QPen(QColor(COLORS['bg']), 1))
+                    p.setPen(QPen(c_key_bg, 1))
                 p.drawPath(path)
         if not tracks:
-            p.setPen(QColor(COLORS['fg4']))
-            p.setFont(FONT_NORM)
+            p.setPen(c_fg4)
+            p.setFont(_canvas_font(9))
             p.drawText(self.rect(), Qt.AlignCenter, 'No tracks — click "+ Add Track" to begin')
         if clip:
             ph_x = int(self._t_to_x(self._state.time))
-            p.setPen(QPen(QColor(COLORS['playhead']), 1))
+            p.setPen(QPen(c_ph, 1))
             p.drawLine(ph_x, 0, ph_x, h)
         if self._box_select and self._box_start and self._box_end:
             r = QRectF(self._box_start, self._box_end).normalized()
@@ -1200,8 +1320,11 @@ class TrackWidget(QWidget):
                 self._drag_seek   = False
                 self.update()
         elif ev.button() == Qt.MiddleButton:
-            self._drag_seek = True
-            self.seek_requested.emit(max(0.0, self._x_to_t(ev.x())))
+            self._mmb_pan_active = True
+            self._mmb_pan_x      = ev.x()
+            self._mmb_pan_vs     = self._view_start
+            self._mmb_pan_ve     = self._view_end
+            self.setCursor(Qt.SizeHorCursor)
         elif ev.button() == Qt.RightButton:
             if ti is None:
                 ti, track = self._track_at_row(ev.y())
@@ -1236,6 +1359,21 @@ class TrackWidget(QWidget):
             self.update()
         elif self._drag_seek and (ev.buttons() & (Qt.LeftButton | Qt.MiddleButton)):
             self.seek_requested.emit(max(0.0, self._x_to_t(ev.x())))
+        if self._mmb_pan_active and (ev.buttons() & Qt.MiddleButton):
+            dx   = ev.x() - self._mmb_pan_x
+            span = self._mmb_pan_ve - self._mmb_pan_vs
+            dt   = -dx / max(self.width() - self.LABEL_W, 1) * span
+            new_vs = max(0.0, self._mmb_pan_vs + dt)
+            new_ve = new_vs + span
+            self._view_start = new_vs
+            self._view_end   = new_ve
+            parent = self.parent()
+            while parent:
+                if hasattr(parent, '_sync_view'):
+                    parent._sync_view()
+                    break
+                parent = parent.parent() if hasattr(parent, 'parent') else None
+            self.update()
 
     def mouseReleaseEvent(self, ev):
         if self._drag_key:
@@ -1255,6 +1393,9 @@ class TrackWidget(QWidget):
             self._box_end    = None
         self._drag_key  = False
         self._drag_seek = False
+        if self._mmb_pan_active:
+            self._mmb_pan_active = False
+            self.setCursor(Qt.ArrowCursor)
         self.update()
 
     def _track_index_of(self, track):
@@ -1329,7 +1470,6 @@ class TrackWidget(QWidget):
 
     def _ctx_menu(self, pos, ti, track, kf):
         menu = QMenu(self)
-        menu.setStyleSheet(_menu_css())
         if kf is not None:
             sel_pairs = self._selected_key_pairs()
             if len(sel_pairs) > 1:
@@ -1338,7 +1478,6 @@ class TrackWidget(QWidget):
                 a_del.triggered.connect(self._delete_selected)
                 menu.addSeparator()
                 im = menu.addMenu('Set Interpolation (all selected)')
-                im.setStyleSheet(_menu_css())
                 for mode, label in INTERP_LABELS.items():
                     ac = im.addAction(label)
                     ac.triggered.connect(lambda _, m=mode: self._set_interp_selected(m))
@@ -1347,7 +1486,6 @@ class TrackWidget(QWidget):
                 a.triggered.connect(lambda: self._delete_key_cmd(track, kf))
                 menu.addSeparator()
                 im = menu.addMenu('Interpolation')
-                im.setStyleSheet(_menu_css())
                 for mode, label in INTERP_LABELS.items():
                     ac = im.addAction(label)
                     ac.setCheckable(True)
@@ -1425,13 +1563,7 @@ class KeyEditDialog(QDialog):
     def __init__(self, prop, kf, ptype_info, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f'Edit Keyframe: {prop}')
-        self.setFixedWidth(320)
-        self.setStyleSheet(
-            f"QDialog {{ background: {COLORS['bg2']}; color: {COLORS['fg']}; }}"
-            f"QLabel {{ background: transparent; color: {COLORS['fg']}; }}"
-            f"QDoubleSpinBox, QSpinBox, QComboBox {{ background: {COLORS['panel']}; color: {COLORS['fg']};"
-            f" border: 1px solid {COLORS['border']}; border-radius: 3px; padding: 2px 4px; }}"
-        )
+
         self.time_val   = kf.time
         self.prop_val   = kf.value
         self.interp_val = kf.interp
@@ -1490,11 +1622,7 @@ class KeyEditDialog(QDialog):
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self._accept)
         btns.rejected.connect(self.reject)
-        btns.setStyleSheet(
-            f"QPushButton {{ background: {COLORS['panel2']}; color: {COLORS['fg']};"
-            f" border: 1px solid {COLORS['border']}; border-radius: 3px; padding: 4px 16px; }}"
-            f"QPushButton:hover {{ background: {COLORS['sel']}; }}"
-        )
+
         root.addWidget(btns)
 
     def _accept(self):
@@ -1657,7 +1785,16 @@ class CurveEditor(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.fillRect(self.rect(), QColor(COLORS['bg']))
+        dark  = _is_dark_theme()
+        pal   = self.palette()
+        c_bg     = QColor(COLORS['bg'])      if dark else pal.color(pal.Base)
+        c_grid   = QColor(COLORS['panel2'])  if dark else pal.color(pal.AlternateBase)
+        c_border = QColor(COLORS['border'])  if dark else pal.color(pal.Mid)
+        c_fg2    = QColor(COLORS['fg2'])     if dark else pal.color(pal.WindowText)
+        c_fg4    = QColor(COLORS['fg4'])     if dark else pal.color(pal.Midlight)
+        c_accent = QColor(COLORS['accent'])  if dark else pal.color(pal.Highlight)
+        c_ph     = QColor(COLORS['playhead'])
+        p.fillRect(self.rect(), c_bg)
         m  = self._m()
         iw = self._iw()
         ih = self._ih()
@@ -1670,10 +1807,10 @@ class CurveEditor(QWidget):
             while ti <= self._view_end + step_t:
                 x = self._t_to_x(ti)
                 if m <= x <= m + iw:
-                    p.setPen(QPen(QColor(COLORS['panel2']), 1, Qt.DotLine))
+                    p.setPen(QPen(c_grid, 1, Qt.DotLine))
                     p.drawLine(QPointF(x, m), QPointF(x, m + ih))
-                    p.setPen(QPen(QColor(COLORS['fg4']), 1))
-                    p.setFont(FONT_SMALL)
+                    p.setPen(QPen(c_fg4, 1))
+                    p.setFont(_canvas_font(8))
                     lbl = f'{ti:.2g}s'
                     p.drawText(QRectF(x - 20, m + ih + 2, 40, m - 4), Qt.AlignHCenter | Qt.AlignTop, lbl)
                 ti += step_t
@@ -1683,26 +1820,26 @@ class CurveEditor(QWidget):
             while vi <= self._val_max + step_v:
                 y = self._v_to_y(vi)
                 if m <= y <= m + ih:
-                    p.setPen(QPen(QColor(COLORS['panel2']), 1, Qt.DotLine))
+                    p.setPen(QPen(c_grid, 1, Qt.DotLine))
                     p.drawLine(QPointF(m, y), QPointF(m + iw, y))
-                    p.setPen(QPen(QColor(COLORS['fg4']), 1))
-                    p.setFont(FONT_SMALL)
+                    p.setPen(QPen(c_fg4, 1))
+                    p.setFont(_canvas_font(8))
                     p.drawText(QRectF(0, y - 8, m - 4, 16), Qt.AlignRight | Qt.AlignVCenter, f'{vi:.4g}')
                 vi += step_v
-        p.setPen(QPen(QColor(COLORS['border']), 1))
+        p.setPen(QPen(c_border, 1))
         p.drawRect(QRectF(m, m, iw, ih))
         track = self._track
         if not track or not track.keys:
-            p.setPen(QColor(COLORS['fg4']))
-            p.setFont(FONT_NORM)
+            p.setPen(c_fg4)
+            p.setFont(_canvas_font(9))
             msg = 'Select a float track to edit curve' if not track else 'No keyframes'
             p.drawText(self.rect(), Qt.AlignCenter, msg)
             p.end()
             return
         ptype = ALL_PROPERTIES.get(track.prop, (PROP_FLOAT,))[0]
         if ptype not in (PROP_FLOAT, PROP_INT):
-            p.setPen(QColor(COLORS['fg4']))
-            p.setFont(FONT_NORM)
+            p.setPen(c_fg4)
+            p.setFont(_canvas_font(9))
             p.drawText(self.rect(), Qt.AlignCenter, f'No curve for type: {ptype}')
             p.end()
             return
@@ -1724,16 +1861,16 @@ class CurveEditor(QWidget):
                 started = True
             else:
                 path.lineTo(x, y)
-        p.setPen(QPen(QColor(COLORS['accent']), 1.5))
+        p.setPen(QPen(c_accent, 1.5))
         p.drawPath(path)
         ph_x = self._t_to_x(self._state.time)
-        p.setPen(QPen(QColor(COLORS['playhead']), 1))
+        p.setPen(QPen(c_ph, 1))
         p.drawLine(QPointF(ph_x, m), QPointF(ph_x, m + ih))
         cur_v = track.evaluate(self._state.time)
         if cur_v is not None:
             try:
                 cy = self._v_to_y(float(cur_v))
-                p.setBrush(QBrush(QColor(COLORS['playhead'])))
+                p.setBrush(QBrush(c_ph))
                 p.setPen(Qt.NoPen)
                 p.drawEllipse(QPointF(ph_x, cy), 3, 3)
             except Exception:
@@ -1757,13 +1894,13 @@ class CurveEditor(QWidget):
                 kr = self.KEY_R + 1
             else:
                 p.setBrush(QBrush(icolor))
-                p.setPen(QPen(QColor(COLORS['bg']), 1))
+                p.setPen(QPen(c_bg, 1))
                 kr = self.KEY_R
             p.drawEllipse(QPointF(kx, ky), kr, kr)
         if self._box_sel and self._box_p0 and self._box_p1:
             br = QRectF(self._box_p0, self._box_p1).normalized()
             p.setBrush(QBrush(QColor(COLORS['accent'] + '44')))
-            p.setPen(QPen(QColor(COLORS['accent']), 1, Qt.DashLine))
+            p.setPen(QPen(c_accent, 1, Qt.DashLine))
             p.drawRect(br)
         p.restore()
         for kf in track.keys:
@@ -1775,14 +1912,14 @@ class CurveEditor(QWidget):
             except Exception:
                 continue
             kr = self.KEY_R + (2 if id(kf) in self._sel_keys else 1)
-            p.setPen(QPen(QColor(COLORS['fg3']), 1))
-            p.setFont(FONT_SMALL)
+            p.setPen(QPen(c_fg4, 1))
+            p.setFont(_canvas_font(8))
             lbl = f't={kf.time:.3f}  v={kf.value:.4g}'
             tx  = kx + kr + 3
             ty  = max(m + 10, min(ky - 3, m + ih - 2))
             p.drawText(QPointF(tx, ty), lbl)
-        p.setPen(QPen(QColor(COLORS['fg2']), 1))
-        p.setFont(FONT_BOLD)
+        p.setPen(QPen(c_fg2, 1))
+        p.setFont(_canvas_font(9, bold=True))
         p.drawText(QRectF(m + 4, m + 4, iw - 8, 16), Qt.AlignLeft | Qt.AlignTop, track.prop)
         p.end()
 
@@ -1991,7 +2128,6 @@ class CurveEditor(QWidget):
 
     def _ctx_menu(self, pos, kf):
         menu = QMenu(self)
-        menu.setStyleSheet(_menu_css())
         if kf is not None:
             sel_kfs = [k for k in (self._track.keys if self._track else []) if id(k) in self._sel_keys]
             if len(sel_kfs) > 1:
@@ -2000,7 +2136,6 @@ class CurveEditor(QWidget):
                 a.triggered.connect(self._delete_selected)
                 menu.addSeparator()
                 im = menu.addMenu('Set Interpolation')
-                im.setStyleSheet(_menu_css())
                 for mode, label in INTERP_LABELS.items():
                     ac = im.addAction(label)
                     ac.triggered.connect(lambda _, m=mode: self._set_interp_sel(m))
@@ -2009,7 +2144,6 @@ class CurveEditor(QWidget):
                 a.triggered.connect(lambda: self._delete_kf(kf))
                 menu.addSeparator()
                 im = menu.addMenu('Interpolation')
-                im.setStyleSheet(_menu_css())
                 for mode, label in INTERP_LABELS.items():
                     ac = im.addAction(label)
                     ac.setCheckable(True)
@@ -2091,8 +2225,7 @@ class PlaybackBar(QWidget):
     def __init__(self, state, parent=None):
         super().__init__(parent)
         self._state = state
-        self.setFixedHeight(44)
-        self.setStyleSheet(f"background: {COLORS['bg2']}; color: {COLORS['fg']};")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._build()
         state.time_changed.connect(self._on_time)
         state.playback_changed.connect(self._on_play)
@@ -2113,52 +2246,31 @@ class PlaybackBar(QWidget):
         for btn in (self._back_btn, self._stop_btn, self._play_btn, self._fwd_btn):
             root.addWidget(btn)
         root.addSpacing(8)
-        lbl_t = QLabel('Time:')
-        lbl_t.setFont(FONT_SMALL)
-        lbl_t.setStyleSheet(f'color: {COLORS["fg2"]}; background: transparent;')
-        root.addWidget(lbl_t)
+        root.addWidget(QLabel('Time:'))
         self._time_lbl = QLabel('0.000s')
-        self._time_lbl.setFont(FONT_MONO)
-        self._time_lbl.setFixedWidth(72)
-        self._time_lbl.setStyleSheet(f'color: {COLORS["fg"]}; background: transparent;')
         root.addWidget(self._time_lbl)
         root.addSpacing(12)
-        sp_css = (f"QDoubleSpinBox {{ background: {COLORS['panel']}; color: {COLORS['fg']};"
-                  f" border: 1px solid {COLORS['border']}; border-radius: 3px; padding: 1px 3px; }}")
-        lbl_s = QLabel('Spd:')
-        lbl_s.setFont(FONT_SMALL)
-        lbl_s.setStyleSheet(f'color: {COLORS["fg2"]}; background: transparent;')
-        root.addWidget(lbl_s)
+        root.addWidget(QLabel('Spd:'))
         self._speed_spin = QDoubleSpinBox()
         self._speed_spin.setRange(0.01, 10.0)
         self._speed_spin.setSingleStep(0.1)
         self._speed_spin.setDecimals(2)
         self._speed_spin.setValue(1.0)
-        self._speed_spin.setFixedWidth(68)
-        self._speed_spin.setStyleSheet(sp_css)
         self._speed_spin.valueChanged.connect(self._state.set_speed)
         root.addWidget(self._speed_spin)
         root.addSpacing(8)
         self._loop_btn = QPushButton()
         self._loop_btn.setIcon(QApplication.style().standardIcon(QStyle.SP_BrowserReload))
-        self._loop_btn.setIconSize(QSize(14, 14))
-        self._loop_btn.setFixedSize(26, 26)
         self._loop_btn.setCheckable(True)
         self._loop_btn.setToolTip('Loop')
-        self._loop_btn.setStyleSheet(_btn_css(pad='2px 4px'))
         self._loop_btn.toggled.connect(self._set_loop)
         root.addWidget(self._loop_btn)
         root.addSpacing(8)
-        lbl_d = QLabel('Dur:')
-        lbl_d.setFont(FONT_SMALL)
-        lbl_d.setStyleSheet(f'color: {COLORS["fg2"]}; background: transparent;')
-        root.addWidget(lbl_d)
+        root.addWidget(QLabel('Dur:'))
         self._dur_spin = QDoubleSpinBox()
         self._dur_spin.setRange(0.5, 9999.0)
         self._dur_spin.setSingleStep(1.0)
         self._dur_spin.setDecimals(2)
-        self._dur_spin.setFixedWidth(80)
-        self._dur_spin.setStyleSheet(sp_css)
         self._dur_spin.valueChanged.connect(self._set_duration)
         root.addWidget(self._dur_spin)
         root.addStretch()
@@ -2201,8 +2313,7 @@ class InspectorPanel(QWidget):
     def __init__(self, state, parent=None):
         super().__init__(parent)
         self._state = state
-        self.setFixedWidth(200)
-        self.setStyleSheet(f"background: {COLORS['bg2']}; color: {COLORS['fg']};")
+
         self._build()
         state.changed.connect(self._refresh)
         state.clip_changed.connect(self._refresh)
@@ -2212,18 +2323,11 @@ class InspectorPanel(QWidget):
         root.setContentsMargins(4, 4, 4, 4)
         root.setSpacing(4)
         hdr = QLabel("INSPECTOR")
-        hdr.setFont(FONT_BOLD)
-        hdr.setStyleSheet(f"color: {COLORS['accent']}; background: transparent; padding: 2px 0px;")
+
         root.addWidget(hdr)
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
-        self._scroll.setStyleSheet(
-            f"QScrollArea {{ border: none; background: transparent; }}"
-            f"QScrollBar:vertical {{ background: {COLORS['panel']}; width: 8px; border-radius: 4px; }}"
-            f"QScrollBar::handle:vertical {{ background: {COLORS['border']}; border-radius: 4px; }}"
-        )
         self._content = QWidget()
-        self._content.setStyleSheet("background: transparent;")
         self._v_layout = QVBoxLayout(self._content)
         self._v_layout.setContentsMargins(0, 0, 0, 0)
         self._v_layout.setSpacing(4)
@@ -2249,15 +2353,13 @@ class InspectorPanel(QWidget):
             ('Loop',     'Yes' if clip.loop else 'No'),
         ]:
             row = QWidget()
-            row.setStyleSheet(f"background: {COLORS['panel']}; border-radius: 3px;")
+
             h = QHBoxLayout(row)
             h.setContentsMargins(6, 3, 6, 3)
             lbl = QLabel(label + ':')
-            lbl.setFont(FONT_SMALL)
-            lbl.setStyleSheet(f"color: {COLORS['fg2']}; background: transparent;")
+
             val = QLabel(value)
-            val.setFont(FONT_SMALL)
-            val.setStyleSheet(f"color: {COLORS['fg']}; background: transparent;")
+
             h.addWidget(lbl)
             h.addStretch()
             h.addWidget(val)
@@ -2275,33 +2377,57 @@ class AnimationEditorWindow(QMainWindow):
         self._view_start = 0.0
         self._view_end   = 10.0
         self.setWindowTitle('Animation Editor')
-        self.resize(self.WIN_W, self.WIN_H)
-        self.setStyleSheet(
-            f"QMainWindow {{ background: {COLORS['bg']}; }}"
-            f"QSplitter::handle {{ background: {COLORS['border']}; }}"
-            f"QStatusBar {{ background: {COLORS['bg2']}; color: {COLORS['fg2']};"
-            f" font: 8pt 'Segoe UI'; border-top: 1px solid {COLORS['border']}; }}"
-        )
         self._build_ui()
         self._build_toolbar()
         self._build_statusbar()
         state.time_changed.connect(self._on_time)
         state.changed.connect(self._on_change)
         state.clip_changed.connect(self._on_clip_change)
+        if _app_config:
+            _app_config.restore_window_geometry("anim_editor", self,
+                                                default_w=self.WIN_W, default_h=self.WIN_H)
+            _app_config.register_theme_change_callback(self._on_theme_changed)
+        else:
+            self.resize(self.WIN_W, self.WIN_H)
+        QTimer.singleShot(0, self._on_clip_change)
+
+    def _on_theme_changed(self, theme_name: str):
+        if _app_config:
+            _app_config.save_window_geometry("anim_editor", self)
+        geom = self.geometry()
+        for sig, slot in [
+            (self._state.time_changed,    self._on_time),
+            (self._state.changed,         self._on_change),
+            (self._state.clip_changed,    self._on_clip_change),
+            (_undo_stack.changed,         self._refresh_undo_btns),
+        ]:
+            try:
+                sig.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        old_central = self.centralWidget()
+        from PyQt5.QtWidgets import QToolBar, QStatusBar
+        for tb in self.findChildren(QToolBar):
+            self.removeToolBar(tb)
+            tb.deleteLater()
+        old_sb = self.statusBar()
+        old_sb.deleteLater()
+        self.setStatusBar(QStatusBar(self))
+        self._build_ui()
+        self._build_toolbar()
+        self._build_statusbar()
+        if old_central:
+            old_central.deleteLater()
+        self._state.time_changed.connect(self._on_time)
+        self._state.changed.connect(self._on_change)
+        self._state.clip_changed.connect(self._on_clip_change)
+        self.setGeometry(geom)
         QTimer.singleShot(0, self._on_clip_change)
 
     def _build_toolbar(self):
         tb = self.addToolBar('Main')
         tb.setMovable(False)
-        tb.setStyleSheet(
-            f"QToolBar {{ background: {COLORS['bg2']}; border-bottom: 1px solid {COLORS['border']};"
-            f" spacing: 4px; padding: 2px 4px; }}"
-            f"QToolButton {{ background: {COLORS['panel2']}; color: {COLORS['fg']};"
-            f" border: 1px solid {COLORS['border']}; border-radius: 3px;"
-            f" padding: 3px 8px; margin: 1px; }}"
-            f"QToolButton:hover {{ background: {COLORS['sel']}; }}"
-            f"QToolButton:pressed {{ background: {COLORS['accent2']}; }}"
-        )
+
         tb.addAction(self.style().standardIcon(QStyle.SP_FileDialogNewFolder), 'New Clip').triggered.connect(self._new_clip)
         tb.addAction(self.style().standardIcon(QStyle.SP_DialogOpenButton),    'Open').triggered.connect(self._open)
         tb.addAction(self.style().standardIcon(QStyle.SP_DialogSaveButton),    'Save').triggered.connect(self._save)
@@ -2310,6 +2436,10 @@ class AnimationEditorWindow(QMainWindow):
         self._redo_act = tb.addAction(self.style().standardIcon(QStyle.SP_ArrowForward), 'Redo  Ctrl+Y / Ctrl+Shift+Z')
         self._undo_act.triggered.connect(lambda: (_undo_stack.undo(), self._state.changed.emit()))
         self._redo_act.triggered.connect(lambda: (_undo_stack.redo(), self._state.changed.emit()))
+        try:
+            _undo_stack.changed.disconnect(self._refresh_undo_btns)
+        except (RuntimeError, TypeError):
+            pass
         _undo_stack.changed.connect(self._refresh_undo_btns)
         self._refresh_undo_btns()
         tb.addSeparator()
@@ -2326,30 +2456,30 @@ class AnimationEditorWindow(QMainWindow):
         sb = self.statusBar()
         self._status_lbl = QLabel('Ready')
         sb.addWidget(self._status_lbl)
-        hint = QLabel('Space: Play  |  K/I: Add Key  |  Del: Delete  |  A: Sel All  |  F: Fit  |  Ctrl+Z/Y: Undo/Redo  |  Curve: LMB drag pts, DblClick=add, Scroll=zoom val, Ctrl+Scroll=zoom time, MMB=pan')
-        hint.setStyleSheet(f'color: {COLORS["fg4"]};')
-        hint.setFont(FONT_SMALL)
+        hint = QLabel('Space: Play  |  K/I: Add Key  |  Del: Delete  |  A: Sel All  |  F: Fit  |  Ctrl+Z/Y: Undo/Redo  |  Timeline: MMB drag=pan view  |  Curve: LMB drag pts, DblClick=add, Scroll=zoom val, Ctrl+Scroll=zoom time, MMB=pan')
+
         sb.addPermanentWidget(hint)
 
     def _build_ui(self):
         central = QWidget()
-        central.setStyleSheet(f'background: {COLORS["bg"]};')
         self.setCentralWidget(central)
         ml = QVBoxLayout(central)
         ml.setContentsMargins(0, 0, 0, 0)
         ml.setSpacing(0)
         self._playback_bar = PlaybackBar(self._state)
+        self._playback_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         ml.addWidget(self._playback_bar)
         sep = QFrame()
-        sep.setFixedHeight(1)
-        sep.setStyleSheet(f'background: {COLORS["border"]};')
+        sep.setFrameShape(QFrame.HLine)
+        sep.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         ml.addWidget(sep)
         hsplit = QSplitter(Qt.Horizontal)
         hsplit.setHandleWidth(3)
         self._clip_panel = ClipListPanel(self._state)
+        self._clip_panel.setMinimumWidth(160)
+        self._clip_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         hsplit.addWidget(self._clip_panel)
         center = QWidget()
-        center.setStyleSheet(f'background: {COLORS["bg"]};')
         clayout = QVBoxLayout(center)
         clayout.setContentsMargins(0, 0, 0, 0)
         clayout.setSpacing(0)
@@ -2366,11 +2496,6 @@ class AnimationEditorWindow(QMainWindow):
         self._track_scroll = QScrollArea()
         self._track_scroll.setWidgetResizable(True)
         self._track_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._track_scroll.setStyleSheet(
-            f"QScrollArea {{ border: none; background: {COLORS['bg']}; }}"
-            f"QScrollBar:vertical {{ background: {COLORS['panel']}; width: 8px; border-radius: 4px; }}"
-            f"QScrollBar::handle:vertical {{ background: {COLORS['border']}; border-radius: 4px; min-height: 20px; }}"
-        )
         self._track_widget = TrackWidget(self._state)
         self._track_widget.key_added.connect(self._on_key_added)
         self._track_widget.seek_requested.connect(self._state.set_time)
@@ -2385,50 +2510,36 @@ class AnimationEditorWindow(QMainWindow):
         clayout.addWidget(vsplit)
         hsplit.addWidget(center)
         self._inspector = InspectorPanel(self._state)
+        self._inspector.setMinimumWidth(160)
+        self._inspector.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         hsplit.addWidget(self._inspector)
         hsplit.setSizes([200, 880, 200])
-        ml.addWidget(hsplit)
+        ml.addWidget(hsplit, 1)
         self._sync_view()
 
     def _build_track_toolbar(self):
         bar = QWidget()
-        bar.setFixedHeight(32)
-        bar.setStyleSheet(f"background: {COLORS['bg2']}; border-bottom: 1px solid {COLORS['border']};")
+        bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         row = QHBoxLayout(bar)
         row.setContentsMargins(6, 2, 6, 2)
         row.setSpacing(4)
         add_btn = QPushButton('+ Add Track')
-        add_btn.setStyleSheet(_btn_css())
         add_btn.clicked.connect(self._add_track_dialog)
         row.addWidget(add_btn)
-        cap_btn = QPushButton()
-        cap_btn.setIconSize(QSize(14, 14))
-        cap_btn.setFixedHeight(24)
-        cap_btn.setText(' Capture All')
+        cap_btn = QPushButton('Capture All')
         cap_btn.setToolTip('Capture current property values as keyframe at playhead')
-        cap_btn.setStyleSheet(_btn_css())
         cap_btn.clicked.connect(self._capture_all)
         row.addWidget(cap_btn)
         row.addStretch()
-        lbl = QLabel('Filter:')
-        lbl.setFont(FONT_SMALL)
-        lbl.setStyleSheet(f'color: {COLORS["fg2"]}; background: transparent;')
-        row.addWidget(lbl)
+        row.addWidget(QLabel('Filter:'))
         self._filter_edit = QLineEdit()
         self._filter_edit.setPlaceholderText('Filter tracks...')
-        self._filter_edit.setFixedWidth(140)
-        self._filter_edit.setStyleSheet(
-            f"QLineEdit {{ background: {COLORS['panel']}; color: {COLORS['fg']};"
-            f" border: 1px solid {COLORS['border']}; border-radius: 3px; padding: 1px 6px;"
-            f" font: 9pt 'Segoe UI'; }}"
-        )
         row.addWidget(self._filter_edit)
         return bar
 
     def _build_zoom_bar(self):
         bar = QWidget()
-        bar.setFixedHeight(28)
-        bar.setStyleSheet(f"background: {COLORS['bg2']}; border-top: 1px solid {COLORS['border']};")
+        bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         row = QHBoxLayout(bar)
         row.setContentsMargins(6, 2, 6, 2)
         row.setSpacing(4)
@@ -2439,13 +2550,9 @@ class AnimationEditorWindow(QMainWindow):
         row.addWidget(zm)
         row.addWidget(zp)
         self._zoom_lbl = QLabel()
-        self._zoom_lbl.setFont(FONT_SMALL)
-        self._zoom_lbl.setStyleSheet(f'color: {COLORS["fg2"]}; background: transparent;')
         row.addWidget(self._zoom_lbl)
         row.addStretch()
         fit_btn = QPushButton('Fit View')
-        fit_btn.setStyleSheet(_btn_css())
-        fit_btn.setFixedHeight(22)
         fit_btn.clicked.connect(self._frame_all)
         row.addWidget(fit_btn)
         return bar
@@ -2622,6 +2729,9 @@ class AnimationEditorWindow(QMainWindow):
                 QMessageBox.critical(self, 'Load Error', str(e))
 
     def closeEvent(self, ev):
+        if _app_config:
+            _app_config.save_window_geometry("anim_editor", self)
+            _app_config.unregister_theme_change_callback(self._on_theme_changed)
         self._state.pause()
         self.closed.emit()
         super().closeEvent(ev)
@@ -2633,6 +2743,7 @@ _params_ref = None
 def set_params_ref(params_obj):
     global _params_ref
     _params_ref = params_obj
+    _apply_dispatch_cache.clear()
     _anim_state.set_apply_callback(apply_anim_to_params)
 
 
@@ -2659,37 +2770,75 @@ def _get_param_value(prop):
     return None
 
 
+_apply_dispatch_cache = {}
+
+
+def _build_apply_dispatch(p):
+    dispatch = {}
+    for prop in ALL_PROPERTIES:
+        if prop == 'cam_pos_x':
+            dispatch[prop] = ('cam_pos', 0)
+        elif prop == 'cam_pos_y':
+            dispatch[prop] = ('cam_pos', 1)
+        elif prop == 'cam_pos_z':
+            dispatch[prop] = ('cam_pos', 2)
+        elif prop == 'light2_color':
+            dispatch[prop] = 'light2_color'
+        elif hasattr(p, prop):
+            cur = getattr(p, prop)
+            if isinstance(cur, bool):
+                dispatch[prop] = ('attr_bool', prop)
+            elif isinstance(cur, int):
+                dispatch[prop] = ('attr_int', prop)
+            elif isinstance(cur, float):
+                dispatch[prop] = ('attr_float', prop)
+            elif isinstance(cur, tuple):
+                dispatch[prop] = ('attr_tuple', prop)
+            elif isinstance(cur, list):
+                dispatch[prop] = ('attr_list', prop, len(cur))
+            else:
+                dispatch[prop] = ('attr_typed', prop, type(cur))
+    return dispatch
+
+
 def apply_anim_to_params(values):
     p = _params_ref
     if p is None:
         return
+    global _apply_dispatch_cache
+    dispatch = _apply_dispatch_cache.get(id(p))
+    if dispatch is None:
+        dispatch = _build_apply_dispatch(p)
+        _apply_dispatch_cache[id(p)] = dispatch
     for prop, val in values.items():
+        entry = dispatch.get(prop)
+        if entry is None:
+            continue
         try:
-            if prop == 'cam_pos_x':
-                p.cam_pos[0] = float(val)
-            elif prop == 'cam_pos_y':
-                p.cam_pos[1] = float(val)
-            elif prop == 'cam_pos_z':
-                p.cam_pos[2] = float(val)
-            elif prop == 'light2_color':
+            if entry == 'light2_color':
                 if isinstance(val, (tuple, list)) and len(val) == 3:
                     p.light2_r = float(val[0])
                     p.light2_g = float(val[1])
                     p.light2_b = float(val[2])
-            elif hasattr(p, prop):
-                cur = getattr(p, prop)
-                if isinstance(cur, tuple) and isinstance(val, (tuple, list)):
-                    setattr(p, prop, tuple(float(v) for v in val))
-                elif isinstance(cur, list) and isinstance(val, (tuple, list)):
-                    for i, v in enumerate(val):
-                        if i < len(cur):
-                            cur[i] = float(v)
-                elif isinstance(cur, bool):
-                    setattr(p, prop, bool(val))
-                elif isinstance(cur, int):
-                    setattr(p, prop, int(round(float(val))))
-                else:
-                    setattr(p, prop, type(cur)(val))
+            elif entry[0] == 'cam_pos':
+                p.cam_pos[entry[1]] = float(val)
+            elif entry[0] == 'attr_bool':
+                setattr(p, entry[1], bool(val))
+            elif entry[0] == 'attr_int':
+                setattr(p, entry[1], int(round(float(val))))
+            elif entry[0] == 'attr_float':
+                setattr(p, entry[1], float(val))
+            elif entry[0] == 'attr_tuple':
+                if isinstance(val, (tuple, list)):
+                    setattr(p, entry[1], tuple(float(v) for v in val))
+            elif entry[0] == 'attr_list':
+                lst = getattr(p, entry[1])
+                n   = entry[2]
+                for i, v in enumerate(val):
+                    if i < n:
+                        lst[i] = float(v)
+            elif entry[0] == 'attr_typed':
+                setattr(p, entry[1], entry[2](val))
         except Exception:
             pass
 
@@ -2706,5 +2855,6 @@ def open_animation_editor():
         _anim_window = AnimationEditorWindow(_anim_state)
         _anim_window.show()
     except Exception as e:
-        print(e)
+        import traceback
+        traceback.print_exc()
     return _anim_window

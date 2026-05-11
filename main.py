@@ -9,19 +9,22 @@ from pathlib import Path
 import moderngl
 import moderngl_window as mglw
 import numpy as np
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt5.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QPainter, QLinearGradient, QBrush, QPen
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QSize
+from PyQt5.QtGui import QColor, QPalette, QIcon, QPixmap, QPainter, QLinearGradient, QBrush, QPen
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QScrollArea,
     QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QSlider, QRadioButton, QCheckBox, QPushButton,
     QButtonGroup, QGroupBox, QColorDialog, QTabWidget,
     QFileDialog, QInputDialog, QMessageBox, QProgressBar,
-    QSizePolicy, QComboBox,
+    QSizePolicy, QComboBox, QStyle, QDoubleSpinBox,
+    QToolBar, QAction,
 )
 from moderngl_window.conf import settings as mglw_settings
 
-APP_VERSION = "1.6.0"
+import app_config
+
+APP_VERSION = "1.7.0"
 
 try:
     from animation_editor import (
@@ -236,6 +239,55 @@ uniform float u_ms_scale_z;
 uniform float u_si_rot_x;
 uniform float u_si_rot_z;
 
+// --- Mandelbox extended ---
+uniform float u_mb_scale_x;
+uniform float u_mb_scale_y;
+uniform float u_mb_scale_z;
+uniform float u_mb_offset_x;
+uniform float u_mb_offset_y;
+uniform float u_mb_offset_z;
+uniform float u_mb_inversion_radius;
+
+// --- Mandelbulb extended ---
+uniform float u_mb2_polar_mix;
+uniform float u_mb2_rot_per_iter;
+uniform int   u_mb2_abs_x;
+uniform int   u_mb2_abs_y;
+uniform int   u_mb2_abs_z;
+
+// --- Menger extended ---
+uniform float u_ms_offset_x;
+uniform float u_ms_offset_y;
+uniform float u_ms_offset_z;
+uniform int   u_ms_fold_type;
+uniform float u_ms_fold_abs_amount;
+
+// --- Sierpinski extended ---
+uniform float u_si_scale_x;
+uniform float u_si_scale_y;
+uniform float u_si_scale_z;
+uniform float u_si_offset_x;
+uniform float u_si_offset_y;
+uniform float u_si_offset_z;
+uniform float u_si_rot_y;
+
+// --- Octahedron extended ---
+uniform float u_oc_scale_y;
+uniform float u_oc_scale_z;
+uniform int   u_oc_julia_mode;
+uniform float u_oc_julia_x;
+uniform float u_oc_julia_y;
+uniform float u_oc_julia_z;
+
+// --- Kleinian extended ---
+uniform float u_kl_fold_limit_x;
+uniform float u_kl_fold_limit_y;
+uniform float u_kl_fold_limit_z;
+uniform int   u_kl_julia_mode;
+uniform float u_kl_offset_x;
+uniform float u_kl_offset_y;
+uniform float u_kl_offset_z;
+
 // --- Global space operators ---
 uniform int   u_warp_enabled;
 uniform float u_warp_strength;
@@ -250,6 +302,19 @@ uniform int   u_rep_enabled;
 uniform float u_rep_cell_x;
 uniform float u_rep_cell_y;
 uniform float u_rep_cell_z;
+
+// --- Spherical inversion ---
+uniform int   u_sph_inv_enabled;
+uniform float u_sph_inv_radius;
+uniform float u_sph_inv_cx;
+uniform float u_sph_inv_cy;
+uniform float u_sph_inv_cz;
+
+// --- Lattice fold ---
+uniform int   u_lattice_fold_enabled;
+uniform float u_lattice_fold_x;
+uniform float u_lattice_fold_y;
+uniform float u_lattice_fold_z;
 
 #define PI 3.14159265358979323846
 #define MAX_STEPS 512
@@ -301,6 +366,21 @@ vec2 mandelbox(vec3 pos) {
     float foldZ = (u_mb_fold_z > 0.001) ? u_mb_fold_z : u_mb_fold_limit;
     float sphIn = u_mb_sphere_inner;
     float sphOut = u_mb_sphere_outer * u_mb_fixed_radius;
+    float sx = (u_mb_scale_x > 0.001) ? u_mb_scale_x : u_scale;
+    float sy = (u_mb_scale_y > 0.001) ? u_mb_scale_y : u_scale;
+    float sz = (u_mb_scale_z > 0.001) ? u_mb_scale_z : u_scale;
+    vec3 joff = (u_mb_julia_mode == 1)
+        ? vec3(u_julia_x, u_julia_y, u_julia_z)
+        : vec3(0.0);
+    vec3 posOff = (u_mb_offset_x != 0.0 || u_mb_offset_y != 0.0 || u_mb_offset_z != 0.0)
+        ? vec3(u_mb_offset_x, u_mb_offset_y, u_mb_offset_z)
+        : pos * (1.0 - u_scale) * 0.1;
+    if (u_mb_inversion_radius > 0.001) {
+        float r2 = dot(p, p);
+        float k  = (u_mb_inversion_radius * u_mb_inversion_radius) / max(r2, 1e-6);
+        p  *= k;
+        dr *= k;
+    }
     for (int i = 0; i < u_iterations; i++) {
         if (u_mb_rot_per_iter > 0.0001) p = rotY(u_mb_rot_per_iter * float(i)) * p;
         if (u_mb_fold_mode == 0) {
@@ -325,9 +405,9 @@ vec2 mandelbox(vec3 pos) {
             p *= k; dr *= k;
         }
         if (u_mb_julia_mode == 1) {
-            p = p * u_scale + vec3(u_julia_x, u_julia_y, u_julia_z);
+            p = vec3(p.x * sx, p.y * sy, p.z * sz) + joff;
         } else {
-            p = p * u_scale + pos * (1.0 - u_scale) * 0.1;
+            p = vec3(p.x * sx, p.y * sy, p.z * sz) + posOff;
         }
         dr = dr * abs(u_scale) + 1.0;
         trap = min(trap, orbitTrap(p, u_mb_color_scale));
@@ -341,21 +421,29 @@ vec2 mengerSponge(vec3 pos) {
     float s = 1.0;
     float trap = 1e10;
     float ms = u_ms_scale;
-    float mo = u_ms_offset;
     float sy = (u_ms_scale_y > 0.001) ? u_ms_scale_y : ms;
     float sz = (u_ms_scale_z > 0.001) ? u_ms_scale_z : ms;
+    float ox = (u_ms_offset_x != 0.0) ? u_ms_offset_x : u_ms_offset;
+    float oy = (u_ms_offset_y != 0.0) ? u_ms_offset_y : u_ms_offset;
+    float oz = (u_ms_offset_z != 0.0) ? u_ms_offset_z : u_ms_offset;
     for (int i = 0; i < u_iterations; i++) {
         if (u_ms_twist > 0.001)  p = rotY(u_ms_twist) * p;
         if (u_ms_rot_x > 0.001) p = rotX(u_ms_rot_x) * p;
         if (u_ms_rot_z > 0.001) p = rotZ(u_ms_rot_z) * p;
-        p = abs(p);
+        if (u_ms_fold_type == 0) {
+            p = abs(p);
+        } else if (u_ms_fold_type == 1) {
+            p = abs(p) - vec3(u_ms_fold_abs_amount);
+        } else {
+            p = abs(p + vec3(u_ms_fold_abs_amount)) - abs(p - vec3(u_ms_fold_abs_amount)) - p;
+        }
         if (p.x < p.y) p.xy = p.yx;
         if (p.x < p.z) p.xz = p.zx;
         if (p.y < p.z) p.yz = p.zy;
-        p.x = p.x * ms - mo;
-        p.y = p.y * sy - mo;
-        p.z = p.z * sz - mo;
-        p.z += mo * clamp(p.z / mo * 0.5 + 0.5, 0.0, 1.0) * u_ms_cross_width;
+        p.x = p.x * ms - ox;
+        p.y = p.y * sy - oy;
+        p.z = p.z * sz - oz;
+        p.z += oz * clamp(p.z / oz * 0.5 + 0.5, 0.0, 1.0) * u_ms_cross_width;
         s *= ms;
         trap = min(trap, orbitTrap(p, s));
     }
@@ -386,12 +474,17 @@ vec2 sierpinski(vec3 pos) {
     }
     vec3 p = pos;
     p.y *= u_si_squash;
+    float scX = (u_si_scale_x > 0.001) ? u_si_scale_x : u_si_fold_bias;
+    float scY = (u_si_scale_y > 0.001) ? u_si_scale_y : u_si_fold_bias;
+    float scZ = (u_si_scale_z > 0.001) ? u_si_scale_z : u_si_fold_bias;
+    vec3 siOff = vec3(u_si_offset_x, u_si_offset_y, u_si_offset_z);
     float scale = 1.0;
     float trap = 1e10;
     for (int i = 0; i < u_iterations; i++) {
         if (u_si_twist > 0.001)  p = rotY(u_si_twist) * p;
         if (u_si_rot_x > 0.001) p = rotX(u_si_rot_x) * p;
         if (u_si_rot_z > 0.001) p = rotZ(u_si_rot_z) * p;
+        if (u_si_rot_y > 0.001) p = rotY(u_si_rot_y) * p;
         vec3 closest = A;
         float d = dot(p - A, p - A);
         float db = dot(p - B, p - B);
@@ -400,7 +493,9 @@ vec2 sierpinski(vec3 pos) {
         if (db < d) { closest = B; d = db; }
         if (dc < d) { closest = C; d = dc; }
         if (dd < d) { closest = D; }
-        p = u_si_fold_bias * p - closest * (u_si_fold_bias - 1.0);
+        p = vec3(scX * p.x - closest.x * (scX - 1.0),
+                 scY * p.y - closest.y * (scY - 1.0),
+                 scZ * p.z - closest.z * (scZ - 1.0)) + siOff;
         scale *= u_si_fold_bias;
         trap = min(trap, orbitTrap(p, scale));
     }
@@ -412,11 +507,14 @@ vec2 octahedronIFS(vec3 pos) {
     float s = 1.0;
     float trap = 1e10;
     float IFS_SCALE = u_oc_ifs_scale;
+    float scY = (u_oc_scale_y > 0.001) ? u_oc_scale_y : IFS_SCALE;
+    float scZ = (u_oc_scale_z > 0.001) ? u_oc_scale_z : IFS_SCALE;
     vec3 off = vec3(
         (u_oc_offset_x > 0.0001) ? u_oc_offset_x : u_offset_x * u_oc_offset_uni,
         (u_oc_offset_y > 0.0001) ? u_oc_offset_y : u_offset_y * u_oc_offset_uni,
         (u_oc_offset_z > 0.0001) ? u_oc_offset_z : u_offset_z * u_oc_offset_uni
     );
+    vec3 juliaC = vec3(u_oc_julia_x, u_oc_julia_y, u_oc_julia_z);
     for (int i = 0; i < u_iterations; i++) {
         if (u_oc_twist  > 0.001) p = rotY(u_oc_twist)  * p;
         if (u_oc_rot_x  > 0.001) p = rotX(u_oc_rot_x)  * p;
@@ -430,7 +528,11 @@ vec2 octahedronIFS(vec3 pos) {
         if (p.x < p.y) p.xy = p.yx;
         if (p.x < p.z) p.xz = p.zx;
         if (p.y < p.z) p.yz = p.zy;
-        p = IFS_SCALE * p - off * (IFS_SCALE - 1.0);
+        if (u_oc_julia_mode == 1) {
+            p = vec3(IFS_SCALE * p.x, scY * p.y, scZ * p.z) - off * (IFS_SCALE - 1.0) + juliaC;
+        } else {
+            p = vec3(IFS_SCALE * p.x, scY * p.y, scZ * p.z) - off * (IFS_SCALE - 1.0);
+        }
         s *= IFS_SCALE;
         trap = min(trap, orbitTrap(p, s));
     }
@@ -451,16 +553,22 @@ vec2 mandelbulb(vec3 pos) {
     float r = 0.0;
     float pw = max(u_mb2_power, 1.0);
     float bail = u_mb2_bailout;
+    if (u_mb2_abs_x == 1) p.x = abs(p.x);
+    if (u_mb2_abs_y == 1) p.y = abs(p.y);
+    if (u_mb2_abs_z == 1) p.z = abs(p.z);
     for (int i = 0; i < u_iterations; i++) {
         r = length(p);
         if (r > bail) break;
+        if (u_mb2_rot_per_iter > 0.0001) p = rotY(u_mb2_rot_per_iter * float(i)) * p;
         float theta = acos(clamp(p.z / r, -1.0, 1.0));
         float phi   = atan(p.y, p.x);
         dr = pow(r, pw - 1.0) * pw * dr + 1.0;
         float zr = pow(r, pw);
-        theta *= pw;
+        float thetaSph = theta * pw;
+        float thetaCyl = atan(length(p.xy), p.z) * pw;
+        float thetaFin = mix(thetaSph, thetaCyl, u_mb2_polar_mix);
         phi   *= pw;
-        vec3 np = zr * vec3(sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta));
+        vec3 np = zr * vec3(sin(thetaFin)*cos(phi), sin(thetaFin)*sin(phi), cos(thetaFin));
         if (u_mb2_fold_type == 1) {
             float fs = u_mb2_fold_strength;
             np = clamp(np, -fs, fs) * 2.0 - np;
@@ -484,15 +592,25 @@ vec2 pseudoKleinian(vec3 pos) {
     float kscale = u_kl_scale;
     vec3  c = vec3(u_kl_cx, u_kl_cy, u_kl_cz);
     float fl = u_kl_fold_limit;
+    float flX = (u_kl_fold_limit_x > 0.001) ? u_kl_fold_limit_x : fl;
+    float flY = (u_kl_fold_limit_y > 0.001) ? u_kl_fold_limit_y : fl;
+    float flZ = (u_kl_fold_limit_z > 0.001) ? u_kl_fold_limit_z : fl;
     float sr = u_kl_sph_radius;
+    vec3 klOff = vec3(u_kl_offset_x, u_kl_offset_y, u_kl_offset_z);
     for (int i = 0; i < u_iterations; i++) {
         if (u_kl_rot_per_iter > 0.0001) p = rotY(u_kl_rot_per_iter * float(i)) * p;
-        p = clamp(p, -fl, fl) * 2.0 - p;
+        p.x = clamp(p.x, -flX, flX) * 2.0 - p.x;
+        p.y = clamp(p.y, -flY, flY) * 2.0 - p.y;
+        p.z = clamp(p.z, -flZ, flZ) * 2.0 - p.z;
         float r2 = dot(p, p);
         float k  = max(sr * sr / r2, 1.0);
         p  *= k;
         dr *= k;
-        p   = p * kscale + c;
+        if (u_kl_julia_mode == 1) {
+            p   = p * kscale + vec3(u_julia_x, u_julia_y, u_julia_z) + klOff;
+        } else {
+            p   = p * kscale + c + klOff;
+        }
         dr  = dr * abs(kscale) + 1.0;
         trap = min(trap, orbitTrap(p, abs(kscale)));
         if (r2 > u_bailout * u_bailout) break;
@@ -502,6 +620,19 @@ vec2 pseudoKleinian(vec3 pos) {
 }
 
 vec3 applySpaceOps(vec3 p) {
+    if (u_sph_inv_enabled == 1) {
+        vec3 center = vec3(u_sph_inv_cx, u_sph_inv_cy, u_sph_inv_cz);
+        vec3 q  = p - center;
+        float r2 = dot(q, q);
+        float ir = u_sph_inv_radius;
+        p = center + q * (ir * ir / max(r2, 1e-6));
+    }
+    if (u_lattice_fold_enabled == 1) {
+        p.x = p.x - u_lattice_fold_x * round(p.x / u_lattice_fold_x);
+        p.y = p.y - u_lattice_fold_y * round(p.y / u_lattice_fold_y);
+        p.z = p.z - u_lattice_fold_z * round(p.z / u_lattice_fold_z);
+        p = abs(p) - vec3(u_lattice_fold_x, u_lattice_fold_y, u_lattice_fold_z) * 0.5;
+    }
     if (u_rep_enabled == 1) {
         if (u_rep_cell_x > 0.001) p.x = p.x - u_rep_cell_x * round(p.x / u_rep_cell_x);
         if (u_rep_cell_y > 0.001) p.y = p.y - u_rep_cell_y * round(p.y / u_rep_cell_y);
@@ -1091,14 +1222,59 @@ class FractalParams:
         self.mb_fold_y        = 0.0
         self.mb_fold_z        = 0.0
         self.mb_julia_mode    = 1
+        self.mb_scale_x       = 0.0
+        self.mb_scale_y       = 0.0
+        self.mb_scale_z       = 0.0
+        self.mb_offset_x      = 0.0
+        self.mb_offset_y      = 0.0
+        self.mb_offset_z      = 0.0
+        self.mb_inversion_radius = 0.0
         # --- Menger per-axis / rotation ---
         self.ms_rot_x         = 0.0
         self.ms_rot_z         = 0.0
         self.ms_scale_y       = 0.0
         self.ms_scale_z       = 0.0
-        # --- Sierpinski per-axis rotation ---
+        self.ms_offset_x      = 0.0
+        self.ms_offset_y      = 0.0
+        self.ms_offset_z      = 0.0
+        self.ms_fold_type     = 0
+        self.ms_fold_abs_amount = 0.5
         self.si_rot_x         = 0.0
         self.si_rot_z         = 0.0
+        self.si_scale_x       = 0.0
+        self.si_scale_y       = 0.0
+        self.si_scale_z       = 0.0
+        self.si_offset_x      = 0.0
+        self.si_offset_y      = 0.0
+        self.si_offset_z      = 0.0
+        self.si_rot_y         = 0.0
+        self.oc_scale_y       = 0.0
+        self.oc_scale_z       = 0.0
+        self.oc_julia_mode    = 0
+        self.oc_julia_x       = 0.0
+        self.oc_julia_y       = 0.0
+        self.oc_julia_z       = 0.0
+        self.mb2_polar_mix    = 0.0
+        self.mb2_rot_per_iter = 0.0
+        self.mb2_abs_x        = False
+        self.mb2_abs_y        = False
+        self.mb2_abs_z        = False
+        self.kl_fold_limit_x  = 0.0
+        self.kl_fold_limit_y  = 0.0
+        self.kl_fold_limit_z  = 0.0
+        self.kl_julia_mode    = 0
+        self.kl_offset_x      = 0.0
+        self.kl_offset_y      = 0.0
+        self.kl_offset_z      = 0.0
+        self.sph_inv_enabled  = False
+        self.sph_inv_radius   = 1.0
+        self.sph_inv_cx       = 0.0
+        self.sph_inv_cy       = 0.0
+        self.sph_inv_cz       = 0.0
+        self.lattice_fold_enabled = False
+        self.lattice_fold_x   = 2.0
+        self.lattice_fold_y   = 2.0
+        self.lattice_fold_z   = 2.0
         # --- Global space operators ---
         self.warp_enabled     = False
         self.warp_strength    = 0.3
@@ -2755,9 +2931,54 @@ class FractalWindow(mglw.WindowConfig):
         self._set('u_ms_rot_z',         p.ms_rot_z)
         self._set('u_ms_scale_y',       p.ms_scale_y)
         self._set('u_ms_scale_z',       p.ms_scale_z)
-        # Sierpinski per-axis
+        self._set('u_ms_offset_x',      p.ms_offset_x)
+        self._set('u_ms_offset_y',      p.ms_offset_y)
+        self._set('u_ms_offset_z',      p.ms_offset_z)
+        self._set('u_ms_fold_type',     p.ms_fold_type)
+        self._set('u_ms_fold_abs_amount', p.ms_fold_abs_amount)
         self._set('u_si_rot_x',         p.si_rot_x)
         self._set('u_si_rot_z',         p.si_rot_z)
+        self._set('u_si_scale_x',       p.si_scale_x)
+        self._set('u_si_scale_y',       p.si_scale_y)
+        self._set('u_si_scale_z',       p.si_scale_z)
+        self._set('u_si_offset_x',      p.si_offset_x)
+        self._set('u_si_offset_y',      p.si_offset_y)
+        self._set('u_si_offset_z',      p.si_offset_z)
+        self._set('u_si_rot_y',         p.si_rot_y)
+        self._set('u_mb_scale_x',       p.mb_scale_x)
+        self._set('u_mb_scale_y',       p.mb_scale_y)
+        self._set('u_mb_scale_z',       p.mb_scale_z)
+        self._set('u_mb_offset_x',      p.mb_offset_x)
+        self._set('u_mb_offset_y',      p.mb_offset_y)
+        self._set('u_mb_offset_z',      p.mb_offset_z)
+        self._set('u_mb_inversion_radius', p.mb_inversion_radius)
+        self._set('u_mb2_polar_mix',    p.mb2_polar_mix)
+        self._set('u_mb2_rot_per_iter', p.mb2_rot_per_iter)
+        self._set('u_mb2_abs_x',        1 if p.mb2_abs_x else 0)
+        self._set('u_mb2_abs_y',        1 if p.mb2_abs_y else 0)
+        self._set('u_mb2_abs_z',        1 if p.mb2_abs_z else 0)
+        self._set('u_oc_scale_y',       p.oc_scale_y)
+        self._set('u_oc_scale_z',       p.oc_scale_z)
+        self._set('u_oc_julia_mode',    p.oc_julia_mode)
+        self._set('u_oc_julia_x',       p.oc_julia_x)
+        self._set('u_oc_julia_y',       p.oc_julia_y)
+        self._set('u_oc_julia_z',       p.oc_julia_z)
+        self._set('u_kl_fold_limit_x',  p.kl_fold_limit_x)
+        self._set('u_kl_fold_limit_y',  p.kl_fold_limit_y)
+        self._set('u_kl_fold_limit_z',  p.kl_fold_limit_z)
+        self._set('u_kl_julia_mode',    p.kl_julia_mode)
+        self._set('u_kl_offset_x',      p.kl_offset_x)
+        self._set('u_kl_offset_y',      p.kl_offset_y)
+        self._set('u_kl_offset_z',      p.kl_offset_z)
+        self._set('u_sph_inv_enabled',  1 if p.sph_inv_enabled else 0)
+        self._set('u_sph_inv_radius',   p.sph_inv_radius)
+        self._set('u_sph_inv_cx',       p.sph_inv_cx)
+        self._set('u_sph_inv_cy',       p.sph_inv_cy)
+        self._set('u_sph_inv_cz',       p.sph_inv_cz)
+        self._set('u_lattice_fold_enabled', 1 if p.lattice_fold_enabled else 0)
+        self._set('u_lattice_fold_x',   p.lattice_fold_x)
+        self._set('u_lattice_fold_y',   p.lattice_fold_y)
+        self._set('u_lattice_fold_z',   p.lattice_fold_z)
         # Global space operators
         self._set('u_warp_enabled',     1 if p.warp_enabled  else 0)
         self._set('u_warp_strength',    p.warp_strength)
@@ -2846,23 +3067,6 @@ class FractalWindow(mglw.WindowConfig):
         except Exception as e:
             print(f'[screenshot] failed: {e}')
 
-COLORS = {
-    'bg':     '#1a1a2e',
-    'bg2':    '#12122a',
-    'panel':  '#2d2d5e',
-    'accent': '#7b68ee',
-    'fg':     '#e0e0ff',
-    'fg2':    '#8888cc',
-    'fg3':    '#aaaacc',
-    'fg4':    '#6060aa',
-}
-FONT_MONO  = QFont('Segoe UI', 10)
-FONT_SMALL = QFont('Segoe UI', 9)
-FONT_TITLE = QFont('Segoe UI', 13)
-FONT_TITLE.setBold(True)
-FONT_BOLD  = QFont('Segoe UI', 9)
-FONT_BOLD.setBold(True)
-
 def _make_icon() -> QIcon:
     path = _ICON_PATH
     if path.exists():
@@ -2908,7 +3112,6 @@ class SplashScreen(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         inner = QWidget()
-        inner.setStyleSheet(f"background: #12122a; border: 2px solid #7b68ee; border-radius: 12px;")
         vbox = QVBoxLayout(inner)
         vbox.setContentsMargins(32, 28, 32, 24)
         vbox.setSpacing(10)
@@ -2981,93 +3184,26 @@ class SplashScreen(QWidget):
 
 def _apply_palette(app: QApplication):
     pass
-    pal = QPalette()
-    bg  = QColor(COLORS['bg'])
-    fg  = QColor(COLORS['fg'])
-    acc = QColor(COLORS['accent'])
-    pal.setColor(QPalette.Window,          bg)
-    pal.setColor(QPalette.WindowText,      fg)
-    pal.setColor(QPalette.Base,            QColor(COLORS['panel']))
-    pal.setColor(QPalette.AlternateBase,   bg)
-    pal.setColor(QPalette.Text,            fg)
-    pal.setColor(QPalette.Button,          QColor(COLORS['panel']))
-    pal.setColor(QPalette.ButtonText,      fg)
-    pal.setColor(QPalette.Highlight,       acc)
-    pal.setColor(QPalette.HighlightedText, fg)
-    app.setPalette(pal)
 
 
-def _css_groupbox() -> str:
-    return f"""
-        QGroupBox {{
-            color: {COLORS['accent']};
-            font: bold 9pt Segoe UI;
-            border: 1px solid {COLORS['panel']};
-            border-radius: 4px;
-            margin-top: 8px;
-            padding-top: 6px;
-        }}
-        QGroupBox::title {{
-            subcontrol-origin: margin;
-            left: 8px;
-        }}
-    """
-
-def _css_check() -> str:
-    return f"""
-        QCheckBox {{ color: {COLORS['fg']}; font: 9pt Segoe UI; spacing: 6px; }}
-        QCheckBox::indicator {{
-            width: 14px; height: 14px;
-            background: {COLORS['panel']};
-            border: 1px solid {COLORS['accent']};
-            border-radius: 3px;
-        }}
-        QCheckBox::indicator:checked {{ background: {COLORS['accent']}; }}
-    """
-
-def _css_radio() -> str:
-    return f"""
-        QRadioButton {{ color: {COLORS['fg']}; font: 9pt Segoe UI; spacing: 6px; }}
-        QRadioButton::indicator {{
-            width: 14px; height: 14px;
-            background: {COLORS['panel']};
-            border: 1px solid {COLORS['accent']};
-            border-radius: 7px;
-        }}
-        QRadioButton::indicator:checked {{ background: {COLORS['accent']}; }}
-    """
-
-def _css_button(bg=None, hover=None) -> str:
-    bg    = bg    or COLORS['panel']
-    hover = hover or COLORS['accent']
-    return f"""
-        QPushButton {{
-            background: {bg}; color: {COLORS['fg']};
-            font: 8pt Segoe UI; border: none;
-            border-radius: 4px; padding: 4px 8px;
-        }}
-        QPushButton:hover {{ background: {hover}; }}
-        QPushButton:pressed {{ background: {COLORS['accent']}; }}
-    """
+def _icon_btn(std_icon, tooltip='', text=''):
+    btn = QPushButton()
+    btn.setIcon(QApplication.style().standardIcon(std_icon))
+    if text:
+        btn.setText(text)
+    btn.setToolTip(tooltip)
+    return btn
 
 def _label(text, color=None, font=None) -> QLabel:
     lbl = QLabel(text)
-    lbl.setFont(font or FONT_MONO)
-    lbl.setStyleSheet(f"color: {color or COLORS['fg']}; background: transparent;")
     return lbl
 
 def _section(title) -> QGroupBox:
-    grp = QGroupBox(f' {title} ')
-    grp.setStyleSheet(_css_groupbox())
-    grp.setFont(FONT_MONO)
-    return grp
+    return QGroupBox(f' {title} ')
 
 def _lbl_hint(layout, text: str):
-    lbl = _label(text, COLORS['fg4'], FONT_SMALL)
-    lbl.setStyleSheet(
-        f"color: {COLORS['fg4']}; background: transparent;"
-        "padding: 0px 4px; font-style: italic;"
-    )
+    lbl = QLabel(text)
+    lbl.setWordWrap(True)
     layout.addWidget(lbl)
 
 class SliderSmoother:
@@ -3093,6 +3229,11 @@ class SliderSmoother:
         self._timer.stop()
         self._cb(v)
 
+    def sync_current(self, v: float):
+        self._target  = v
+        self._current = v
+        self._timer.stop()
+
     def _tick(self):
         alpha = 1.0 - math.exp(-self.SMOOTHING * self.TICK_MS * 0.001)
         self._current += (self._target - self._current) * alpha
@@ -3108,23 +3249,29 @@ class SliderRow(QWidget):
                  value: float, step: float = 0.01, parent=None):
         super().__init__(parent)
         self._mn, self._mx, self._step = mn, mx, step
+        self._updating = False
+        self._params_attr: str = ''
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(6)
-        lbl = _label(label, COLORS['fg2'], FONT_SMALL)
-        lbl.setFixedWidth(80)
+        lbl = QLabel(label)
+        lbl.setMinimumWidth(80)
         lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._slider = QSlider(Qt.Horizontal)
         self._slider.setRange(0, self.SLIDER_STEPS)
-        self._val_lbl = _label(f'{value:.2f}', COLORS['fg'], FONT_SMALL)
-        self._val_lbl.setFixedWidth(50)
-        self._val_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        decimals = max(0, -int(math.floor(math.log10(max(abs(step), 1e-9)))))
+        self._spin = QDoubleSpinBox()
+        self._spin.setRange(mn, mx)
+        self._spin.setSingleStep(step)
+        self._spin.setDecimals(decimals)
+        self._spin.setMinimumWidth(72)
         layout.addWidget(lbl)
         layout.addWidget(self._slider, 1)
-        layout.addWidget(self._val_lbl)
+        layout.addWidget(self._spin, 0)
         self._callbacks = []
         self._smoother = SliderSmoother(value, self._dispatch)
         self._slider.valueChanged.connect(self._on_slider_moved)
+        self._spin.valueChanged.connect(self._on_spin_changed)
         self.set_value(value)
 
     def _float_to_int(self, v: float) -> int:
@@ -3135,37 +3282,60 @@ class SliderRow(QWidget):
         return round(raw / self._step) * self._step
 
     def _dispatch(self, v: float):
-        self._val_lbl.setText(f'{v:.2f}')
+        self._updating = True
+        self._spin.setValue(v)
+        self._updating = False
         for cb in self._callbacks:
             cb(v)
 
     def set_value(self, v: float):
         self._slider.blockSignals(True)
+        self._spin.blockSignals(True)
         self._slider.setValue(self._float_to_int(v))
+        self._spin.setValue(v)
         self._slider.blockSignals(False)
+        self._spin.blockSignals(False)
         self._smoother.set_immediate(v)
 
     def get_value(self) -> float:
         return self._int_to_float(self._slider.value())
 
     def _on_slider_moved(self, _):
-        self._smoother.set_target(self.get_value())
+        if not self._updating:
+            self._smoother.set_target(self.get_value())
+
+    def _on_spin_changed(self, v: float):
+        if self._updating:
+            return
+        clamped = max(self._mn, min(self._mx, v))
+        self._slider.blockSignals(True)
+        self._slider.setValue(self._float_to_int(clamped))
+        self._slider.blockSignals(False)
+        self._smoother.set_target(clamped)
 
     def on_change(self, cb):
         self._callbacks.append(cb)
+
+    def sync_current(self, v: float):
+        v = max(self._mn, min(self._mx, v))
+        self._smoother.sync_current(v)
 
 class ControlGUI(QMainWindow):
     CAM_SYNC_MS = 80
     def __init__(self):
         super().__init__()
         self.setWindowTitle("IFS Parameters")
-        self.resize(1020, 860)
-        self.setStyleSheet(f"QMainWindow, QWidget {{ background: {COLORS['bg']}; }}")
         self._feat_sections: dict = {}
         self._build()
+        app_config.restore_window_geometry("main", self, default_w=1020, default_h=860)
         self._cam_timer = QTimer(self)
         self._cam_timer.timeout.connect(self._sync_camera_ui)
         self._cam_timer.start(self.CAM_SYNC_MS)
+
+    def closeEvent(self, ev):
+        app_config.save_window_geometry("main", self)
+        super().closeEvent(ev)
+
     def _register_feat_section(self, feat_attr: str, widget):
         self._feat_sections.setdefault(feat_attr, []).append(widget)
         widget.setVisible(getattr(_params, feat_attr, True))
@@ -3176,7 +3346,6 @@ class ControlGUI(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setStyleSheet("QScrollArea { border: none; }")
         container = QWidget()
-        container.setStyleSheet(f"background: {COLORS['bg']};")
         vbox = QVBoxLayout(container)
         vbox.setSpacing(4)
         vbox.setContentsMargins(8, 8, 8, 8)
@@ -3185,54 +3354,14 @@ class ControlGUI(QMainWindow):
 
     def _build(self):
         root = QWidget()
-        root.setStyleSheet(f"background: {COLORS['bg']};")
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(8, 8, 8, 8)
         root_layout.setSpacing(4)
 
-        title = _label("KALEIDOSCOPIC IFS", COLORS['accent'], FONT_TITLE)
-        title.setAlignment(Qt.AlignCenter)
-        root_layout.addWidget(title)
-
-        sub = _label("Ray-marched fractal renderer", COLORS['fg4'], FONT_SMALL)
-        sub.setAlignment(Qt.AlignCenter)
-        root_layout.addWidget(sub)
-
-        hint_text = (
-            "LMB drag -> look   Scroll -> fly fwd/bwd\n"
-            "W/S -> fwd/bwd   A/D -> strafe   Q/E -> up/dn\n"
-            "Shift -> x5 faster   Alt -> x0.2 slower"
-        )
-        hint = _label(hint_text, COLORS['fg2'], FONT_SMALL)
-        hint.setStyleSheet(
-            f"color: {COLORS['fg2']}; background: {COLORS['bg2']};"
-            "padding: 6px 8px; border-radius: 4px;"
-        )
-        root_layout.addWidget(hint)
+        self._build_toolbar()
 
         tabs = QTabWidget()
-        tabs.setStyleSheet(f"""
-            QTabWidget::pane {{
-                border: 1px solid {COLORS['panel']};
-                background: {COLORS['bg']};
-            }}
-            QTabBar::tab {{
-                background: {COLORS['bg2']};
-                color: {COLORS['fg2']};
-                padding: 5px 10px;
-                border: 1px solid {COLORS['panel']};
-                border-bottom: none;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-            }}
-            QTabBar::tab:selected {{
-                background: {COLORS['panel']};
-                color: {COLORS['accent']};
-            }}
-            QTabBar::tab:hover {{
-                background: {COLORS['panel']};
-            }}
-        """)
+
         root_layout.addWidget(tabs, 1)
 
         tab_fractal, vbox = self._make_scroll_tab()
@@ -3311,6 +3440,12 @@ class ControlGUI(QMainWindow):
             self._vbox.addStretch()
             tabs.addTab(tab_anim, "Animation")
 
+        tab_settings, vbox = self._make_scroll_tab()
+        self._vbox = vbox
+        self._build_settings_section()
+        self._vbox.addStretch()
+        tabs.addTab(tab_settings, "Settings")
+
         self.setCentralWidget(root)
 
     def _add_section(self, widget):
@@ -3320,20 +3455,12 @@ class ControlGUI(QMainWindow):
         grp_open = _section("ANIMATION EDITOR")
         layout_open = QVBoxLayout(grp_open)
         layout_open.setSpacing(6)
-        hint = _label(
-            "Timeline-based keyframe animation.\n"
+        hint = QLabel("Timeline-based keyframe animation.\n"
             "Animate any fractal, render, or camera property.\n"
-            "Supports float, color, bool and int tracks.",
-            COLORS['fg2'], FONT_SMALL
-        )
-        hint.setStyleSheet(
-            f"color: {COLORS['fg2']}; background: {COLORS['bg2']};"
-            "padding: 6px 8px; border-radius: 4px;"
-        )
+            "Supports float, color, bool and int tracks.")
+
         layout_open.addWidget(hint)
-        open_btn = QPushButton("Open Animation Editor")
-        open_btn.setFont(FONT_BOLD)
-        open_btn.setStyleSheet(_css_button(COLORS['accent'], COLORS['panel']))
+        open_btn = _icon_btn(QStyle.SP_MediaPlay, "Открыть редактор анимации", "Open Animation Editor")
         open_btn.setFixedHeight(34)
         open_btn.clicked.connect(self._open_anim_editor)
         layout_open.addWidget(open_btn)
@@ -3343,13 +3470,7 @@ class ControlGUI(QMainWindow):
         layout_clip = QVBoxLayout(grp_clip)
         layout_clip.setSpacing(4)
         self._clip_combo = QComboBox()
-        self._clip_combo.setStyleSheet(
-            f"QComboBox {{ background: {COLORS['panel']}; color: {COLORS['fg']};"
-            f" border: 1px solid {COLORS['fg4']}; border-radius: 3px; padding: 3px 6px; }}"
-            f"QComboBox::drop-down {{ border: none; }}"
-            f"QComboBox QAbstractItemView {{ background: {COLORS['panel']}; color: {COLORS['fg']};"
-            f" selection-background-color: {COLORS['accent']}; border: 1px solid {COLORS['fg4']}; }}"
-        )
+
         self._clip_combo.currentIndexChanged.connect(self._on_clip_combo_changed)
         layout_clip.addWidget(self._clip_combo)
         self._add_section(grp_clip)
@@ -3358,22 +3479,21 @@ class ControlGUI(QMainWindow):
         layout_ctl = QVBoxLayout(grp_ctl)
         layout_ctl.setSpacing(4)
         row1 = QHBoxLayout()
-        self._anim_play_btn = QPushButton("Play")
-        self._anim_play_btn.setStyleSheet(_css_button())
+        self._anim_play_btn = _icon_btn(QStyle.SP_MediaPlay, "Play / Pause", "Play")
         self._anim_play_btn.clicked.connect(self._anim_toggle_play)
-        self._anim_stop_btn = QPushButton("Stop")
-        self._anim_stop_btn.setStyleSheet(_css_button())
+        self._anim_stop_btn = _icon_btn(QStyle.SP_MediaStop, "Stop", "Stop")
         self._anim_stop_btn.clicked.connect(_anim_state.stop)
         row1.addWidget(self._anim_play_btn)
         row1.addWidget(self._anim_stop_btn)
         layout_ctl.addLayout(row1)
-        self._anim_time_lbl = _label("t = 0.000s  |  clip: —", COLORS['fg3'], FONT_SMALL)
+        self._anim_time_lbl = QLabel("t = 0.000s  |  clip: —")
         layout_ctl.addWidget(self._anim_time_lbl)
         self._add_section(grp_ctl)
 
         _anim_state.time_changed.connect(self._on_anim_time)
         _anim_state.playback_changed.connect(self._on_anim_play)
         _anim_state.clip_changed.connect(self._on_anim_clip)
+        _anim_state.time_changed.connect(self._sync_sliders_from_anim)
         self._refresh_clip_combo()
 
     def _open_anim_editor(self):
@@ -3407,16 +3527,30 @@ class ControlGUI(QMainWindow):
 
     def _on_anim_play(self, playing: bool):
         self._anim_play_btn.setText("Pause" if playing else "Play")
-        self._anim_play_btn.setStyleSheet(
-            _css_button(COLORS['accent'], COLORS['panel']) if playing
-            else _css_button()
-        )
+        icon_type = QStyle.SP_MediaPause if playing else QStyle.SP_MediaPlay
+        self._anim_play_btn.setIcon(QApplication.style().standardIcon(icon_type))
 
     def _on_anim_clip(self):
         clip = _anim_state.current_clip
         if clip and hasattr(self, '_anim_time_lbl'):
             self._anim_time_lbl.setText(f't = 0.000s/{clip.duration:.1f}s  |  {clip.name}')
         self._refresh_clip_combo()
+
+    def _sync_sliders_from_anim(self, _t: float):
+        if not _anim_state.playing:
+            return
+        for name in dir(self):
+            if not name.startswith('_sl_'):
+                continue
+            sl = getattr(self, name, None)
+            if not isinstance(sl, SliderRow):
+                continue
+            attr = getattr(sl, '_params_attr', '')
+            if not attr:
+                continue
+            v = getattr(_params, attr, None)
+            if isinstance(v, (int, float)):
+                sl.sync_current(float(v))
 
     def _build_fractal_section(self):
         grp = _section("FRACTAL TYPE")
@@ -3426,8 +3560,6 @@ class ControlGUI(QMainWindow):
         row = QHBoxLayout()
         for i, name in enumerate(["Mandelbox", "Menger Sponge", "Sierpinski", "Octahedron IFS", "Mandelbulb", "Kleinian"]):
             rb = QRadioButton(name)
-            rb.setFont(FONT_MONO)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i == _params.fractal_type)
             self._type_grp.addButton(rb, i)
             if i % 2 == 0 and i > 0:
@@ -3439,13 +3571,13 @@ class ControlGUI(QMainWindow):
         iter_row = QWidget()
         iter_layout = QHBoxLayout(iter_row)
         iter_layout.setContentsMargins(0, 0, 0, 0)
-        iter_lbl = _label("Iterations", COLORS['fg2'], FONT_SMALL)
+        iter_lbl = QLabel("Iterations")
         iter_lbl.setFixedWidth(80)
         iter_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._iter_slider = QSlider(Qt.Horizontal)
         self._iter_slider.setRange(1, 64)
         self._iter_slider.setValue(_params.iterations)
-        self._iter_val_lbl = _label(str(_params.iterations), COLORS['fg'], FONT_SMALL)
+        self._iter_val_lbl = QLabel(str(_params.iterations))
         self._iter_val_lbl.setFixedWidth(50)
         self._iter_slider.valueChanged.connect(self._on_iter_change)
         iter_layout.addWidget(iter_lbl)
@@ -3468,16 +3600,15 @@ class ControlGUI(QMainWindow):
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             base_layout.addWidget(sr)
-        trap_lbl = _label("Orbit trap shape:", COLORS['fg3'], FONT_SMALL)
+        trap_lbl = QLabel("Orbit trap shape:")
         base_layout.addWidget(trap_lbl)
         trap_row = QHBoxLayout()
         self._trap_grp = QButtonGroup(self)
         for i, name in enumerate(["Sphere", "Plane", "Cube", "Torus"]):
             rb = QRadioButton(name)
-            rb.setFont(FONT_SMALL)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i == _params.orbit_trap_type)
             self._trap_grp.addButton(rb, i)
             trap_row.addWidget(rb)
@@ -3490,59 +3621,61 @@ class ControlGUI(QMainWindow):
         mb = _section("MANDELBOX FINE-TUNE")
         mb_l = QVBoxLayout(mb)
         mb_l.setSpacing(2)
-        _lbl_hint(mb_l, "Box fold per axis, sphere fold radii, Julia mode")
+        _lbl_hint(mb_l, "Box fold per axis, sphere fold radii, Julia mode, per-axis scale/offset")
         for label, attr, mn, mx, val, step in [
             ("Fold Limit",    'mb_fold_limit',   0.1, 3.0,  _params.mb_fold_limit,   0.01),
             ("Fold X",        'mb_fold_x',       0.0, 3.0,  _params.mb_fold_x,       0.01),
             ("Fold Y",        'mb_fold_y',       0.0, 3.0,  _params.mb_fold_y,       0.01),
             ("Fold Z",        'mb_fold_z',       0.0, 3.0,  _params.mb_fold_z,       0.01),
-            ("Sph Inner r²",  'mb_sphere_inner', 0.01,2.0,  _params.mb_sphere_inner, 0.005),
-            ("Sph Outer r²",  'mb_sphere_outer', 0.1, 5.0,  _params.mb_sphere_outer, 0.01),
+            ("Sph Inner r\u00b2", 'mb_sphere_inner', 0.01,2.0,  _params.mb_sphere_inner, 0.005),
+            ("Sph Outer r\u00b2", 'mb_sphere_outer', 0.1, 5.0,  _params.mb_sphere_outer, 0.01),
             ("Fixed Radius",  'mb_fixed_radius', 0.1, 4.0,  _params.mb_fixed_radius, 0.01),
             ("Color Scale",   'mb_color_scale',  0.01,5.0,  _params.mb_color_scale,  0.01),
             ("Rot/Iter",      'mb_rot_per_iter', 0.0, 0.5,  _params.mb_rot_per_iter, 0.002),
+            ("Scale X",       'mb_scale_x',      0.0, 5.0,  _params.mb_scale_x,      0.01),
+            ("Scale Y",       'mb_scale_y',      0.0, 5.0,  _params.mb_scale_y,      0.01),
+            ("Scale Z",       'mb_scale_z',      0.0, 5.0,  _params.mb_scale_z,      0.01),
+            ("Offset X",      'mb_offset_x',    -5.0, 5.0,  _params.mb_offset_x,     0.01),
+            ("Offset Y",      'mb_offset_y',    -5.0, 5.0,  _params.mb_offset_y,     0.01),
+            ("Offset Z",      'mb_offset_z',    -5.0, 5.0,  _params.mb_offset_z,     0.01),
+            ("Inversion R",   'mb_inversion_radius', 0.0, 4.0, _params.mb_inversion_radius, 0.01),
             ("Julia X",       'julia_x',        -20.0,20.0, _params.julia_x,         0.01),
             ("Julia Y",       'julia_y',        -20.0,20.0, _params.julia_y,         0.01),
             ("Julia Z",       'julia_z',        -20.0,20.0, _params.julia_z,         0.01),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             mb_l.addWidget(sr)
-        fold_mode_lbl = _label("Box fold mode:", COLORS['fg3'], FONT_SMALL)
+        fold_mode_lbl = QLabel("Box fold mode:")
         mb_l.addWidget(fold_mode_lbl)
         fold_mode_row = QHBoxLayout()
         self._fold_mode_grp = QButtonGroup(self)
         for i, name in enumerate(["Clamp", "Abs", "Sin"]):
             rb = QRadioButton(name)
-            rb.setFont(FONT_SMALL)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i == _params.mb_fold_mode)
             self._fold_mode_grp.addButton(rb, i)
             fold_mode_row.addWidget(rb)
         self._fold_mode_grp.idClicked.connect(lambda idx: setattr(_params, 'mb_fold_mode', idx))
         mb_l.addLayout(fold_mode_row)
-        julia_mode_lbl = _label("Julia mode:", COLORS['fg3'], FONT_SMALL)
+        julia_mode_lbl = QLabel("Julia mode:")
         mb_l.addWidget(julia_mode_lbl)
         julia_mode_row = QHBoxLayout()
         self._mb_julia_mode_grp = QButtonGroup(self)
         for i, name in enumerate(["Orbit (free)", "Fixed Julia"]):
             rb = QRadioButton(name)
-            rb.setFont(FONT_SMALL)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i == _params.mb_julia_mode)
             self._mb_julia_mode_grp.addButton(rb, i)
             julia_mode_row.addWidget(rb)
         self._mb_julia_mode_grp.idClicked.connect(lambda idx: setattr(_params, 'mb_julia_mode', idx))
         mb_l.addLayout(julia_mode_row)
-        folds_lbl = _label("Axis folds:", COLORS['fg3'], FONT_SMALL)
+        folds_lbl = QLabel("Axis folds:")
         mb_l.addWidget(folds_lbl)
         folds_row = QHBoxLayout()
         self._fold_checks = {}
         for axis in ['X', 'Y', 'Z']:
             cb = QCheckBox(f'Fold {axis}')
-            cb.setFont(FONT_MONO)
-            cb.setStyleSheet(_css_check())
             cb.setChecked(getattr(_params, f'fold_{axis.lower()}'))
             cb.stateChanged.connect(
                 lambda state, a=axis: setattr(_params, f'fold_{a.lower()}', bool(state))
@@ -3556,29 +3689,45 @@ class ControlGUI(QMainWindow):
         ms = _section("MENGER SPONGE FINE-TUNE")
         ms_l = QVBoxLayout(ms)
         ms_l.setSpacing(2)
-        _lbl_hint(ms_l, "IFS scale per axis, cross gap, twist per axis")
+        _lbl_hint(ms_l, "IFS scale per axis, cross gap, twist per axis, per-axis offset, fold mode")
         for label, attr, mn, mx, val, step in [
-            ("IFS Scale",    'ms_scale',       2.0, 5.0, _params.ms_scale,       0.01),
-            ("Scale Y",      'ms_scale_y',     0.0, 5.0, _params.ms_scale_y,     0.01),
-            ("Scale Z",      'ms_scale_z',     0.0, 5.0, _params.ms_scale_z,     0.01),
-            ("IFS Offset",   'ms_offset',      1.0, 4.0, _params.ms_offset,      0.01),
-            ("Cross Width",  'ms_cross_width', 0.0, 4.0, _params.ms_cross_width, 0.01),
-            ("Twist Y",      'ms_twist',       0.0, 1.3, _params.ms_twist,       0.001),
-            ("Twist X",      'ms_rot_x',       0.0, 1.3, _params.ms_rot_x,       0.001),
-            ("Twist Z",      'ms_rot_z',       0.0, 1.3, _params.ms_rot_z,       0.001),
-            ("Edge Sharp",   'ms_sharpness',   0.1, 1.0, _params.ms_sharpness,   0.01),
+            ("IFS Scale",    'ms_scale',         2.0, 5.0, _params.ms_scale,         0.01),
+            ("Scale Y",      'ms_scale_y',       0.0, 5.0, _params.ms_scale_y,       0.01),
+            ("Scale Z",      'ms_scale_z',       0.0, 5.0, _params.ms_scale_z,       0.01),
+            ("IFS Offset",   'ms_offset',        1.0, 4.0, _params.ms_offset,        0.01),
+            ("Offset X",     'ms_offset_x',     -4.0, 4.0, _params.ms_offset_x,      0.01),
+            ("Offset Y",     'ms_offset_y',     -4.0, 4.0, _params.ms_offset_y,      0.01),
+            ("Offset Z",     'ms_offset_z',     -4.0, 4.0, _params.ms_offset_z,      0.01),
+            ("Cross Width",  'ms_cross_width',   0.0, 4.0, _params.ms_cross_width,   0.01),
+            ("Twist Y",      'ms_twist',         0.0, 1.3, _params.ms_twist,         0.001),
+            ("Twist X",      'ms_rot_x',         0.0, 1.3, _params.ms_rot_x,         0.001),
+            ("Twist Z",      'ms_rot_z',         0.0, 1.3, _params.ms_rot_z,         0.001),
+            ("Edge Sharp",   'ms_sharpness',     0.1, 1.0, _params.ms_sharpness,     0.01),
+            ("Fold Abs Amt", 'ms_fold_abs_amount', 0.0, 3.0, _params.ms_fold_abs_amount, 0.01),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             ms_l.addWidget(sr)
+        ms_fold_lbl = QLabel("Fold mode:")
+        ms_l.addWidget(ms_fold_lbl)
+        ms_fold_row = QHBoxLayout()
+        self._ms_fold_grp = QButtonGroup(self)
+        for i, name in enumerate(["Abs", "Abs-Offset", "Box"]):
+            rb = QRadioButton(name)
+            rb.setChecked(i == _params.ms_fold_type)
+            self._ms_fold_grp.addButton(rb, i)
+            ms_fold_row.addWidget(rb)
+        self._ms_fold_grp.idClicked.connect(lambda idx: setattr(_params, 'ms_fold_type', idx))
+        ms_l.addLayout(ms_fold_row)
         self._fractal_panels[1] = ms
         self._add_section(ms)
 
         si = _section("SIERPINSKI FINE-TUNE")
         si_l = QVBoxLayout(si)
         si_l.setSpacing(2)
-        _lbl_hint(si_l, "Vertex spread, fold bias, squash, twist per axis")
+        _lbl_hint(si_l, "Vertex spread, fold bias, squash, twist per axis, per-axis scale/offset")
         for label, attr, mn, mx, val, step in [
             ("Vertex Spread", 'si_vertex_spread', 0.2, 3.0, _params.si_vertex_spread, 0.01),
             ("Fold Bias",     'si_fold_bias',      1.2, 4.0, _params.si_fold_bias,     0.01),
@@ -3586,10 +3735,18 @@ class ControlGUI(QMainWindow):
             ("Twist Y",       'si_twist',          0.0, 1.3, _params.si_twist,         0.001),
             ("Twist X",       'si_rot_x',          0.0, 1.3, _params.si_rot_x,         0.001),
             ("Twist Z",       'si_rot_z',          0.0, 1.3, _params.si_rot_z,         0.001),
+            ("Twist Y2",      'si_rot_y',          0.0, 1.3, _params.si_rot_y,         0.001),
             ("Vtx Jitter",    'si_vertex_jitter',  0.0, 1.0, _params.si_vertex_jitter, 0.005),
+            ("Scale X",       'si_scale_x',        0.0, 4.0, _params.si_scale_x,       0.01),
+            ("Scale Y",       'si_scale_y',        0.0, 4.0, _params.si_scale_y,       0.01),
+            ("Scale Z",       'si_scale_z',        0.0, 4.0, _params.si_scale_z,       0.01),
+            ("Offset X",      'si_offset_x',      -3.0, 3.0, _params.si_offset_x,      0.01),
+            ("Offset Y",      'si_offset_y',      -3.0, 3.0, _params.si_offset_y,      0.01),
+            ("Offset Z",      'si_offset_z',      -3.0, 3.0, _params.si_offset_z,      0.01),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             si_l.addWidget(sr)
         self._fractal_panels[2] = si
@@ -3598,9 +3755,11 @@ class ControlGUI(QMainWindow):
         oc = _section("OCTAHEDRON IFS FINE-TUNE")
         oc_l = QVBoxLayout(oc)
         oc_l.setSpacing(2)
-        _lbl_hint(oc_l, "IFS scale, per-axis offset, rotation per axis, norm sharpness")
+        _lbl_hint(oc_l, "IFS scale, per-axis offset/scale, rotation per axis, norm sharpness, Julia mode")
         for label, attr, mn, mx, val, step in [
             ("IFS Scale",     'oc_ifs_scale',   1.2, 4.0,  _params.oc_ifs_scale,   0.01),
+            ("Scale Y",       'oc_scale_y',     0.0, 4.0,  _params.oc_scale_y,     0.01),
+            ("Scale Z",       'oc_scale_z',     0.0, 4.0,  _params.oc_scale_z,     0.01),
             ("Offset Uni",    'oc_offset_uni',  0.1, 3.0,  _params.oc_offset_uni,  0.01),
             ("Offset X",      'oc_offset_x',    0.0, 4.0,  _params.oc_offset_x,    0.01),
             ("Offset Y",      'oc_offset_y',    0.0, 4.0,  _params.oc_offset_y,    0.01),
@@ -3610,18 +3769,33 @@ class ControlGUI(QMainWindow):
             ("Twist Z",       'oc_rot_z',       0.0, 1.55,  _params.oc_rot_z,       0.001),
             ("Norm Sharp",    'oc_sharpness',   0.5, 4.0,  _params.oc_sharpness,   0.05),
             ("Fold Amount",   'oc_fold_amount', 0.0, 1.0,  _params.oc_fold_amount, 0.01),
+            ("Julia X",       'oc_julia_x',    -3.0, 3.0,  _params.oc_julia_x,     0.005),
+            ("Julia Y",       'oc_julia_y',    -3.0, 3.0,  _params.oc_julia_y,     0.005),
+            ("Julia Z",       'oc_julia_z',    -3.0, 3.0,  _params.oc_julia_z,     0.005),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             oc_l.addWidget(sr)
+        oc_julia_lbl = QLabel("Julia mode:")
+        oc_l.addWidget(oc_julia_lbl)
+        oc_julia_row = QHBoxLayout()
+        self._oc_julia_grp = QButtonGroup(self)
+        for i, name in enumerate(["Standard IFS", "Julia set"]):
+            rb = QRadioButton(name)
+            rb.setChecked(i == _params.oc_julia_mode)
+            self._oc_julia_grp.addButton(rb, i)
+            oc_julia_row.addWidget(rb)
+        self._oc_julia_grp.idClicked.connect(lambda idx: setattr(_params, 'oc_julia_mode', idx))
+        oc_l.addLayout(oc_julia_row)
         self._fractal_panels[3] = oc
         self._add_section(oc)
 
         mb2 = _section("MANDELBULB FINE-TUNE")
         mb2_l = QVBoxLayout(mb2)
         mb2_l.setSpacing(2)
-        _lbl_hint(mb2_l, "Power N (2=sphere, 8=classic), Julia mode, pre-fold")
+        _lbl_hint(mb2_l, "Power N (2=sphere, 8=classic), Julia mode, pre-fold, polar mix, rot/iter, conditional abs")
         for label, attr, mn, mx, val, step in [
             ("Power N",       'mb2_power',        2.0, 16.0, _params.mb2_power,        0.05),
             ("Bailout",       'mb2_bailout',       1.0, 10.0, _params.mb2_bailout,      0.1),
@@ -3629,32 +3803,41 @@ class ControlGUI(QMainWindow):
             ("Julia Y",       'mb2_julia_y',      -2.0, 2.0,  _params.mb2_julia_y,      0.005),
             ("Julia Z",       'mb2_julia_z',      -2.0, 2.0,  _params.mb2_julia_z,      0.005),
             ("Fold Strength", 'mb2_fold_strength', 0.0, 2.0,  _params.mb2_fold_strength, 0.01),
+            ("Polar Mix",     'mb2_polar_mix',     0.0, 1.0,  _params.mb2_polar_mix,     0.005),
+            ("Rot/Iter",      'mb2_rot_per_iter',  0.0, 0.5,  _params.mb2_rot_per_iter,  0.002),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             mb2_l.addWidget(sr)
-        julia_lbl = _label("Julia mode:", COLORS['fg3'], FONT_SMALL)
+        abs_lbl = QLabel("Conditional abs fold:")
+        mb2_l.addWidget(abs_lbl)
+        abs_row = QHBoxLayout()
+        for axis, attr in [("Abs X", 'mb2_abs_x'), ("Abs Y", 'mb2_abs_y'), ("Abs Z", 'mb2_abs_z')]:
+            cb = QCheckBox(axis)
+            cb.setChecked(getattr(_params, attr))
+            cb.stateChanged.connect(lambda s, a=attr: setattr(_params, a, bool(s)))
+            setattr(self, f'_cb_{attr}', cb)
+            abs_row.addWidget(cb)
+        mb2_l.addLayout(abs_row)
+        julia_lbl = QLabel("Julia mode:")
         mb2_l.addWidget(julia_lbl)
         julia_row = QHBoxLayout()
         self._mb2_julia_grp = QButtonGroup(self)
         for i, name in enumerate(["Mandelbulb", "Julia set"]):
             rb = QRadioButton(name)
-            rb.setFont(FONT_SMALL)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i == _params.mb2_julia_mode)
             self._mb2_julia_grp.addButton(rb, i)
             julia_row.addWidget(rb)
         self._mb2_julia_grp.idClicked.connect(lambda idx: setattr(_params, 'mb2_julia_mode', idx))
         mb2_l.addLayout(julia_row)
-        fold_lbl2 = _label("Pre-fold type:", COLORS['fg3'], FONT_SMALL)
+        fold_lbl2 = QLabel("Pre-fold type:")
         mb2_l.addWidget(fold_lbl2)
         fold_row2 = QHBoxLayout()
         self._mb2_fold_grp = QButtonGroup(self)
         for i, name in enumerate(["None", "Box", "Abs"]):
             rb = QRadioButton(name)
-            rb.setFont(FONT_SMALL)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i == _params.mb2_fold_type)
             self._mb2_fold_grp.addButton(rb, i)
             fold_row2.addWidget(rb)
@@ -3666,21 +3849,39 @@ class ControlGUI(QMainWindow):
         kl = _section("PSEUDO-KLEINIAN FINE-TUNE")
         kl_l = QVBoxLayout(kl)
         kl_l.setSpacing(2)
-        _lbl_hint(kl_l, "Sphere inversion IFS. Scale, C offset, fold limit, sphere radius.")
+        _lbl_hint(kl_l, "Sphere inversion IFS. Scale, C offset, fold limit per axis, sphere radius, Julia mode.")
         for label, attr, mn, mx, val, step in [
             ("Scale",        'kl_scale',        0.5,  3.0,  _params.kl_scale,        0.01),
             ("C x",          'kl_cx',          -2.0,  2.0,  _params.kl_cx,           0.005),
             ("C y",          'kl_cy',          -2.0,  2.0,  _params.kl_cy,           0.005),
             ("C z",          'kl_cz',          -2.0,  2.0,  _params.kl_cz,           0.005),
             ("Fold Limit",   'kl_fold_limit',   0.1,  3.0,  _params.kl_fold_limit,   0.01),
+            ("Fold Lim X",   'kl_fold_limit_x', 0.0,  3.0,  _params.kl_fold_limit_x, 0.01),
+            ("Fold Lim Y",   'kl_fold_limit_y', 0.0,  3.0,  _params.kl_fold_limit_y, 0.01),
+            ("Fold Lim Z",   'kl_fold_limit_z', 0.0,  3.0,  _params.kl_fold_limit_z, 0.01),
             ("Sph Radius",   'kl_sph_radius',   0.05, 2.0,  _params.kl_sph_radius,   0.005),
             ("Rot/Iter",     'kl_rot_per_iter', 0.0,  1.5,  _params.kl_rot_per_iter, 0.002),
             ("DE Mix",       'kl_mix_factor',   0.0,  1.0,  _params.kl_mix_factor,   0.01),
+            ("Offset X",     'kl_offset_x',    -3.0,  3.0,  _params.kl_offset_x,     0.005),
+            ("Offset Y",     'kl_offset_y',    -3.0,  3.0,  _params.kl_offset_y,     0.005),
+            ("Offset Z",     'kl_offset_z',    -3.0,  3.0,  _params.kl_offset_z,     0.005),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             kl_l.addWidget(sr)
+        kl_julia_lbl = QLabel("Julia mode:")
+        kl_l.addWidget(kl_julia_lbl)
+        kl_julia_row = QHBoxLayout()
+        self._kl_julia_grp = QButtonGroup(self)
+        for i, name in enumerate(["C offset", "Julia set"]):
+            rb = QRadioButton(name)
+            rb.setChecked(i == _params.kl_julia_mode)
+            self._kl_julia_grp.addButton(rb, i)
+            kl_julia_row.addWidget(rb)
+        self._kl_julia_grp.idClicked.connect(lambda idx: setattr(_params, 'kl_julia_mode', idx))
+        kl_l.addLayout(kl_julia_row)
         self._fractal_panels[5] = kl
         self._add_section(kl)
 
@@ -3689,12 +3890,10 @@ class ControlGUI(QMainWindow):
         space_l.setSpacing(4)
         _lbl_hint(space_l, "Applied before the fractal. Stacks: repetition then mirrors then twist then warp.")
 
-        rep_hdr = _label("INFINITE REPETITION", COLORS['fg3'], FONT_SMALL)
+        rep_hdr = QLabel("INFINITE REPETITION")
         space_l.addWidget(rep_hdr)
         rep_en_row = QHBoxLayout()
         self._rep_check = QCheckBox("Enable repetition")
-        self._rep_check.setFont(FONT_SMALL)
-        self._rep_check.setStyleSheet(_css_check())
         self._rep_check.setChecked(_params.rep_enabled)
         self._rep_check.stateChanged.connect(lambda s: setattr(_params, 'rep_enabled', bool(s)))
         rep_en_row.addWidget(self._rep_check)
@@ -3706,16 +3905,15 @@ class ControlGUI(QMainWindow):
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             space_l.addWidget(sr)
 
-        mir_hdr = _label("MIRROR PLANES", COLORS['fg3'], FONT_SMALL)
+        mir_hdr = QLabel("MIRROR PLANES")
         space_l.addWidget(mir_hdr)
         mir_row = QHBoxLayout()
         for axis in ['x', 'y', 'z']:
             cb = QCheckBox(f'Mirror {axis.upper()}')
-            cb.setFont(FONT_SMALL)
-            cb.setStyleSheet(_css_check())
             cb.setChecked(getattr(_params, f'fold_mirror_{axis}'))
             cb.stateChanged.connect(
                 lambda s, a=axis: setattr(_params, f'fold_mirror_{a}', bool(s))
@@ -3724,17 +3922,15 @@ class ControlGUI(QMainWindow):
             mir_row.addWidget(cb)
         space_l.addLayout(mir_row)
 
-        twist_hdr = _label("TWIST", COLORS['fg3'], FONT_SMALL)
+        twist_hdr = QLabel("TWIST")
         space_l.addWidget(twist_hdr)
         _lbl_hint(space_l, "Twists space around the chosen axis by amount * coordinate.")
         twist_axis_row = QHBoxLayout()
-        twist_axis_lbl = _label("Axis:", COLORS['fg3'], FONT_SMALL)
+        twist_axis_lbl = QLabel("Axis:")
         twist_axis_lbl.setFixedWidth(36)
         self._twist_axis_grp = QButtonGroup(self)
         for i, name in enumerate(["Y", "X", "Z"]):
             rb = QRadioButton(name)
-            rb.setFont(FONT_SMALL)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i == _params.twist_axis)
             self._twist_axis_grp.addButton(rb, i)
             twist_axis_row.addWidget(rb)
@@ -3746,25 +3942,21 @@ class ControlGUI(QMainWindow):
         setattr(self, '_sl_twist_amount', sr_tw)
         space_l.addWidget(sr_tw)
 
-        warp_hdr = _label("DOMAIN WARP", COLORS['fg3'], FONT_SMALL)
+        warp_hdr = QLabel("DOMAIN WARP")
         space_l.addWidget(warp_hdr)
         _lbl_hint(space_l, "Sine-based space distortion before fractal evaluation.")
         warp_en_row = QHBoxLayout()
         self._warp_check = QCheckBox("Enable warp")
-        self._warp_check.setFont(FONT_SMALL)
-        self._warp_check.setStyleSheet(_css_check())
         self._warp_check.setChecked(_params.warp_enabled)
         self._warp_check.stateChanged.connect(lambda s: setattr(_params, 'warp_enabled', bool(s)))
         warp_en_row.addWidget(self._warp_check)
         space_l.addLayout(warp_en_row)
         warp_type_row = QHBoxLayout()
-        warp_type_lbl = _label("Type:", COLORS['fg3'], FONT_SMALL)
+        warp_type_lbl = QLabel("Type:")
         warp_type_lbl.setFixedWidth(36)
         self._warp_type_grp = QButtonGroup(self)
         for i, name in enumerate(["Sine", "FBM", "Curl"]):
             rb = QRadioButton(name)
-            rb.setFont(FONT_SMALL)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i == _params.warp_type)
             self._warp_type_grp.addButton(rb, i)
             warp_type_row.addWidget(rb)
@@ -3777,12 +3969,56 @@ class ControlGUI(QMainWindow):
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             space_l.addWidget(sr)
 
         self._add_section(space_grp)
 
-        # Wire fractal-type selector to show/hide panels
+        sph_grp = _section("SPHERICAL INVERSION")
+        sph_l = QVBoxLayout(sph_grp)
+        sph_l.setSpacing(4)
+        _lbl_hint(sph_l, "Inverts space through a sphere. Creates Kleinian-like structures from any fractal.")
+        sph_en_row = QHBoxLayout()
+        self._sph_inv_check = QCheckBox("Enable spherical inversion")
+        self._sph_inv_check.setChecked(_params.sph_inv_enabled)
+        self._sph_inv_check.stateChanged.connect(lambda s: setattr(_params, 'sph_inv_enabled', bool(s)))
+        sph_en_row.addWidget(self._sph_inv_check)
+        sph_l.addLayout(sph_en_row)
+        for label, attr, mn, mx, val, step in [
+            ("Radius",   'sph_inv_radius', 0.1,  5.0, _params.sph_inv_radius, 0.01),
+            ("Center X", 'sph_inv_cx',    -3.0,  3.0, _params.sph_inv_cx,     0.01),
+            ("Center Y", 'sph_inv_cy',    -3.0,  3.0, _params.sph_inv_cy,     0.01),
+            ("Center Z", 'sph_inv_cz',    -3.0,  3.0, _params.sph_inv_cz,     0.01),
+        ]:
+            sr = SliderRow(label, mn, mx, val, step)
+            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
+            setattr(self, f'_sl_{attr}', sr)
+            sph_l.addWidget(sr)
+        self._add_section(sph_grp)
+
+        lat_grp = _section("LATTICE FOLD")
+        lat_l = QVBoxLayout(lat_grp)
+        lat_l.setSpacing(4)
+        _lbl_hint(lat_l, "Folds space into a lattice cell before fractal evaluation. Creates crystalline repeating structures.")
+        lat_en_row = QHBoxLayout()
+        self._lattice_check = QCheckBox("Enable lattice fold")
+        self._lattice_check.setChecked(_params.lattice_fold_enabled)
+        self._lattice_check.stateChanged.connect(lambda s: setattr(_params, 'lattice_fold_enabled', bool(s)))
+        lat_en_row.addWidget(self._lattice_check)
+        lat_l.addLayout(lat_en_row)
+        for label, attr, mn, mx, val, step in [
+            ("Cell X", 'lattice_fold_x', 0.2, 8.0, _params.lattice_fold_x, 0.05),
+            ("Cell Y", 'lattice_fold_y', 0.2, 8.0, _params.lattice_fold_y, 0.05),
+            ("Cell Z", 'lattice_fold_z', 0.2, 8.0, _params.lattice_fold_z, 0.05),
+        ]:
+            sr = SliderRow(label, mn, mx, val, step)
+            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
+            setattr(self, f'_sl_{attr}', sr)
+            lat_l.addWidget(sr)
+        self._add_section(lat_grp)
         self._type_grp.idClicked.connect(self._on_fractal_type_changed)
         self._on_fractal_type_changed(_params.fractal_type)
 
@@ -3801,6 +4037,7 @@ class ControlGUI(QMainWindow):
         ]:
             sr = SliderRow(label, 0.0, math.pi * 2, val, 0.01)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             layout.addWidget(sr)
         self._add_section(grp)
@@ -3809,30 +4046,24 @@ class ControlGUI(QMainWindow):
         layout = QVBoxLayout(grp)
         layout.setSpacing(4)
         self._cam_pos_lbl = QLabel("pos  (0.00, 0.00, 5.00)\nyaw  180.0   pitch  0.0")
-        self._cam_pos_lbl.setFont(FONT_SMALL)
-        self._cam_pos_lbl.setStyleSheet(
-            f"color: {COLORS['fg2']}; background: {COLORS['bg2']};"
-            "padding: 4px 6px; border-radius: 3px;"
-        )
+
         layout.addWidget(self._cam_pos_lbl)
         reset_btn = QPushButton("Reset Camera")
-        reset_btn.setFont(FONT_SMALL)
-        reset_btn.setStyleSheet(_css_button())
         reset_btn.clicked.connect(self._reset_camera)
         layout.addWidget(reset_btn)
         self._sl_move_spd = SliderRow("Move Speed", 0.1, 10.0, FractalWindow.KEY_MOVE_SPD, 0.1)
         self._sl_move_spd.on_change(lambda v: setattr(FractalWindow, 'KEY_MOVE_SPD', v))
         layout.addWidget(self._sl_move_spd)
         self._anim_check = QCheckBox("Auto-rotate (anim)")
-        self._anim_check.setFont(FONT_MONO)
-        self._anim_check.setStyleSheet(_css_check())
         self._anim_check.setChecked(_params.animate)
         self._anim_check.stateChanged.connect(lambda s: setattr(_params, 'animate', bool(s)))
         layout.addWidget(self._anim_check)
         self._sl_anim_speed = SliderRow("Anim Speed", 0.0, 5.0, _params.anim_speed, 0.01)
+        self._sl_anim_speed._params_attr = 'anim_speed'
         self._sl_anim_speed.on_change(lambda v: setattr(_params, 'anim_speed', v))
         layout.addWidget(self._sl_anim_speed)
         self._sl_fov = SliderRow("FOV", 0.5, 3.0, _params.fov, 0.01)
+        self._sl_fov._params_attr = 'fov'
         self._sl_fov.on_change(lambda v: setattr(_params, 'fov', v))
         layout.addWidget(self._sl_fov)
         self._add_section(grp)
@@ -3856,16 +4087,10 @@ class ControlGUI(QMainWindow):
             lbl = self._player_mode_lbl
             if _params.player_mode:
                 lbl.setText("PLAYER MODE: ON")
-                lbl.setStyleSheet(
-                    f"color: {COLORS['accent']}; background: {COLORS['bg2']};"
-                    "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
-                )
+
             else:
                 lbl.setText("PLAYER MODE: OFF")
-                lbl.setStyleSheet(
-                    f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
-                    "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
-                )
+
         except Exception:
             pass
     def _build_color_section(self):
@@ -3876,14 +4101,13 @@ class ControlGUI(QMainWindow):
         self._cmode_grp = QButtonGroup(self)
         for i, label in enumerate(["Iteration", "Orbit Trap", "Normal", "Distance"]):
             rb = QRadioButton(label)
-            rb.setFont(FONT_MONO)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i == _params.color_mode)
             self._cmode_grp.addButton(rb, i)
             modes_layout.addWidget(rb, i // 2, i % 2)
         self._cmode_grp.idClicked.connect(lambda idx: setattr(_params, 'color_mode', idx))
         layout.addLayout(modes_layout)
         self._sl_fog = SliderRow("Fog Density", 0.0, 3.0, _params.fog_density, 0.01)
+        self._sl_fog._params_attr = 'fog_density'
         self._sl_fog.on_change(lambda v: setattr(_params, 'fog_density', v))
         layout.addWidget(self._sl_fog)
         color_row = QHBoxLayout()
@@ -3897,15 +4121,21 @@ class ControlGUI(QMainWindow):
         self._add_section(grp)
     def _make_color_btn(self, label: str, attr: str, rgb) -> QPushButton:
         btn = QPushButton(label)
-        btn.setFont(FONT_BOLD)
-        hex_col = self._rgb_to_hex(rgb)
-        btn.setStyleSheet(
-            f"QPushButton {{ background: {hex_col}; color: white; border: none;"
-            "border-radius: 4px; padding: 4px 8px; font: bold 8pt Segoe UI; }}"
-            f"QPushButton:hover {{ border: 2px solid {COLORS['accent']}; }}"
-        )
+        self._update_color_btn_style(btn, rgb)
         btn.clicked.connect(lambda _, a=attr, b=btn: self._pick_color(a, b))
         return btn
+
+    def _update_color_btn_style(self, btn: QPushButton, rgb):
+        r, g, b = [int(c * 255) for c in rgb]
+        hex_col = f'#{r:02x}{g:02x}{b:02x}'
+        luma = 0.299 * r + 0.587 * g + 0.114 * b
+        fg = '#111111' if luma > 140 else '#eeeeee'
+        btn.setStyleSheet(
+            f"QPushButton {{ background-color: {hex_col}; color: {fg}; "
+            f"border: 1px solid #5050a0; border-radius: 4px; padding: 3px 10px; }}"
+            f"QPushButton:hover {{ border: 2px solid #9d8fff; }}"
+            f"QPushButton:pressed {{ border: 2px solid #ffffff; }}"
+        )
     def _rgb_to_hex(self, rgb) -> str:
         r, g, b = [int(c * 255) for c in rgb]
         return f'#{r:02x}{g:02x}{b:02x}'
@@ -3915,12 +4145,8 @@ class ControlGUI(QMainWindow):
         if col.isValid():
             rgb = (col.redF(), col.greenF(), col.blueF())
             setattr(_params, attr, rgb)
-            hex_col = self._rgb_to_hex(rgb)
-            btn.setStyleSheet(
-                f"QPushButton {{ background: {hex_col}; color: white; border: none;"
-                "border-radius: 4px; padding: 4px 8px; font: bold 8pt Segoe UI; }}"
-                f"QPushButton:hover {{ border: 2px solid {COLORS['accent']}; }}"
-            )
+            self._update_color_btn_style(btn, rgb)
+
     def _build_glow_section(self):
         grp = _section("GLOW & EMISSION")
         layout = QVBoxLayout(grp)
@@ -3935,6 +4161,7 @@ class ControlGUI(QMainWindow):
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             layout.addWidget(sr)
         self._add_section(grp)
@@ -3949,8 +4176,6 @@ class ControlGUI(QMainWindow):
         self._bg_mode_grp = QButtonGroup(self)
         for i, lbl in enumerate(["Flat", "Gradient", "Nebula", "Stars"]):
             rb = QRadioButton(lbl)
-            rb.setFont(FONT_SMALL)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i == _params.bg_mode)
             self._bg_mode_grp.addButton(rb, i)
             mode_row.addWidget(rb)
@@ -3974,8 +4199,6 @@ class ControlGUI(QMainWindow):
         self._aa_grp = QButtonGroup(self)
         for i, lbl in enumerate(["Off (1x)", "RGSS 4x", "Grid 9x"]):
             rb = QRadioButton(lbl)
-            rb.setFont(FONT_SMALL)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i + 1 == _params.aa_samples)
             self._aa_grp.addButton(rb, i + 1)
             aa_row.addWidget(rb)
@@ -3988,11 +4211,9 @@ class ControlGUI(QMainWindow):
         layout.addWidget(sep)
         ss_row = QHBoxLayout()
         ss_btn = QPushButton("📷  Save Screenshot  (F12)")
-        ss_btn.setFont(FONT_BOLD)
-        ss_btn.setStyleSheet(_css_button(COLORS['panel'], COLORS['accent']))
         ss_btn.clicked.connect(self._trigger_screenshot)
         ss_row.addWidget(ss_btn)
-        self._ss_status = _label("", COLORS['fg4'], FONT_SMALL)
+        self._ss_status = QLabel("")
         ss_row.addWidget(self._ss_status)
         layout.addLayout(ss_row)
         # register callback for status update
@@ -4021,17 +4242,16 @@ class ControlGUI(QMainWindow):
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             ao_l.addWidget(sr)
         ao_row = QHBoxLayout()
-        ao_lbl = _label("AO samples:", COLORS['fg3'], FONT_SMALL)
+        ao_lbl = QLabel("AO samples:")
         ao_lbl.setFixedWidth(80)
         ao_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._ao_samples_grp = QButtonGroup(self)
         for i, n in enumerate([3, 5, 8, 12]):
             rb = QRadioButton(str(n))
-            rb.setFont(FONT_SMALL)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(n == _params.ao_samples)
             self._ao_samples_grp.addButton(rb, n)
             ao_row.addWidget(rb)
@@ -4049,8 +4269,6 @@ class ControlGUI(QMainWindow):
         setattr(self, '_sl_shadow_soft', sr_shadow)
         shadow_l.addWidget(sr_shadow)
         self._shadows_check = QCheckBox("Soft Shadows")
-        self._shadows_check.setFont(FONT_MONO)
-        self._shadows_check.setStyleSheet(_css_check())
         self._shadows_check.setChecked(_params.shadows)
         self._shadows_check.stateChanged.connect(lambda s: setattr(_params, 'shadows', bool(s)))
         shadow_l.addWidget(self._shadows_check)
@@ -4065,13 +4283,9 @@ class ControlGUI(QMainWindow):
         setattr(self, '_sl_fog_density', sr_fog_d)
         fog_l.addWidget(sr_fog_d)
         fog_row = QHBoxLayout()
-        fog_lbl = _label("Fog color:", COLORS['fg3'], FONT_SMALL)
+        fog_lbl = QLabel("Fog color:")
         self._fog_btn = QPushButton()
-        hex_col = self._rgb_to_hex(_params.fog_color)
-        self._fog_btn.setStyleSheet(
-            f"QPushButton {{ background: {hex_col}; border: none; border-radius: 4px; padding: 4px 8px; }}"
-            f"QPushButton:hover {{ border: 2px solid {COLORS['accent']}; }}"
-        )
+        self._update_color_btn_style(self._fog_btn, _params.fog_color)
         self._fog_btn.setFixedHeight(24)
         self._fog_btn.clicked.connect(lambda: self._pick_color('fog_color', self._fog_btn))
         fog_row.addWidget(fog_lbl)
@@ -4103,6 +4317,7 @@ class ControlGUI(QMainWindow):
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             layout.addWidget(sr)
 
@@ -4137,13 +4352,12 @@ class ControlGUI(QMainWindow):
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, int(round(v)) if a == 'max_steps' else v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             march_l.addWidget(sr)
 
         overrelax_row = QHBoxLayout()
         self._overrelax_check = QCheckBox("Overrelaxation (sphere tracing)")
-        self._overrelax_check.setFont(FONT_SMALL)
-        self._overrelax_check.setStyleSheet(_css_check())
         self._overrelax_check.setChecked(_params.rm_overrelax)
         self._overrelax_check.stateChanged.connect(
             lambda s: setattr(_params, 'rm_overrelax', bool(s))
@@ -4169,14 +4383,12 @@ class ControlGUI(QMainWindow):
         normals_l.addWidget(sr_neps)
 
         normals_mode_row = QHBoxLayout()
-        normals_lbl = _label("Sampling:", COLORS['fg3'], FONT_SMALL)
+        normals_lbl = QLabel("Sampling:")
         normals_lbl.setFixedWidth(80)
         normals_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._normals_grp = QButtonGroup(self)
         for i, name in enumerate(["3-tap (fast)", "6-tap (quality)"]):
             rb = QRadioButton(name)
-            rb.setFont(FONT_SMALL)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i == (1 if _params.feat_normals_full else 0))
             self._normals_grp.addButton(rb, i)
             normals_mode_row.addWidget(rb)
@@ -4201,6 +4413,7 @@ class ControlGUI(QMainWindow):
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, int(round(v)) if a == 'shadow_steps' else v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             shadow_l.addWidget(sr)
         layout.addWidget(shadow_grp)
@@ -4241,6 +4454,7 @@ class ControlGUI(QMainWindow):
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             color_l.addWidget(sr)
         layout.addWidget(color_grp)
@@ -4263,6 +4477,7 @@ class ControlGUI(QMainWindow):
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             layout.addWidget(sr)
         self._add_section(grp)
@@ -4280,6 +4495,7 @@ class ControlGUI(QMainWindow):
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
             setattr(self, f'_sl_{attr}', sr)
             layout.addWidget(sr)
         self._add_section(grp)
@@ -4301,13 +4517,13 @@ class ControlGUI(QMainWindow):
         scale_row_l = QHBoxLayout(scale_row)
         scale_row_l.setContentsMargins(4, 2, 4, 2)
         scale_row_l.setSpacing(6)
-        scale_lbl = _label("Scale %", COLORS['fg2'], FONT_SMALL)
+        scale_lbl = QLabel("Scale %")
         scale_lbl.setFixedWidth(80)
         scale_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._res_slider = QSlider(Qt.Horizontal)
         self._res_slider.setRange(10, 200)
         self._res_slider.setValue(_params.render_scale)
-        self._res_val_lbl = _label(f'{_params.render_scale}%', COLORS['fg'], FONT_SMALL)
+        self._res_val_lbl = QLabel(f'{_params.render_scale}%')
         self._res_val_lbl.setFixedWidth(50)
         self._res_val_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         scale_row_l.addWidget(scale_lbl)
@@ -4323,14 +4539,9 @@ class ControlGUI(QMainWindow):
 
         dyn_row = QHBoxLayout()
         self._dyn_res_cb = QCheckBox("Dynamic Resolution")
-        self._dyn_res_cb.setFont(FONT_MONO)
-        self._dyn_res_cb.setStyleSheet(_css_check())
         self._dyn_res_cb.setChecked(_params.dyn_res_enabled)
-        dyn_hint = _label("auto-adjust scale to hit target FPS", COLORS['fg4'], FONT_SMALL)
-        dyn_hint.setStyleSheet(
-            f"color: {COLORS['fg4']}; background: transparent;"
-            "font-style: italic; padding-left: 4px;"
-        )
+        dyn_hint = QLabel("auto-adjust scale to hit target FPS")
+
         dyn_row.addWidget(self._dyn_res_cb)
         dyn_row.addWidget(dyn_hint, 1)
         res_l.addLayout(dyn_row)
@@ -4339,13 +4550,13 @@ class ControlGUI(QMainWindow):
         target_row_l = QHBoxLayout(target_row)
         target_row_l.setContentsMargins(4, 2, 4, 2)
         target_row_l.setSpacing(6)
-        target_lbl = _label("Target FPS", COLORS['fg2'], FONT_SMALL)
+        target_lbl = QLabel("Target FPS")
         target_lbl.setFixedWidth(80)
         target_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._target_fps_slider = QSlider(Qt.Horizontal)
         self._target_fps_slider.setRange(10, 240)
         self._target_fps_slider.setValue(_params.dyn_res_target_fps)
-        self._target_fps_val_lbl = _label(f'{_params.dyn_res_target_fps}', COLORS['fg'], FONT_SMALL)
+        self._target_fps_val_lbl = QLabel(f'{_params.dyn_res_target_fps}')
         self._target_fps_val_lbl.setFixedWidth(50)
         self._target_fps_val_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         target_row_l.addWidget(target_lbl)
@@ -4357,13 +4568,13 @@ class ControlGUI(QMainWindow):
         minfps_row_l = QHBoxLayout(minfps_row)
         minfps_row_l.setContentsMargins(4, 2, 4, 2)
         minfps_row_l.setSpacing(6)
-        minfps_lbl = _label("Min FPS", COLORS['fg2'], FONT_SMALL)
+        minfps_lbl = QLabel("Min FPS")
         minfps_lbl.setFixedWidth(80)
         minfps_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self._min_fps_slider = QSlider(Qt.Horizontal)
         self._min_fps_slider.setRange(5, 120)
         self._min_fps_slider.setValue(_params.dyn_res_min_fps)
-        self._min_fps_val_lbl = _label(f'{_params.dyn_res_min_fps}', COLORS['fg'], FONT_SMALL)
+        self._min_fps_val_lbl = QLabel(f'{_params.dyn_res_min_fps}')
         self._min_fps_val_lbl.setFixedWidth(50)
         self._min_fps_val_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         minfps_row_l.addWidget(minfps_lbl)
@@ -4416,16 +4627,11 @@ class ControlGUI(QMainWindow):
         for attr, label, hint in FEATURES:
             row = QHBoxLayout()
             cb = QCheckBox(label)
-            cb.setFont(FONT_MONO)
-            cb.setStyleSheet(_css_check())
             cb.setChecked(getattr(_params, attr))
             cb.stateChanged.connect(lambda s, a=attr: self._on_feat_changed(a, bool(s)))
             self._feat_checks[attr] = cb
-            hint_lbl = _label(hint, COLORS['fg4'], FONT_SMALL)
-            hint_lbl.setStyleSheet(
-                f"color: {COLORS['fg4']}; background: transparent;"
-                "font-style: italic; padding-left: 4px;"
-            )
+            hint_lbl = QLabel(hint)
+
             row.addWidget(cb)
             row.addWidget(hint_lbl, 1)
             layout.addLayout(row)
@@ -4434,7 +4640,7 @@ class ControlGUI(QMainWindow):
         sep.setFixedHeight(6)
         layout.addWidget(sep)
 
-        preset_lbl = _label("Quality presets:", COLORS['fg3'], FONT_SMALL)
+        preset_lbl = QLabel("Quality presets:")
         layout.addWidget(preset_lbl)
 
         PERF_PRESETS = {
@@ -4463,16 +4669,11 @@ class ControlGUI(QMainWindow):
         btn_row = QHBoxLayout()
         for name, vals in PERF_PRESETS.items():
             btn = QPushButton(name)
-            btn.setFont(FONT_SMALL)
             col_map = {
                 'Ultra': '#4a4a8a', 'High': '#3a6a3a', 'Medium': '#5a5a2a',
                 'Low': '#6a3a1a', 'Potato': '#5a1a1a'
             }
-            btn.setStyleSheet(
-                f"QPushButton {{ background: {col_map[name]}; color: {COLORS['fg']};"
-                "font: 8pt Segoe UI; border: none; border-radius: 4px; padding: 4px 6px; }}"
-                f"QPushButton:hover {{ background: {COLORS['accent']}; }}"
-            )
+
             btn.clicked.connect(lambda _, v=vals: self._apply_perf_preset(v))
             btn_row.addWidget(btn)
         layout.addLayout(btn_row)
@@ -4485,40 +4686,19 @@ class ControlGUI(QMainWindow):
         for widget in sections.get(attr, []):
             widget.setVisible(enabled)
 
-    def _apply_perf_preset(self, vals: dict):
-        for k, v in vals.items():
-            setattr(_params, k, v)
-        for attr, cb in self._feat_checks.items():
-            cb.blockSignals(True)
-            cb.setChecked(getattr(_params, attr))
-            cb.blockSignals(False)
-        self._aa_grp.button(_params.aa_samples).setChecked(True)
-        sections = getattr(self, '_feat_sections', {})
-        for attr, widgets in sections.items():
-            enabled = getattr(_params, attr, True)
-            for widget in widgets:
-                widget.setVisible(enabled)
-
     def _build_saves_section(self):
         self._zkf_buttons = {}
         grp_fractal = _section("FRACTAL PRESETS (.zkf)")
         lf = QVBoxLayout(grp_fractal)
         lf.setSpacing(4)
-        hint = _label(
-            "Save current fractal parameters as a named preset.\n"
-            "Files are stored in saves/ folder next to main.py.",
-            COLORS['fg3'], FONT_SMALL
-        )
+        hint = QLabel("Save current fractal parameters as a named preset.\n"
+            "Files are stored in saves/ folder next to main.py.")
         hint.setWordWrap(True)
         lf.addWidget(hint)
         row_btns = QHBoxLayout()
-        btn_save_zkf = QPushButton("Save Fractal (.zkf)")
-        btn_save_zkf.setFont(FONT_SMALL)
-        btn_save_zkf.setStyleSheet(_css_button())
+        btn_save_zkf = _icon_btn(QStyle.SP_DialogSaveButton, "Сохранить", "Save Fractal (.zkf)")
         btn_save_zkf.clicked.connect(self._save_zkf_dialog)
-        btn_load_zkf = QPushButton("Load Fractal (.zkf)")
-        btn_load_zkf.setFont(FONT_SMALL)
-        btn_load_zkf.setStyleSheet(_css_button())
+        btn_load_zkf = _icon_btn(QStyle.SP_DialogOpenButton, "Загрузить", "Load Fractal (.zkf)")
         btn_load_zkf.clicked.connect(self._load_zkf_dialog)
         row_btns.addWidget(btn_save_zkf)
         row_btns.addWidget(btn_load_zkf)
@@ -4531,21 +4711,14 @@ class ControlGUI(QMainWindow):
         grp_session = _section("SESSION SAVE (.zks)")
         ls = QVBoxLayout(grp_session)
         ls.setSpacing(4)
-        hint2 = _label(
-            "Save/load complete session: all parameters + camera\n"
-            "position, yaw, pitch and player state.",
-            COLORS['fg3'], FONT_SMALL
-        )
+        hint2 = QLabel("Save/load complete session: all parameters + camera\n"
+            "position, yaw, pitch and player state.")
         hint2.setWordWrap(True)
         ls.addWidget(hint2)
         row_sess = QHBoxLayout()
-        btn_save_zks = QPushButton("Save Session (.zks)")
-        btn_save_zks.setFont(FONT_SMALL)
-        btn_save_zks.setStyleSheet(_css_button())
+        btn_save_zks = _icon_btn(QStyle.SP_DialogSaveButton, "Сохранить сессию", "Save Session (.zks)")
         btn_save_zks.clicked.connect(self._save_zks_dialog)
-        btn_load_zks = QPushButton("Load Session (.zks)")
-        btn_load_zks.setFont(FONT_SMALL)
-        btn_load_zks.setStyleSheet(_css_button())
+        btn_load_zks = _icon_btn(QStyle.SP_DialogOpenButton, "Загрузить сессию", "Load Session (.zks)")
         btn_load_zks.clicked.connect(self._load_zks_dialog)
         row_sess.addWidget(btn_save_zks)
         row_sess.addWidget(btn_load_zks)
@@ -4564,7 +4737,7 @@ class ControlGUI(QMainWindow):
         _SAVES_DIR.mkdir(exist_ok=True)
         files = sorted(_SAVES_DIR.glob("*.zkf"))
         if not files:
-            lbl = _label("No saved fractals yet.", COLORS['fg4'], FONT_SMALL)
+            lbl = QLabel("No saved fractals yet.")
             self._zkf_list_layout.addWidget(lbl)
             return
         for fp in files:
@@ -4575,23 +4748,15 @@ class ControlGUI(QMainWindow):
             except Exception:
                 name = fp.stem
             btn = QPushButton(name)
-            btn.setFont(FONT_SMALL)
-            btn.setStyleSheet(_css_button())
             btn.clicked.connect(lambda _, p=fp, n=name: self._apply_zkf(p, n))
             del_btn = QPushButton("x")
-            del_btn.setFont(FONT_SMALL)
             del_btn.setFixedWidth(24)
-            del_btn.setStyleSheet(
-                f"QPushButton {{ background: {COLORS['bg2']}; color: {COLORS['fg4']};"
-                "border: none; border-radius: 3px; padding: 2px; }}"
-                f"QPushButton:hover {{ color: #ff6060; }}"
-            )
+
             del_btn.clicked.connect(lambda _, p=fp: self._delete_zkf(p))
             row.addWidget(btn, 1)
             row.addWidget(del_btn)
             w = QWidget()
             w.setLayout(row)
-            w.setStyleSheet("background: transparent;")
             self._zkf_list_layout.addWidget(w)
 
     def _refresh_zks_list(self):
@@ -4602,29 +4767,21 @@ class ControlGUI(QMainWindow):
         _SAVES_DIR.mkdir(exist_ok=True)
         files = sorted(_SAVES_DIR.glob("*.zks"))
         if not files:
-            lbl = _label("No saved sessions yet.", COLORS['fg4'], FONT_SMALL)
+            lbl = QLabel("No saved sessions yet.")
             self._zks_list_layout.addWidget(lbl)
             return
         for fp in files:
             row = QHBoxLayout()
             btn = QPushButton(fp.stem)
-            btn.setFont(FONT_SMALL)
-            btn.setStyleSheet(_css_button())
             btn.clicked.connect(lambda _, p=fp: self._apply_zks(p))
             del_btn = QPushButton("x")
-            del_btn.setFont(FONT_SMALL)
             del_btn.setFixedWidth(24)
-            del_btn.setStyleSheet(
-                f"QPushButton {{ background: {COLORS['bg2']}; color: {COLORS['fg4']};"
-                "border: none; border-radius: 3px; padding: 2px; }}"
-                f"QPushButton:hover {{ color: #ff6060; }}"
-            )
+
             del_btn.clicked.connect(lambda _, p=fp: self._delete_zks(p))
             row.addWidget(btn, 1)
             row.addWidget(del_btn)
             w = QWidget()
             w.setLayout(row)
-            w.setStyleSheet("background: transparent;")
             self._zks_list_layout.addWidget(w)
 
     def _save_zkf_dialog(self):
@@ -4755,52 +4912,9 @@ class ControlGUI(QMainWindow):
                 color1=(1.0,0.2,0.0), color2=(1.0,0.6,0.0), color3=(0.3,0.0,0.0),
                 glow_intensity=4.0, emission=0.6, rim_strength=0.6,
                 bg_mode=1, bg_color1=(0.08,0.02,0.0), bg_color2=(0.0,0.0,0.0)),
-            "Menger Deep": dict(
-                fractal_type=1, scale=3.0, iterations=4,
-                color_mode=1, ao_strength=1.5, glow=0.5,
-                ms_scale=3.0, ms_offset=2.0, ms_cross_width=1.0,
-                color1=(0.3,0.6,0.9), color2=(0.5,0.5,0.5), color3=(1.0,1.0,1.0)),
-            "Menger Twisted": dict(
-                fractal_type=1, scale=3.0, iterations=5,
-                color_mode=2, glow=1.5,
-                ms_scale=3.2, ms_offset=2.0, ms_twist=0.08,
-                color1=(0.8,0.5,0.1), color2=(0.5,0.3,0.0), color3=(1.0,0.8,0.3)),
-            "Sierp Fire": dict(
-                fractal_type=2, scale=2.0, iterations=8,
-                color_mode=0, glow=2.0,
-                color1=(1.0,0.3,0.0), color2=(1.0,0.8,0.0), color3=(0.5,0.0,0.0),
-                si_vertex_spread=1.0, si_fold_bias=2.0, si_squash=1.0),
-            "Sierp Crystal": dict(
-                fractal_type=2, scale=2.0, iterations=10,
-                color_mode=2, glow=3.0, shadows=True,
-                color1=(0.2,0.5,1.0), color2=(0.8,0.9,1.0), color3=(0.3,0.3,0.8),
-                si_vertex_spread=1.3, si_fold_bias=2.0, si_squash=0.7, si_twist=0.05),
-            "Sierp Abyss": dict(
-                fractal_type=2, scale=2.0, iterations=11,
-                color_mode=0, glow=5.0, shadows=False,
-                color1=(0.1,0.0,0.3), color2=(0.6,0.0,0.8), color3=(0.0,0.0,0.1),
-                si_vertex_spread=1.5, si_fold_bias=2.0, si_squash=0.5, si_twist=0.1,
-                glow_intensity=9.0, glow_falloff=10.0, emission=1.0, rim_strength=1.5,
-                bg_mode=3, bg_color1=(0.03,0.0,0.06), bg_color2=(0.0,0.0,0.0)),
-            "Octa Soft": dict(
-                fractal_type=3, scale=2.0, iterations=7,
-                offset_x=1.8, offset_y=1.8, offset_z=1.8,
-                color_mode=1, shadows=False, glow=3.0,
-                oc_ifs_scale=2.0, oc_sharpness=2.5, oc_twist=0.06,
-                color1=(0.6,0.8,1.0), color2=(0.2,0.4,0.6), color3=(1.0,1.0,1.0)),
-            "Octa Plasma": dict(
-                fractal_type=3, scale=2.0, iterations=8,
-                offset_x=1.6, offset_y=1.6, offset_z=1.6,
-                color_mode=0, shadows=False, glow=5.0,
-                oc_ifs_scale=2.0, oc_sharpness=1.5, oc_twist=0.1,
-                color1=(1.0,0.0,0.5), color2=(0.0,0.5,1.0), color3=(1.0,0.5,0.0),
-                glow_intensity=8.0, emission=0.9, rim_strength=1.0,
-                bg_mode=2, bg_color1=(0.1,0.0,0.1), bg_color2=(0.0,0.0,0.0)),
         }
         for i, (name, vals) in enumerate(presets.items()):
             btn = QPushButton(name)
-            btn.setFont(FONT_SMALL)
-            btn.setStyleSheet(_css_button())
             btn.clicked.connect(lambda _, v=vals: self._apply_preset(v))
             layout.addWidget(btn, i // 3, i % 3)
         layout.setColumnStretch(0, 1)
@@ -4826,12 +4940,14 @@ class ControlGUI(QMainWindow):
         self._sl_glow.set_value(_params.glow)
         self._sl_ao_strength.set_value(_params.ao_strength)
         for btn, attr in [(self._c1_btn,'color1'),(self._c2_btn,'color2'),(self._c3_btn,'color3')]:
-            hex_col = self._rgb_to_hex(getattr(_params, attr))
-            btn.setStyleSheet(
-                f"QPushButton {{ background: {hex_col}; color: white; border: none;"
-                "border-radius: 4px; padding: 4px 8px; font: bold 8pt Segoe UI; }}"
-                f"QPushButton:hover {{ border: 2px solid {COLORS['accent']}; }}"
-            )
+            self._update_color_btn_style(btn, getattr(_params, attr))
+        if hasattr(self, '_fog_btn'):
+            self._update_color_btn_style(self._fog_btn, _params.fog_color)
+        if hasattr(self, '_bg_c1_btn'):
+            self._update_color_btn_style(self._bg_c1_btn, _params.bg_color1)
+        if hasattr(self, '_bg_c2_btn'):
+            self._update_color_btn_style(self._bg_c2_btn, _params.bg_color2)
+
         for attr in [
             'scale', 'bailout', 'min_dist', 'de_multiplier', 'fov',
             'mb_fold_limit','mb_sphere_inner','mb_sphere_outer','mb_fixed_radius',
@@ -4860,38 +4976,25 @@ class ControlGUI(QMainWindow):
         layout_ctrl = QVBoxLayout(grp_ctrl)
         layout_ctrl.setSpacing(6)
 
-        desc = _label(
-            "Continuously morphs all fractal parameters using\n"
+        desc = QLabel("Continuously morphs all fractal parameters using\n"
             "layered sinusoidal waves — no preset switching.\n"
-            "Each run produces a unique, never-repeating form.",
-            COLORS['fg2'], FONT_SMALL
-        )
-        desc.setStyleSheet(
-            f"color: {COLORS['fg2']}; background: {COLORS['bg2']};"
-            "padding: 6px 8px; border-radius: 4px;"
-        )
+            "Each run produces a unique, never-repeating form.")
+
         layout_ctrl.addWidget(desc)
 
         btn_row = QHBoxLayout()
-        self._evo_toggle_btn = QPushButton("START EVOLUTION")
-        self._evo_toggle_btn.setFont(FONT_BOLD)
-        self._evo_toggle_btn.setStyleSheet(
-            _css_button(COLORS['panel'], COLORS['accent'])
-        )
+        self._evo_toggle_btn = _icon_btn(QStyle.SP_MediaPlay, "Start/Stop evolution", "START EVOLUTION")
+
         self._evo_toggle_btn.clicked.connect(self._toggle_evolution)
         btn_row.addWidget(self._evo_toggle_btn, 2)
 
-        reseed_btn = QPushButton("RESEED")
-        reseed_btn.setFont(FONT_SMALL)
-        reseed_btn.setStyleSheet(_css_button())
+        reseed_btn = _icon_btn(QStyle.SP_BrowserReload, "Reseed", "RESEED")
         reseed_btn.clicked.connect(self._reseed_evolution)
         btn_row.addWidget(reseed_btn, 1)
         layout_ctrl.addLayout(btn_row)
 
-        self._evo_status_lbl = _label("Status: stopped   t = 0.00", COLORS['fg4'], FONT_SMALL)
-        self._evo_status_lbl.setStyleSheet(
-            f"color: {COLORS['fg4']}; background: transparent; font: 8pt Segoe UI;"
-        )
+        self._evo_status_lbl = QLabel("Status: stopped   t = 0.00")
+
         layout_ctrl.addWidget(self._evo_status_lbl)
         _infinite_evo._status_cb = self._on_evo_tick
         self._add_section(grp_ctrl)
@@ -4923,8 +5026,6 @@ class ControlGUI(QMainWindow):
         for label in ["Shape & Scale", "Julia / Offset", "Rotation", "Glow & Color", "Lighting"]:
             cb = QCheckBox(label)
             cb.setChecked(True)
-            cb.setFont(FONT_SMALL)
-            cb.setStyleSheet(_css_check())
             layout_channel.addWidget(cb)
         self._add_section(grp_channel)
 
@@ -4932,12 +5033,12 @@ class ControlGUI(QMainWindow):
         if _infinite_evo.active:
             _infinite_evo.stop()
             self._evo_toggle_btn.setText("START EVOLUTION")
-            self._evo_toggle_btn.setStyleSheet(_css_button(COLORS['panel'], COLORS['accent']))
+            self._evo_toggle_btn.setIcon(QApplication.style().standardIcon(QStyle.SP_MediaPlay))
             self._evo_status_lbl.setText(f"Status: stopped   t = {_infinite_evo._t:.2f}")
         else:
             _infinite_evo.start()
             self._evo_toggle_btn.setText("STOP EVOLUTION")
-            self._evo_toggle_btn.setStyleSheet(_css_button(COLORS['accent'], COLORS['panel']))
+            self._evo_toggle_btn.setIcon(QApplication.style().standardIcon(QStyle.SP_MediaStop))
 
     def _reseed_evolution(self):
         _infinite_evo.reseed()
@@ -4951,47 +5052,29 @@ class ControlGUI(QMainWindow):
         layout_mode = QVBoxLayout(grp_mode)
         layout_mode.setSpacing(6)
 
-        hint = _label(
-            "V  — toggle player / fly mode\n"
+        hint = QLabel("V  — toggle player / fly mode\n"
             "W A S D  — move   |   Space  — jump\n"
-            "LMB drag  — look around",
-            COLORS['fg2'], FONT_SMALL
-        )
-        hint.setStyleSheet(
-            f"color: {COLORS['fg2']}; background: {COLORS['bg2']};"
-            "padding: 6px 8px; border-radius: 4px;"
-        )
+            "LMB drag  — look around")
+
         layout_mode.addWidget(hint)
 
         toggle_row = QHBoxLayout()
-        self._player_mode_lbl = _label("PLAYER MODE: OFF", COLORS['fg4'], FONT_SMALL)
-        self._player_mode_lbl.setStyleSheet(
-            f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
-            "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
-        )
-        toggle_btn = QPushButton("Toggle (V)")
-        toggle_btn.setFont(FONT_SMALL)
-        toggle_btn.setStyleSheet(_css_button())
+        self._player_mode_lbl = QLabel("PLAYER MODE: OFF")
+
+        toggle_btn = _icon_btn(QStyle.SP_MediaPlay, "Toggle player mode (V)", "Toggle (V)")
         toggle_btn.clicked.connect(self._toggle_player_mode)
         toggle_row.addWidget(self._player_mode_lbl, 1)
         toggle_row.addWidget(toggle_btn)
         layout_mode.addLayout(toggle_row)
 
-        reset_btn = QPushButton("Reset Velocity")
-        reset_btn.setFont(FONT_SMALL)
-        reset_btn.setStyleSheet(_css_button())
+        reset_btn = _icon_btn(QStyle.SP_BrowserReload, "Reset velocity", "Reset Velocity")
         reset_btn.clicked.connect(self._reset_player_velocity)
         layout_mode.addWidget(reset_btn)
 
         dbg_row = QHBoxLayout()
-        self._dbg_lbl = _label("COLLIDER DEBUG: OFF", COLORS['fg4'], FONT_SMALL)
-        self._dbg_lbl.setStyleSheet(
-            f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
-            "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
-        )
-        dbg_btn = QPushButton("Toggle (F1)")
-        dbg_btn.setFont(FONT_SMALL)
-        dbg_btn.setStyleSheet(_css_button())
+        self._dbg_lbl = QLabel("COLLIDER DEBUG: OFF")
+
+        dbg_btn = _icon_btn(QStyle.SP_FileDialogInfoView, "Toggle debug overlay (F1)", "Toggle (F1)")
         dbg_btn.clicked.connect(self._toggle_debug_overlay)
         dbg_row.addWidget(self._dbg_lbl, 1)
         dbg_row.addWidget(dbg_btn)
@@ -5017,8 +5100,6 @@ class ControlGUI(QMainWindow):
             ("Down",       "Standard gravity: always pulls along -Y axis"),
         ]):
             rb = QRadioButton(label)
-            rb.setFont(FONT_SMALL)
-            rb.setStyleSheet(_css_radio())
             rb.setChecked(i == _player_state.GRAVITY_MODE)
             rb.setToolTip(tip)
             self._grav_mode_grp.addButton(rb, i)
@@ -5075,8 +5156,6 @@ class ControlGUI(QMainWindow):
         btn_row = QHBoxLayout()
         for name, vals in PHYS_PRESETS.items():
             btn = QPushButton(name)
-            btn.setFont(FONT_SMALL)
-            btn.setStyleSheet(_css_button())
             btn.clicked.connect(lambda _, v=vals: self._apply_physics_preset(v))
             btn_row.addWidget(btn)
         layout_pre.addLayout(btn_row)
@@ -5086,18 +5165,15 @@ class ControlGUI(QMainWindow):
         layout_status = QVBoxLayout(grp_status)
         layout_status.setSpacing(4)
 
-        self._pl_pos_lbl    = _label("Position:   —", COLORS['fg3'], FONT_SMALL)
-        self._pl_vel_lbl    = _label("Velocity:   —", COLORS['fg3'], FONT_SMALL)
-        self._pl_ground_lbl = _label("On ground:  —", COLORS['fg3'], FONT_SMALL)
-        self._pl_sdf_lbl    = _label("SDF raw:    —", COLORS['fg3'], FONT_SMALL)
-        self._pl_thresh_lbl = _label("Col thresh: —", COLORS['fg3'], FONT_SMALL)
-        self._pl_grav_lbl   = _label("Grav dir:   —", COLORS['fg3'], FONT_SMALL)
+        self._pl_pos_lbl    = QLabel("Position:   —")
+        self._pl_vel_lbl    = QLabel("Velocity:   —")
+        self._pl_ground_lbl = QLabel("On ground:  —")
+        self._pl_sdf_lbl    = QLabel("SDF raw:    —")
+        self._pl_thresh_lbl = QLabel("Col thresh: —")
+        self._pl_grav_lbl   = QLabel("Grav dir:   —")
         for lbl in (self._pl_pos_lbl, self._pl_vel_lbl, self._pl_ground_lbl,
                     self._pl_sdf_lbl, self._pl_thresh_lbl, self._pl_grav_lbl):
-            lbl.setStyleSheet(
-                f"color: {COLORS['fg3']}; background: transparent;"
-                "font: 8pt Segoe UI;"
-            )
+
             layout_status.addWidget(lbl)
 
         self._status_timer = QTimer(self)
@@ -5116,33 +5192,19 @@ class ControlGUI(QMainWindow):
             _player_state._smooth_normal = list(_player_state._surface_normal)
             _player_state._bob_phase     = 0.0
             self._player_mode_lbl.setText("PLAYER MODE: ON")
-            self._player_mode_lbl.setStyleSheet(
-                f"color: {COLORS['accent']}; background: {COLORS['bg2']};"
-                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
-            )
+
         else:
             _params.player_mode = False
             self._player_mode_lbl.setText("PLAYER MODE: OFF")
-            self._player_mode_lbl.setStyleSheet(
-                f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
-                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
-            )
 
     def _toggle_debug_overlay(self):
         global _debug_overlay_enabled
         _debug_overlay_enabled = not _debug_overlay_enabled
         if _debug_overlay_enabled:
             self._dbg_lbl.setText("COLLIDER DEBUG: ON")
-            self._dbg_lbl.setStyleSheet(
-                f"color: {COLORS['accent']}; background: {COLORS['bg2']};"
-                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
-            )
+
         else:
             self._dbg_lbl.setText("COLLIDER DEBUG: OFF")
-            self._dbg_lbl.setStyleSheet(
-                f"color: {COLORS['fg4']}; background: {COLORS['bg2']};"
-                "padding: 4px 8px; border-radius: 4px; font: bold 9pt Segoe UI;"
-            )
 
     def _reset_player_velocity(self):
         _player_state.vel = [0.0, 0.0, 0.0]
@@ -5194,6 +5256,295 @@ class ControlGUI(QMainWindow):
             f"  ({gd[0]:+.2f} {gd[1]:+.2f} {gd[2]:+.2f})"
         )
 
+    def _build_settings_section(self):
+        grp_theme = _section("THEME")
+        layout_theme = QVBoxLayout(grp_theme)
+        layout_theme.setSpacing(8)
+
+        theme_hint = QLabel("Select a theme. .qss themes are stored in the config/themes folder.\n"
+            "The change is applied immediately.")
+        theme_hint.setWordWrap(True)
+        layout_theme.addWidget(theme_hint)
+
+        combo_row = QHBoxLayout()
+        combo_lbl = QLabel("Theme:")
+        combo_row.addWidget(combo_lbl)
+
+        self._theme_combo = QComboBox()
+        self._theme_combo.setMinimumWidth(220)
+        self._theme_combo.setToolTip("Select a theme")
+
+        theme_items = [
+            (app_config.THEME_DARK_BLUE,      app_config.BUILTIN_THEMES[app_config.THEME_DARK_BLUE]),
+            (app_config.THEME_NATIVE_FUSION,  app_config.BUILTIN_THEMES[app_config.THEME_NATIVE_FUSION]),
+            (app_config.THEME_NATIVE_WINDOWS, app_config.BUILTIN_THEMES[app_config.THEME_NATIVE_WINDOWS]),
+        ]
+        builtin_ids = {app_config.THEME_DARK_BLUE, app_config.THEME_NATIVE_FUSION, app_config.THEME_NATIVE_WINDOWS}
+
+        for tid, tname in theme_items:
+            self._theme_combo.addItem(tname, userData=tid)
+
+        for qss_name in app_config.list_qss_themes():
+            if qss_name not in builtin_ids:
+                self._theme_combo.addItem(app_config.get_theme_display_name(qss_name), userData=qss_name)
+
+        current_theme = app_config.get_theme()
+        for i in range(self._theme_combo.count()):
+            if self._theme_combo.itemData(i) == current_theme:
+                self._theme_combo.setCurrentIndex(i)
+                break
+
+        self._theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        combo_row.addWidget(self._theme_combo)
+        combo_row.addStretch()
+        layout_theme.addLayout(combo_row)
+
+        btn_open_themes = _icon_btn(QStyle.SP_DirOpenIcon, "Open the config/themes folder in File Explorer.", "Open the themes folder")
+        btn_open_themes.setToolTip("Open the config/themes folder in File Explorer.")
+        btn_open_themes.clicked.connect(self._open_themes_folder)
+        layout_theme.addWidget(btn_open_themes)
+
+        self._add_section(grp_theme)
+
+    def _on_theme_changed(self, idx):
+        theme_id = self._theme_combo.itemData(idx)
+        if not theme_id:
+            return
+        app_config.set_theme(theme_id)
+        app_config.apply_theme(QApplication.instance(), theme_id)
+
+    def _open_themes_folder(self):
+        folder = str(app_config.THEMES_DIR.resolve())
+        try:
+            import subprocess, platform
+            if platform.system() == "Windows":
+                subprocess.Popen(["explorer", folder])
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as e:
+            QMessageBox.information(self, "Themes folder", folder)
+
+    def _build_toolbar(self):
+        style = QApplication.style()
+
+        tb = QToolBar("Main Toolbar")
+        tb.setMovable(False)
+        tb.setStyleSheet(
+            "QToolBar { border: none; background: transparent; spacing: 2px; padding: 1px 0; }"
+        )
+
+        def _act(icon_id, label, tooltip, slot):
+            a = QAction(style.standardIcon(icon_id), label, self)
+            a.setToolTip(tooltip)
+            a.triggered.connect(slot)
+            tb.addAction(a)
+            return a
+
+        _act(QStyle.SP_DialogSaveButton, "Save Fractal",
+             "Save current fractal parameters as .zkf preset",
+             self._toolbar_save_fractal)
+
+        _act(QStyle.SP_DialogOpenButton, "Load Fractal",
+             "Load fractal parameters from .zkf file",
+             self._toolbar_load_fractal)
+
+        _act(QStyle.SP_DriveHDIcon, "Save Session",
+             "Save full session (all params + camera) as .zks",
+             self._toolbar_save_session)
+
+        _act(QStyle.SP_FileDialogContentsView, "Load Session",
+             "Load full session from .zks file",
+             self._toolbar_load_session)
+
+        tb.addSeparator()
+
+        _act(QStyle.SP_BrowserReload, "Reset Camera",
+             "Reset camera to default position and orientation",
+             self._reset_camera)
+
+        _act(QStyle.SP_ArrowUp, "Zoom In",
+             "Move camera forward (zoom in)",
+             self._toolbar_zoom_in)
+
+        _act(QStyle.SP_ArrowDown, "Zoom Out",
+             "Move camera backward (zoom out)",
+             self._toolbar_zoom_out)
+
+        tb.addSeparator()
+
+        _act(QStyle.SP_MediaPlay, "Play Animation",
+             "Toggle animation playback (auto-rotate)",
+             self._toolbar_toggle_animate)
+
+        if _ANIM_AVAILABLE:
+            _act(QStyle.SP_MediaSeekForward, "Animation Editor",
+                 "Open the keyframe animation editor",
+                 self._open_anim_editor)
+
+        tb.addSeparator()
+
+        _act(QStyle.SP_DesktopIcon, "Screenshot",
+             "Save screenshot of the current render (F12)",
+             self._trigger_screenshot)
+
+        tb.addSeparator()
+
+        QUALITY_PRESETS = [
+            ("Ultra",  "#4a2080",
+             dict(feat_ao=True,  feat_shadows=True,  feat_normals_full=True,
+                  feat_orbit_trap=True,  feat_second_light=True, feat_fog=True,
+                  feat_glow=True,  feat_reflection=True,  feat_subsurface=True, aa_samples=2)),
+            ("High",   "#1a5030",
+             dict(feat_ao=True,  feat_shadows=True,  feat_normals_full=True,
+                  feat_orbit_trap=True,  feat_second_light=True, feat_fog=True,
+                  feat_glow=True,  feat_reflection=False, feat_subsurface=False, aa_samples=1)),
+            ("Medium", "#504010",
+             dict(feat_ao=True,  feat_shadows=False, feat_normals_full=True,
+                  feat_orbit_trap=True,  feat_second_light=False, feat_fog=True,
+                  feat_glow=True,  feat_reflection=False, feat_subsurface=False, aa_samples=1)),
+            ("Low",    "#602020",
+             dict(feat_ao=True, feat_shadows=False, feat_normals_full=False,
+                  feat_orbit_trap=False, feat_second_light=False, feat_fog=False,
+                  feat_glow=True, feat_reflection=False, feat_subsurface=False, aa_samples=1)),
+            ("Potato", "#3a1a00",
+             dict(feat_ao=False, feat_shadows=False, feat_normals_full=False,
+                  feat_orbit_trap=False, feat_second_light=False, feat_fog=False,
+                  feat_glow=False, feat_reflection=False, feat_subsurface=False, aa_samples=1)),
+        ]
+        for q_name, q_color, q_vals in QUALITY_PRESETS:
+            q_btn = QPushButton(q_name)
+            q_btn.setToolTip(f"Quality preset: {q_name}")
+            q_btn.setFixedHeight(22)
+            q_btn.setStyleSheet(
+                f"QPushButton {{ background-color: {q_color}; color: #e0e0ff; "
+                f"border: 1px solid #5050a0; border-radius: 4px; padding: 2px 8px;}}"
+                f"QPushButton:hover {{ background-color: {q_color}; border-color: #9d8fff; filter: brightness(1.3); }}"
+                f"QPushButton:pressed {{ border-color: #ffffff; }}"
+            )
+            q_btn.clicked.connect(lambda _, v=q_vals: self._apply_perf_preset(v))
+            tb.addWidget(q_btn)
+
+        tb.addSeparator()
+
+        _act(QStyle.SP_TrashIcon, "Reset All",
+             "Reset all fractal parameters to defaults",
+             self._toolbar_reset_all)
+
+        _act(QStyle.SP_MessageBoxInformation, "About",
+             f"Kaleidoscopic IFS Fractal Renderer v{APP_VERSION}",
+             self._toolbar_about)
+
+        self.addToolBar(Qt.TopToolBarArea, tb)
+        self._main_toolbar = tb
+
+    def _toolbar_save_fractal(self):
+        self._save_zkf_dialog()
+
+    def _toolbar_load_fractal(self):
+        self._load_zkf_dialog()
+
+    def _toolbar_save_session(self):
+        self._save_zks_dialog()
+
+    def _toolbar_load_session(self):
+        self._load_zks_dialog()
+
+    def _toolbar_zoom_in(self):
+        yaw   = _params.cam_yaw
+        pitch = _params.cam_pitch
+        fwd = [
+            math.cos(pitch) * math.sin(yaw),
+            math.sin(pitch),
+            math.cos(pitch) * math.cos(yaw),
+        ]
+        step = 0.5
+        _params.cam_pos[0] += fwd[0] * step
+        _params.cam_pos[1] += fwd[1] * step
+        _params.cam_pos[2] += fwd[2] * step
+
+    def _toolbar_zoom_out(self):
+        yaw   = _params.cam_yaw
+        pitch = _params.cam_pitch
+        fwd = [
+            math.cos(pitch) * math.sin(yaw),
+            math.sin(pitch),
+            math.cos(pitch) * math.cos(yaw),
+        ]
+        step = 0.5
+        _params.cam_pos[0] -= fwd[0] * step
+        _params.cam_pos[1] -= fwd[1] * step
+        _params.cam_pos[2] -= fwd[2] * step
+
+    def _toolbar_toggle_animate(self):
+        _params.animate = not _params.animate
+        if hasattr(self, '_anim_check'):
+            self._anim_check.setChecked(_params.animate)
+
+    def _apply_perf_preset(self, preset: dict):
+        for k, v in preset.items():
+            setattr(_params, k, v)
+        if hasattr(self, '_feat_checks'):
+            for attr, cb in self._feat_checks.items():
+                if attr in preset:
+                    cb.blockSignals(True)
+                    cb.setChecked(preset[attr])
+                    cb.blockSignals(False)
+                    for w in self._feat_sections.get(attr, []):
+                        w.setVisible(preset[attr])
+        if hasattr(self, '_aa_grp') and 'aa_samples' in preset:
+            btn = self._aa_grp.button(preset['aa_samples'])
+            if btn:
+                btn.setChecked(True)
+
+    def _toolbar_reset_all(self):
+        reply = QMessageBox.question(
+            self, "Reset All",
+            "Reset all fractal parameters to defaults?\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        defaults = FractalParams()
+        for attr in vars(defaults):
+            if not attr.startswith('_'):
+                try:
+                    v = getattr(defaults, attr)
+                    if isinstance(v, list):
+                        setattr(_params, attr, list(v))
+                    elif isinstance(v, tuple):
+                        setattr(_params, attr, tuple(v))
+                    else:
+                        setattr(_params, attr, v)
+                except Exception:
+                    pass
+        self._sync_all_sliders()
+        ft = _params.fractal_type
+        btn = self._type_grp.button(ft)
+        if btn:
+            btn.setChecked(True)
+        self._on_fractal_type_changed(ft)
+        if hasattr(self, '_iter_slider'):
+            self._iter_slider.setValue(_params.iterations)
+        if hasattr(self, '_cmode_grp'):
+            btn = self._cmode_grp.button(_params.color_mode)
+            if btn:
+                btn.setChecked(True)
+
+    def _toolbar_about(self):
+        QMessageBox.about(
+            self,
+            "About",
+            f"<b>ZarKIFS</b><br>"
+            f"Version {APP_VERSION}<br><br>"
+            "Ray-marched 3D fractal explorer.<br>"
+            "Controls: LMB drag = look | Scroll = zoom | W/A/S/D/Q/E = move<br>"
+            "Shift = x5 speed | Alt = x0.2 speed | F12 = screenshot",
+        )
+
+
 def _set_pyglet_icon(wnd):
     try:
         import pyglet
@@ -5218,10 +5569,9 @@ def run_gl():
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
     icon = _make_icon()
     app.setWindowIcon(icon)
-    _apply_palette(app)
+    app_config.apply_theme(app, app_config.get_theme())
     splash = SplashScreen()
     splash.show()
     gl_thread = threading.Thread(target=run_gl, daemon=True)
