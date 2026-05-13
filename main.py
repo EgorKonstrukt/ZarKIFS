@@ -23,8 +23,9 @@ from PyQt5.QtWidgets import (
 from moderngl_window.conf import settings as mglw_settings
 
 import app_config
+import vr_mode
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 try:
     from animation_editor import (
@@ -1368,6 +1369,15 @@ class FractalParams:
         self.dyn_res_target_fps  = 60
         self.dyn_res_min_fps     = 30
 
+        self.vr_mode = False
+        # --- VR settings ---
+        self.vr_ipd              = 0.063
+        self.vr_render_scale     = 100
+        self.vr_dyn_res_enabled  = False
+        self.vr_comfort_vignette = False
+        self.vr_prediction_mult  = 1.0
+        self.vr_supersampling    = 1
+
 _params = FractalParams()
 
 if _ANIM_AVAILABLE:
@@ -2385,7 +2395,278 @@ class FractalWindow(mglw.WindowConfig):
         self._smooth_bg_color2 = list(_params.bg_color2)
         self._smooth_fog_color = list(_params.fog_color)
         self._COLOR_SMOOTH     = 8.0
+
+        self._vr_renderer_ready = False
+        self._vr_dyn_scale      = float(_params.vr_render_scale)
+        self._vr_dyn_bucket_t   = 0.0
+        self._vr_dyn_bucket_n   = 0
+        self._vr_dyn_bucket_ft  = 0.0
+        self._vr_dyn_cooldown   = 0.0
+        self._vr_fbo_size       = (0, 0)
+        self._vr_fbos           = [None, None]
+        self._gl_funcs          = None
         _interpolator.set_smooth_color_source(self._get_smooth_colors)
+
+    def _ensure_vr_fbos(self, w, h):
+        if self._vr_fbo_size == (w, h):
+            return
+        for fbo_obj in self._vr_fbos:
+            if fbo_obj is not None:
+                try:
+                    fbo_obj['tex'].release()
+                    fbo_obj['fbo'].release()
+                except Exception:
+                    pass
+        self._vr_fbos = []
+        for _ in range(2):
+            tex = self.ctx.texture((w, h), 3, dtype='f4')
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            fbo = self.ctx.framebuffer(color_attachments=[tex])
+            self._vr_fbos.append({'tex': tex, 'fbo': fbo})
+        self._vr_fbo_size = (w, h)
+
+    def _get_gl(self):
+        if self._gl_funcs is None:
+            self._gl_funcs = vr_mode._load_gl_funcs()
+        return self._gl_funcs
+
+    def _set_shared_uniforms(self, p, elapsed, fwd, right, up, render_pos):
+        s = self._set
+        cx, sx = math.cos(p.rot_x), math.sin(p.rot_x)
+        cy, sy = math.cos(p.rot_y), math.sin(p.rot_y)
+        cz, sz = math.cos(p.rot_z), math.sin(p.rot_z)
+        rx = (1,0,0, 0,cx,-sx, 0,sx,cx)
+        ry = (cy,0,sy, 0,1,0, -sy,0,cy)
+        rz = (cz,-sz,0, sz,cz,0, 0,0,1)
+        def _mm3(a, b):
+            out = [0.0]*9
+            for r in range(3):
+                for c in range(3):
+                    out[r*3+c] = a[r*3+0]*b[0*3+c]+a[r*3+1]*b[1*3+c]+a[r*3+2]*b[2*3+c]
+            return tuple(out)
+        rot_mat = _mm3(_mm3(rz, ry), rx)
+        s('u_time',           elapsed)
+        s('u_iterations',     p.iterations)
+        s('u_scale',          p.scale)
+        s('u_fold_x',         1.0 if p.fold_x else 0.0)
+        s('u_fold_y',         1.0 if p.fold_y else 0.0)
+        s('u_fold_z',         1.0 if p.fold_z else 0.0)
+        s('u_rot_x',          p.rot_x)
+        s('u_rot_y',          p.rot_y)
+        s('u_rot_z',          p.rot_z)
+        s('u_rot_mat',        rot_mat)
+        s('u_offset_x',       p.offset_x)
+        s('u_offset_y',       p.offset_y)
+        s('u_offset_z',       p.offset_z)
+        s('u_julia_x',        p.julia_x)
+        s('u_julia_y',        p.julia_y)
+        s('u_julia_z',        p.julia_z)
+        s('u_fractal_type',   p.fractal_type)
+        s('u_bailout',        p.bailout)
+        s('u_min_dist',       p.min_dist)
+        s('u_fog_density',    p.fog_density)
+        s('u_color1',         tuple(self._smooth_color1))
+        s('u_color2',         tuple(self._smooth_color2))
+        s('u_color3',         tuple(self._smooth_color3))
+        s('u_color_mode',     p.color_mode)
+        s('u_ao_strength',    p.ao_strength)
+        s('u_shadow_soft',    p.shadow_soft)
+        s('u_shadows',        1 if p.shadows else 0)
+        s('u_glow',           p.glow)
+        s('u_cam_pos',        tuple(render_pos))
+        s('u_cam_fwd',        fwd)
+        s('u_cam_right',      right)
+        s('u_cam_up',         up)
+        s('u_animate',        1 if p.animate else 0)
+        s('u_anim_speed',     p.anim_speed)
+        s('u_fov',            p.fov)
+        s('u_de_multiplier',  p.de_multiplier)
+        s('u_orbit_trap_type', p.orbit_trap_type)
+        s('u_fog_color',      tuple(self._smooth_fog_color))
+        s('u_ao_radius',      p.ao_radius)
+        s('u_ao_samples',     p.ao_samples)
+        s('u_glow_intensity', p.glow_intensity)
+        s('u_glow_falloff',   p.glow_falloff)
+        s('u_glow_radius',    p.glow_radius)
+        s('u_rim_strength',   p.rim_strength)
+        s('u_emission',       p.emission)
+        s('u_bg_color1',      tuple(self._smooth_bg_color1))
+        s('u_bg_color2',      tuple(self._smooth_bg_color2))
+        s('u_bg_mode',        p.bg_mode)
+        s('u_aa_samples',     p.aa_samples)
+        s('u_mb_fold_limit',   p.mb_fold_limit)
+        s('u_mb_sphere_inner', p.mb_sphere_inner)
+        s('u_mb_sphere_outer', p.mb_sphere_outer)
+        s('u_mb_fixed_radius', p.mb_fixed_radius)
+        s('u_mb_color_scale',  p.mb_color_scale)
+        s('u_mb_rot_per_iter', p.mb_rot_per_iter)
+        s('u_mb_fold_mode',    p.mb_fold_mode)
+        s('u_ms_cross_width',  p.ms_cross_width)
+        s('u_ms_scale',        p.ms_scale)
+        s('u_ms_offset',       p.ms_offset)
+        s('u_ms_twist',        p.ms_twist)
+        s('u_ms_sharpness',    p.ms_sharpness)
+        s('u_si_vertex_spread', p.si_vertex_spread)
+        s('u_si_fold_bias',     p.si_fold_bias)
+        s('u_si_twist',         p.si_twist)
+        s('u_si_squash',        p.si_squash)
+        s('u_si_vertex_jitter', p.si_vertex_jitter)
+        s('u_oc_ifs_scale',    p.oc_ifs_scale)
+        s('u_oc_twist',        p.oc_twist)
+        s('u_oc_sharpness',    p.oc_sharpness)
+        s('u_oc_offset_uni',   p.oc_offset_uni)
+        s('u_oc_fold_amount',  p.oc_fold_amount)
+        s('u_oc_offset_x',     p.oc_offset_x)
+        s('u_oc_offset_y',     p.oc_offset_y)
+        s('u_oc_offset_z',     p.oc_offset_z)
+        s('u_oc_rot_x',        p.oc_rot_x)
+        s('u_oc_rot_z',        p.oc_rot_z)
+        s('u_mb2_power',        p.mb2_power)
+        s('u_mb2_bailout',      p.mb2_bailout)
+        s('u_mb2_julia_x',      p.mb2_julia_x)
+        s('u_mb2_julia_y',      p.mb2_julia_y)
+        s('u_mb2_julia_z',      p.mb2_julia_z)
+        s('u_mb2_julia_mode',   p.mb2_julia_mode)
+        s('u_mb2_fold_strength', p.mb2_fold_strength)
+        s('u_mb2_fold_type',    p.mb2_fold_type)
+        s('u_kl_scale',         p.kl_scale)
+        s('u_kl_cx',            p.kl_cx)
+        s('u_kl_cy',            p.kl_cy)
+        s('u_kl_cz',            p.kl_cz)
+        s('u_kl_fold_limit',    p.kl_fold_limit)
+        s('u_kl_sph_radius',    p.kl_sph_radius)
+        s('u_kl_rot_per_iter',  p.kl_rot_per_iter)
+        s('u_kl_mix_factor',    p.kl_mix_factor)
+        s('u_mb_fold_x',        p.mb_fold_x)
+        s('u_mb_fold_y',        p.mb_fold_y)
+        s('u_mb_fold_z',        p.mb_fold_z)
+        s('u_mb_julia_mode',    p.mb_julia_mode)
+        s('u_ms_rot_x',         p.ms_rot_x)
+        s('u_ms_rot_z',         p.ms_rot_z)
+        s('u_ms_scale_y',       p.ms_scale_y)
+        s('u_ms_scale_z',       p.ms_scale_z)
+        s('u_ms_offset_x',      p.ms_offset_x)
+        s('u_ms_offset_y',      p.ms_offset_y)
+        s('u_ms_offset_z',      p.ms_offset_z)
+        s('u_ms_fold_type',     p.ms_fold_type)
+        s('u_ms_fold_abs_amount', p.ms_fold_abs_amount)
+        s('u_si_rot_x',         p.si_rot_x)
+        s('u_si_rot_z',         p.si_rot_z)
+        s('u_si_scale_x',       p.si_scale_x)
+        s('u_si_scale_y',       p.si_scale_y)
+        s('u_si_scale_z',       p.si_scale_z)
+        s('u_si_offset_x',      p.si_offset_x)
+        s('u_si_offset_y',      p.si_offset_y)
+        s('u_si_offset_z',      p.si_offset_z)
+        s('u_si_rot_y',         p.si_rot_y)
+        s('u_mb_scale_x',       p.mb_scale_x)
+        s('u_mb_scale_y',       p.mb_scale_y)
+        s('u_mb_scale_z',       p.mb_scale_z)
+        s('u_mb_offset_x',      p.mb_offset_x)
+        s('u_mb_offset_y',      p.mb_offset_y)
+        s('u_mb_offset_z',      p.mb_offset_z)
+        s('u_mb_inversion_radius', p.mb_inversion_radius)
+        s('u_mb2_polar_mix',    p.mb2_polar_mix)
+        s('u_mb2_rot_per_iter', p.mb2_rot_per_iter)
+        s('u_mb2_abs_x',        1 if p.mb2_abs_x else 0)
+        s('u_mb2_abs_y',        1 if p.mb2_abs_y else 0)
+        s('u_mb2_abs_z',        1 if p.mb2_abs_z else 0)
+        s('u_oc_scale_y',       p.oc_scale_y)
+        s('u_oc_scale_z',       p.oc_scale_z)
+        s('u_oc_julia_mode',    p.oc_julia_mode)
+        s('u_oc_julia_x',       p.oc_julia_x)
+        s('u_oc_julia_y',       p.oc_julia_y)
+        s('u_oc_julia_z',       p.oc_julia_z)
+        s('u_kl_fold_limit_x',  p.kl_fold_limit_x)
+        s('u_kl_fold_limit_y',  p.kl_fold_limit_y)
+        s('u_kl_fold_limit_z',  p.kl_fold_limit_z)
+        s('u_kl_julia_mode',    p.kl_julia_mode)
+        s('u_kl_offset_x',      p.kl_offset_x)
+        s('u_kl_offset_y',      p.kl_offset_y)
+        s('u_kl_offset_z',      p.kl_offset_z)
+        s('u_sph_inv_enabled',  1 if p.sph_inv_enabled else 0)
+        s('u_sph_inv_radius',   p.sph_inv_radius)
+        s('u_sph_inv_cx',       p.sph_inv_cx)
+        s('u_sph_inv_cy',       p.sph_inv_cy)
+        s('u_sph_inv_cz',       p.sph_inv_cz)
+        s('u_lattice_fold_enabled', 1 if p.lattice_fold_enabled else 0)
+        s('u_lattice_fold_x',   p.lattice_fold_x)
+        s('u_lattice_fold_y',   p.lattice_fold_y)
+        s('u_lattice_fold_z',   p.lattice_fold_z)
+        s('u_warp_enabled',     1 if p.warp_enabled  else 0)
+        s('u_warp_strength',    p.warp_strength)
+        s('u_warp_freq',        p.warp_freq)
+        s('u_warp_type',        p.warp_type)
+        s('u_twist_axis',       p.twist_axis)
+        s('u_twist_amount',     p.twist_amount)
+        s('u_fold_mirror_x',    1 if p.fold_mirror_x else 0)
+        s('u_fold_mirror_y',    1 if p.fold_mirror_y else 0)
+        s('u_fold_mirror_z',    1 if p.fold_mirror_z else 0)
+        s('u_rep_enabled',      1 if p.rep_enabled   else 0)
+        s('u_rep_cell_x',       p.rep_cell_x)
+        s('u_rep_cell_y',       p.rep_cell_y)
+        s('u_rep_cell_z',       p.rep_cell_z)
+        s('u_light_dir',        (p.light_x, p.light_y, p.light_z))
+        s('u_specular_power',   p.specular_power)
+        s('u_specular_strength', p.specular_strength)
+        s('u_ambient',          p.ambient)
+        s('u_subsurface',       p.subsurface)
+        s('u_fresnel_power',    p.fresnel_power)
+        s('u_light2_dir',       (p.light2_x, p.light2_y, p.light2_z))
+        s('u_light2_color',     (p.light2_r, p.light2_g, p.light2_b))
+        s('u_light2_strength',  p.light2_strength)
+        s('u_color_anim_speed', p.color_anim_speed)
+        s('u_color_offset',     p.color_offset)
+        s('u_step_scale',       p.step_scale)
+        s('u_normal_eps',       p.normal_eps)
+        s('u_reflection',       p.reflection)
+        s('u_max_steps',        p.max_steps)
+        s('u_max_dist',         p.max_dist)
+        s('u_hit_eps',          p.hit_eps)
+        s('u_shadow_steps',     p.shadow_steps)
+        s('u_shadow_mint',      p.shadow_mint)
+        s('u_shadow_maxt',      p.shadow_maxt)
+        s('u_ao_step_scale',    p.ao_step_scale)
+        s('u_rm_overrelax',     1 if p.rm_overrelax else 0)
+        s('u_overrelax_factor', p.overrelax_factor)
+        s('u_feat_ao',           1 if p.feat_ao           else 0)
+        s('u_feat_shadows',      1 if p.feat_shadows      else 0)
+        s('u_feat_normals_full', 1 if p.feat_normals_full else 0)
+        s('u_feat_second_light', 1 if p.feat_second_light else 0)
+        s('u_feat_fog',          1 if p.feat_fog          else 0)
+        s('u_feat_glow',         1 if p.feat_glow         else 0)
+        s('u_feat_reflection',   1 if p.feat_reflection   else 0)
+        s('u_feat_subsurface',   1 if p.feat_subsurface   else 0)
+        s('u_feat_orbit_trap',   1 if p.feat_orbit_trap   else 0)
+        s('u_star_density',      getattr(p, 'star_density',   0.5))
+        s('u_star_brightness',   getattr(p, 'star_brightness', 1.0))
+        s('u_star_twinkle',      getattr(p, 'star_twinkle',   0.0))
+        s('u_star_size',         getattr(p, 'star_size',      1.0))
+        s('u_milkyway',          1 if getattr(p, 'milkyway', False) else 0)
+
+    def _render_eye_for_vr(self, eye_fbo, ew, eh, eye: dict):
+        p = _params
+        vr_scale = max(10, min(200, self._vr_dyn_scale)) / 100.0
+        rw = max(1, int(ew * vr_scale))
+        rh = max(1, int(eh * vr_scale))
+        self._ensure_vr_fbos(rw, rh)
+        fbo_obj = self._vr_fbos[eye['eye_idx']]
+        scene_fbo = fbo_obj['fbo']
+        scene_tex = fbo_obj['tex']
+        scene_fbo.use()
+        scene_fbo.clear(0, 0, 0)
+        vr_mode.set_uniforms_for_eye(self._set, eye, rw, rh)
+        self.vao.render(moderngl.TRIANGLE_STRIP)
+        eye_fbo.use()
+        eye_fbo.clear(0, 0, 0)
+        pl = self._post_uloc
+        scene_tex.use(location=0)
+        if 'u_scene'      in pl: pl['u_scene'].value      = 0
+        if 'u_resolution' in pl: pl['u_resolution'].value = (float(ew), float(eh))
+        if 'u_gamma'      in pl: pl['u_gamma'].value      = p.gamma
+        if 'u_exposure'   in pl: pl['u_exposure'].value   = p.exposure
+        if 'u_saturation' in pl: pl['u_saturation'].value = p.saturation
+        self.post_vao.render(moderngl.TRIANGLE_STRIP)
 
     def _init_debug_overlay(self):
         self._dbg_prog = self.ctx.program(
@@ -2560,7 +2841,6 @@ class FractalWindow(mglw.WindowConfig):
 
     def _update_dyn_res(self, ft):
         p = _params
-
         if not p.dyn_res_enabled:
             self._dyn_res_scale    = float(p.render_scale)
             self._dyn_last_scale_int = int(p.render_scale)
@@ -2568,62 +2848,92 @@ class FractalWindow(mglw.WindowConfig):
             self._dyn_bucket_count = 0
             self._dyn_bucket_sum_ft = 0.0
             self._dyn_cooldown     = 0.0
-            return
-
-        if ft <= 0.0 or ft > 1.0:
-            return
-
-        MEASURE_WINDOW = 0.4
-        COOLDOWN_DOWN  = 0.3
-        COOLDOWN_UP    = 3.0
-
-        self._dyn_bucket_time   += ft
-        self._dyn_bucket_count  += 1
-        self._dyn_bucket_sum_ft += ft
-
-        if self._dyn_cooldown > 0.0:
-            self._dyn_cooldown -= ft
-
-        if self._dyn_bucket_time < MEASURE_WINDOW:
-            return
-
-        avg_ft  = self._dyn_bucket_sum_ft / self._dyn_bucket_count
-        avg_fps = 1.0 / avg_ft if avg_ft > 0.0 else 0.0
-
-        self._dyn_bucket_time   = 0.0
-        self._dyn_bucket_count  = 0
-        self._dyn_bucket_sum_ft = 0.0
-
-        target  = float(p.dyn_res_target_fps)
-        min_fps = float(p.dyn_res_min_fps)
-        cap     = float(p.render_scale)
-        current = self._dyn_res_scale
-
-        if avg_fps < min_fps:
-            ratio     = avg_fps / max(min_fps, 1.0)
-            step      = (1.0 - ratio) * current * 0.5
-            new_scale = max(10.0, current - max(step, 5.0))
-            self._dyn_res_scale    = new_scale
-            self._dyn_last_scale_int = int(round(new_scale))
-            self._dyn_cooldown     = COOLDOWN_DOWN
-
-        elif avg_fps < target * 0.97:
-            if self._dyn_cooldown <= 0.0:
-                ratio     = avg_fps / target
-                step      = (1.0 - ratio) * current * 0.35
-                new_scale = max(10.0, current - max(step, 2.0))
-                self._dyn_res_scale    = new_scale
-                self._dyn_last_scale_int = int(round(new_scale))
-                self._dyn_cooldown     = COOLDOWN_DOWN
-
-        elif avg_fps > target * 1.15 and current < cap:
-            if self._dyn_cooldown <= 0.0:
-                headroom  = (avg_fps / target) - 1.0
-                step      = headroom * (cap - current) * 0.15
-                new_scale = min(cap, current + max(step, 1.0))
-                self._dyn_res_scale    = new_scale
-                self._dyn_last_scale_int = int(round(new_scale))
-                self._dyn_cooldown     = COOLDOWN_UP
+        else:
+            if ft > 0.0 and ft <= 1.0:
+                MEASURE_WINDOW = 0.4
+                COOLDOWN_DOWN  = 0.3
+                COOLDOWN_UP    = 3.0
+                self._dyn_bucket_time   += ft
+                self._dyn_bucket_count  += 1
+                self._dyn_bucket_sum_ft += ft
+                if self._dyn_cooldown > 0.0:
+                    self._dyn_cooldown -= ft
+                if self._dyn_bucket_time >= MEASURE_WINDOW:
+                    avg_ft  = self._dyn_bucket_sum_ft / self._dyn_bucket_count
+                    avg_fps = 1.0 / avg_ft if avg_ft > 0.0 else 0.0
+                    self._dyn_bucket_time   = 0.0
+                    self._dyn_bucket_count  = 0
+                    self._dyn_bucket_sum_ft = 0.0
+                    target  = float(p.dyn_res_target_fps)
+                    min_fps = float(p.dyn_res_min_fps)
+                    cap     = float(p.render_scale)
+                    current = self._dyn_res_scale
+                    if avg_fps < min_fps:
+                        ratio     = avg_fps / max(min_fps, 1.0)
+                        step      = (1.0 - ratio) * current * 0.5
+                        new_scale = max(10.0, current - max(step, 5.0))
+                        self._dyn_res_scale    = new_scale
+                        self._dyn_last_scale_int = int(round(new_scale))
+                        self._dyn_cooldown     = COOLDOWN_DOWN
+                    elif avg_fps < target * 0.97:
+                        if self._dyn_cooldown <= 0.0:
+                            ratio     = avg_fps / target
+                            step      = (1.0 - ratio) * current * 0.35
+                            new_scale = max(10.0, current - max(step, 2.0))
+                            self._dyn_res_scale    = new_scale
+                            self._dyn_last_scale_int = int(round(new_scale))
+                            self._dyn_cooldown     = COOLDOWN_DOWN
+                    elif avg_fps > target * 1.15 and current < cap:
+                        if self._dyn_cooldown <= 0.0:
+                            headroom  = (avg_fps / target) - 1.0
+                            step      = headroom * (cap - current) * 0.15
+                            new_scale = min(cap, current + max(step, 1.0))
+                            self._dyn_res_scale    = new_scale
+                            self._dyn_last_scale_int = int(round(new_scale))
+                            self._dyn_cooldown     = COOLDOWN_UP
+        if p.vr_mode and vr_mode.vr_enabled():
+            if not p.vr_dyn_res_enabled:
+                self._vr_dyn_scale   = float(p.vr_render_scale)
+                self._vr_dyn_bucket_t  = 0.0
+                self._vr_dyn_bucket_n  = 0
+                self._vr_dyn_bucket_ft = 0.0
+                self._vr_dyn_cooldown  = 0.0
+            elif ft > 0.0 and ft <= 1.0:
+                MEASURE_WINDOW = 0.4
+                COOLDOWN_DOWN  = 0.3
+                COOLDOWN_UP    = 3.0
+                self._vr_dyn_bucket_t  += ft
+                self._vr_dyn_bucket_n  += 1
+                self._vr_dyn_bucket_ft += ft
+                if self._vr_dyn_cooldown > 0.0:
+                    self._vr_dyn_cooldown -= ft
+                if self._vr_dyn_bucket_t >= MEASURE_WINDOW:
+                    avg_ft  = self._vr_dyn_bucket_ft / self._vr_dyn_bucket_n
+                    avg_fps = 1.0 / avg_ft if avg_ft > 0.0 else 0.0
+                    self._vr_dyn_bucket_t  = 0.0
+                    self._vr_dyn_bucket_n  = 0
+                    self._vr_dyn_bucket_ft = 0.0
+                    target  = float(p.dyn_res_target_fps)
+                    min_fps = float(p.dyn_res_min_fps)
+                    cap     = float(p.vr_render_scale)
+                    current = self._vr_dyn_scale
+                    if avg_fps < min_fps:
+                        ratio     = avg_fps / max(min_fps, 1.0)
+                        step      = (1.0 - ratio) * current * 0.5
+                        self._vr_dyn_scale   = max(10.0, current - max(step, 5.0))
+                        self._vr_dyn_cooldown = COOLDOWN_DOWN
+                    elif avg_fps < target * 0.97:
+                        if self._vr_dyn_cooldown <= 0.0:
+                            ratio     = avg_fps / target
+                            step      = (1.0 - ratio) * current * 0.35
+                            self._vr_dyn_scale   = max(10.0, current - max(step, 2.0))
+                            self._vr_dyn_cooldown = COOLDOWN_DOWN
+                    elif avg_fps > target * 1.15 and current < cap:
+                        if self._vr_dyn_cooldown <= 0.0:
+                            headroom  = (avg_fps / target) - 1.0
+                            step      = headroom * (cap - current) * 0.15
+                            self._vr_dyn_scale   = min(cap, current + max(step, 1.0))
+                            self._vr_dyn_cooldown = COOLDOWN_UP
 
     def _ensure_fbo(self):
         rw, rh = self._get_render_size()
@@ -2697,6 +3007,18 @@ class FractalWindow(mglw.WindowConfig):
             global _debug_overlay_enabled
             _debug_overlay_enabled = not _debug_overlay_enabled
             return
+        if key == km.F2 and action == PRESS:
+            p = _params
+            if not p.vr_mode:
+                ok = vr_mode.toggle_vr(self.ctx)
+                p.vr_mode = ok
+                if ok:
+                    vr_mode.reset_hmd_origin()
+            else:
+                vr_mode.toggle_vr(self.ctx)
+                p.vr_mode = False
+            return
+
         if key == km.SPACE and action == PRESS and _params.player_mode:
             _player_state.jump_queued = True
             return
@@ -2836,269 +3158,70 @@ class FractalWindow(mglw.WindowConfig):
         p = _params
         fwd, right, up = self._calc_basis()
         elapsed = time.time() - self.start
+        _ca = 1.0 - math.exp(-self._COLOR_SMOOTH * ft) if ft > 0.0 else 1.0
+        for _ci in range(3):
+            self._smooth_color1[_ci]    += (p.color1[_ci]    - self._smooth_color1[_ci])    * _ca
+            self._smooth_color2[_ci]    += (p.color2[_ci]    - self._smooth_color2[_ci])    * _ca
+            self._smooth_color3[_ci]    += (p.color3[_ci]    - self._smooth_color3[_ci])    * _ca
+            self._smooth_bg_color1[_ci] += (p.bg_color1[_ci] - self._smooth_bg_color1[_ci]) * _ca
+            self._smooth_bg_color2[_ci] += (p.bg_color2[_ci] - self._smooth_bg_color2[_ci]) * _ca
+            self._smooth_fog_color[_ci] += (p.fog_color[_ci] - self._smooth_fog_color[_ci]) * _ca
 
-        render_pos = (
-            _player_state.get_render_pos(ft)
-            if p.player_mode
-            else list(p.cam_pos)
-        )
+        if p.vr_mode and vr_mode.vr_enabled():
+            hx, hy, hz = vr_mode.get_hmd_pos_offset()
+            if p.player_mode:
+                base = _player_state.get_render_pos(ft)
+            else:
+                base = list(p.cam_pos)
+            render_pos = [base[0] + hx, base[1] + hy, base[2] + hz]
+        else:
+            render_pos = (
+                _player_state.get_render_pos(ft)
+                if p.player_mode
+                else list(p.cam_pos)
+            )
 
         rw, rh = self._fbo_size
+        is_vr = p.vr_mode and vr_mode.vr_enabled()
+        if is_vr:
+            vr_mode.poll_xr_events()
+            vr_mode.sync_hmd_pose()
+            self._set_shared_uniforms(p, elapsed, fwd, right, up, render_pos)
+            ww, wh = self.wnd.size
+            vr_mode.render_vr_frame(
+                self._render_eye_for_vr,
+                self.ctx,
+                self.ctx.screen,
+                p,
+                ww,
+                wh,
+            )
+            vr_mode.end_xr_frame()
+            if self._pending_screenshot or p.screenshot_requested:
+                self._pending_screenshot = False
+                p.screenshot_requested   = False
+                self._save_screenshot()
+            self._render_debug_overlay()
+            return
         self._scene_fbo.use()
         self._scene_fbo.clear(0, 0, 0)
-        self._set('u_time',         elapsed)
-        self._set('u_resolution',   (rw, rh))
-        self._set('u_iterations',   p.iterations)
-        self._set('u_scale',        p.scale)
-        self._set('u_fold_x',       1.0 if p.fold_x else 0.0)
-        self._set('u_fold_y',       1.0 if p.fold_y else 0.0)
-        self._set('u_fold_z',       1.0 if p.fold_z else 0.0)
-        self._set('u_rot_x',        p.rot_x)
-        self._set('u_rot_y',        p.rot_y)
-        self._set('u_rot_z',        p.rot_z)
-
-        cx, sx = math.cos(p.rot_x), math.sin(p.rot_x)
-        cy, sy = math.cos(p.rot_y), math.sin(p.rot_y)
-        cz, sz = math.cos(p.rot_z), math.sin(p.rot_z)
-        rx = (1,0,0, 0,cx,-sx, 0,sx,cx)
-        ry = (cy,0,sy, 0,1,0, -sy,0,cy)
-        rz = (cz,-sz,0, sz,cz,0, 0,0,1)
-        def _mat3mul(a, b):
-            return tuple(
-                a[r*3+0]*b[0*3+c] + a[r*3+1]*b[1*3+c] + a[r*3+2]*b[2*3+c]
-                for r in range(3) for c in range(3)
-            )
-        rot_mat = _mat3mul(_mat3mul(rz, ry), rx)
-        self._set('u_rot_mat', rot_mat)
-        self._set('u_offset_x',     p.offset_x)
-        self._set('u_offset_y',     p.offset_y)
-        self._set('u_offset_z',     p.offset_z)
-        self._set('u_julia_x',      p.julia_x)
-        self._set('u_julia_y',      p.julia_y)
-        self._set('u_julia_z',      p.julia_z)
-        self._set('u_fractal_type', p.fractal_type)
-        self._set('u_bailout',      p.bailout)
-        self._set('u_min_dist',     p.min_dist)
-        self._set('u_fog_density',  p.fog_density)
-        _ca = 1.0 - math.exp(-self._COLOR_SMOOTH * ft) if ft > 0.0 else 1.0
-        for i in range(3):
-            self._smooth_color1[i]    += (p.color1[i]    - self._smooth_color1[i])    * _ca
-            self._smooth_color2[i]    += (p.color2[i]    - self._smooth_color2[i])    * _ca
-            self._smooth_color3[i]    += (p.color3[i]    - self._smooth_color3[i])    * _ca
-            self._smooth_bg_color1[i] += (p.bg_color1[i] - self._smooth_bg_color1[i]) * _ca
-            self._smooth_bg_color2[i] += (p.bg_color2[i] - self._smooth_bg_color2[i]) * _ca
-            self._smooth_fog_color[i] += (p.fog_color[i] - self._smooth_fog_color[i]) * _ca
-        self._set('u_color1',       tuple(self._smooth_color1))
-        self._set('u_color2',       tuple(self._smooth_color2))
-        self._set('u_color3',       tuple(self._smooth_color3))
-        self._set('u_color_mode',   p.color_mode)
-        self._set('u_ao_strength',  p.ao_strength)
-        self._set('u_shadow_soft',  p.shadow_soft)
-        self._set('u_shadows',      1 if p.shadows else 0)
-        self._set('u_glow',         p.glow)
-        self._set('u_cam_pos',      tuple(render_pos))
-        self._set('u_cam_fwd',      fwd)
-        self._set('u_cam_right',    right)
-        self._set('u_cam_up',       up)
-        self._set('u_animate',      1 if p.animate else 0)
-        self._set('u_anim_speed',   p.anim_speed)
-        self._set('u_fov',          p.fov)
-        self._set('u_de_multiplier', p.de_multiplier)
-        self._set('u_orbit_trap_type', p.orbit_trap_type)
-        # Fog
-        self._set('u_fog_color',    tuple(self._smooth_fog_color))
-        # AO
-        self._set('u_ao_radius',    p.ao_radius)
-        self._set('u_ao_samples',   p.ao_samples)
-        # Glow
-        self._set('u_glow_intensity', p.glow_intensity)
-        self._set('u_glow_falloff',   p.glow_falloff)
-        self._set('u_glow_radius',    p.glow_radius)
-        self._set('u_rim_strength',   p.rim_strength)
-        self._set('u_emission',       p.emission)
-        # Background
-        self._set('u_bg_color1',  tuple(self._smooth_bg_color1))
-        self._set('u_bg_color2',  tuple(self._smooth_bg_color2))
-        self._set('u_bg_mode',    p.bg_mode)
-        # AA
-        self._set('u_aa_samples', p.aa_samples)
-        # Mandelbox fine-tune
-        self._set('u_mb_fold_limit',   p.mb_fold_limit)
-        self._set('u_mb_sphere_inner', p.mb_sphere_inner)
-        self._set('u_mb_sphere_outer', p.mb_sphere_outer)
-        self._set('u_mb_fixed_radius', p.mb_fixed_radius)
-        self._set('u_mb_color_scale',  p.mb_color_scale)
-        self._set('u_mb_rot_per_iter', p.mb_rot_per_iter)
-        self._set('u_mb_fold_mode',    p.mb_fold_mode)
-        # Menger fine-tune
-        self._set('u_ms_cross_width',  p.ms_cross_width)
-        self._set('u_ms_scale',        p.ms_scale)
-        self._set('u_ms_offset',       p.ms_offset)
-        self._set('u_ms_twist',        p.ms_twist)
-        self._set('u_ms_sharpness',    p.ms_sharpness)
-        # Sierpinski fine-tune
-        self._set('u_si_vertex_spread', p.si_vertex_spread)
-        self._set('u_si_fold_bias',     p.si_fold_bias)
-        self._set('u_si_twist',         p.si_twist)
-        self._set('u_si_squash',        p.si_squash)
-        self._set('u_si_vertex_jitter', p.si_vertex_jitter)
-        # Octahedron fine-tune
-        self._set('u_oc_ifs_scale',    p.oc_ifs_scale)
-        self._set('u_oc_twist',        p.oc_twist)
-        self._set('u_oc_sharpness',    p.oc_sharpness)
-        self._set('u_oc_offset_uni',   p.oc_offset_uni)
-        self._set('u_oc_fold_amount',  p.oc_fold_amount)
-        self._set('u_oc_offset_x',     p.oc_offset_x)
-        self._set('u_oc_offset_y',     p.oc_offset_y)
-        self._set('u_oc_offset_z',     p.oc_offset_z)
-        self._set('u_oc_rot_x',        p.oc_rot_x)
-        self._set('u_oc_rot_z',        p.oc_rot_z)
-        # Mandelbulb fine-tune
-        self._set('u_mb2_power',        p.mb2_power)
-        self._set('u_mb2_bailout',      p.mb2_bailout)
-        self._set('u_mb2_julia_x',      p.mb2_julia_x)
-        self._set('u_mb2_julia_y',      p.mb2_julia_y)
-        self._set('u_mb2_julia_z',      p.mb2_julia_z)
-        self._set('u_mb2_julia_mode',   p.mb2_julia_mode)
-        self._set('u_mb2_fold_strength', p.mb2_fold_strength)
-        self._set('u_mb2_fold_type',    p.mb2_fold_type)
-        # Pseudo-Kleinian fine-tune
-        self._set('u_kl_scale',         p.kl_scale)
-        self._set('u_kl_cx',            p.kl_cx)
-        self._set('u_kl_cy',            p.kl_cy)
-        self._set('u_kl_cz',            p.kl_cz)
-        self._set('u_kl_fold_limit',    p.kl_fold_limit)
-        self._set('u_kl_sph_radius',    p.kl_sph_radius)
-        self._set('u_kl_rot_per_iter',  p.kl_rot_per_iter)
-        self._set('u_kl_mix_factor',    p.kl_mix_factor)
-        # Mandelbox per-axis fold
-        self._set('u_mb_fold_x',        p.mb_fold_x)
-        self._set('u_mb_fold_y',        p.mb_fold_y)
-        self._set('u_mb_fold_z',        p.mb_fold_z)
-        self._set('u_mb_julia_mode',    p.mb_julia_mode)
-        # Menger per-axis
-        self._set('u_ms_rot_x',         p.ms_rot_x)
-        self._set('u_ms_rot_z',         p.ms_rot_z)
-        self._set('u_ms_scale_y',       p.ms_scale_y)
-        self._set('u_ms_scale_z',       p.ms_scale_z)
-        self._set('u_ms_offset_x',      p.ms_offset_x)
-        self._set('u_ms_offset_y',      p.ms_offset_y)
-        self._set('u_ms_offset_z',      p.ms_offset_z)
-        self._set('u_ms_fold_type',     p.ms_fold_type)
-        self._set('u_ms_fold_abs_amount', p.ms_fold_abs_amount)
-        self._set('u_si_rot_x',         p.si_rot_x)
-        self._set('u_si_rot_z',         p.si_rot_z)
-        self._set('u_si_scale_x',       p.si_scale_x)
-        self._set('u_si_scale_y',       p.si_scale_y)
-        self._set('u_si_scale_z',       p.si_scale_z)
-        self._set('u_si_offset_x',      p.si_offset_x)
-        self._set('u_si_offset_y',      p.si_offset_y)
-        self._set('u_si_offset_z',      p.si_offset_z)
-        self._set('u_si_rot_y',         p.si_rot_y)
-        self._set('u_mb_scale_x',       p.mb_scale_x)
-        self._set('u_mb_scale_y',       p.mb_scale_y)
-        self._set('u_mb_scale_z',       p.mb_scale_z)
-        self._set('u_mb_offset_x',      p.mb_offset_x)
-        self._set('u_mb_offset_y',      p.mb_offset_y)
-        self._set('u_mb_offset_z',      p.mb_offset_z)
-        self._set('u_mb_inversion_radius', p.mb_inversion_radius)
-        self._set('u_mb2_polar_mix',    p.mb2_polar_mix)
-        self._set('u_mb2_rot_per_iter', p.mb2_rot_per_iter)
-        self._set('u_mb2_abs_x',        1 if p.mb2_abs_x else 0)
-        self._set('u_mb2_abs_y',        1 if p.mb2_abs_y else 0)
-        self._set('u_mb2_abs_z',        1 if p.mb2_abs_z else 0)
-        self._set('u_oc_scale_y',       p.oc_scale_y)
-        self._set('u_oc_scale_z',       p.oc_scale_z)
-        self._set('u_oc_julia_mode',    p.oc_julia_mode)
-        self._set('u_oc_julia_x',       p.oc_julia_x)
-        self._set('u_oc_julia_y',       p.oc_julia_y)
-        self._set('u_oc_julia_z',       p.oc_julia_z)
-        self._set('u_kl_fold_limit_x',  p.kl_fold_limit_x)
-        self._set('u_kl_fold_limit_y',  p.kl_fold_limit_y)
-        self._set('u_kl_fold_limit_z',  p.kl_fold_limit_z)
-        self._set('u_kl_julia_mode',    p.kl_julia_mode)
-        self._set('u_kl_offset_x',      p.kl_offset_x)
-        self._set('u_kl_offset_y',      p.kl_offset_y)
-        self._set('u_kl_offset_z',      p.kl_offset_z)
-        self._set('u_sph_inv_enabled',  1 if p.sph_inv_enabled else 0)
-        self._set('u_sph_inv_radius',   p.sph_inv_radius)
-        self._set('u_sph_inv_cx',       p.sph_inv_cx)
-        self._set('u_sph_inv_cy',       p.sph_inv_cy)
-        self._set('u_sph_inv_cz',       p.sph_inv_cz)
-        self._set('u_lattice_fold_enabled', 1 if p.lattice_fold_enabled else 0)
-        self._set('u_lattice_fold_x',   p.lattice_fold_x)
-        self._set('u_lattice_fold_y',   p.lattice_fold_y)
-        self._set('u_lattice_fold_z',   p.lattice_fold_z)
-        # Global space operators
-        self._set('u_warp_enabled',     1 if p.warp_enabled  else 0)
-        self._set('u_warp_strength',    p.warp_strength)
-        self._set('u_warp_freq',        p.warp_freq)
-        self._set('u_warp_type',        p.warp_type)
-        self._set('u_twist_axis',       p.twist_axis)
-        self._set('u_twist_amount',     p.twist_amount)
-        self._set('u_fold_mirror_x',    1 if p.fold_mirror_x else 0)
-        self._set('u_fold_mirror_y',    1 if p.fold_mirror_y else 0)
-        self._set('u_fold_mirror_z',    1 if p.fold_mirror_z else 0)
-        self._set('u_rep_enabled',      1 if p.rep_enabled   else 0)
-        self._set('u_rep_cell_x',       p.rep_cell_x)
-        self._set('u_rep_cell_y',       p.rep_cell_y)
-        self._set('u_rep_cell_z',       p.rep_cell_z)
-        # Light primary
-        self._set('u_light_dir',       (p.light_x, p.light_y, p.light_z))
-        self._set('u_specular_power',  p.specular_power)
-        self._set('u_specular_strength', p.specular_strength)
-        self._set('u_ambient',         p.ambient)
-        self._set('u_subsurface',      p.subsurface)
-        self._set('u_fresnel_power',   p.fresnel_power)
-        # Second light
-        self._set('u_light2_dir',      (p.light2_x, p.light2_y, p.light2_z))
-        self._set('u_light2_color',    (p.light2_r, p.light2_g, p.light2_b))
-        self._set('u_light2_strength', p.light2_strength)
-        # Color animation
-        self._set('u_color_anim_speed', p.color_anim_speed)
-        self._set('u_color_offset',    p.color_offset)
-        # Raymarching
-        self._set('u_step_scale',      p.step_scale)
-        self._set('u_normal_eps',      p.normal_eps)
-        self._set('u_reflection',      p.reflection)
-        self._set('u_max_steps',       p.max_steps)
-        self._set('u_max_dist',        p.max_dist)
-        self._set('u_hit_eps',         p.hit_eps)
-        self._set('u_shadow_steps',    p.shadow_steps)
-        self._set('u_shadow_mint',     p.shadow_mint)
-        self._set('u_shadow_maxt',     p.shadow_maxt)
-        self._set('u_ao_step_scale',   p.ao_step_scale)
-        self._set('u_rm_overrelax',    1 if p.rm_overrelax else 0)
-        self._set('u_overrelax_factor', p.overrelax_factor)
-        # DOF
-        self._set('u_feat_ao',           1 if p.feat_ao           else 0)
-        self._set('u_feat_shadows',      1 if p.feat_shadows      else 0)
-        self._set('u_feat_normals_full', 1 if p.feat_normals_full else 0)
-        self._set('u_feat_second_light', 1 if p.feat_second_light else 0)
-        self._set('u_feat_fog',          1 if p.feat_fog          else 0)
-        self._set('u_feat_glow',         1 if p.feat_glow         else 0)
-        self._set('u_feat_reflection',   1 if p.feat_reflection   else 0)
-        self._set('u_feat_subsurface',   1 if p.feat_subsurface   else 0)
-        self._set('u_feat_orbit_trap',   1 if p.feat_orbit_trap   else 0)
+        self._set('u_resolution', (rw, rh))
+        self._set_shared_uniforms(p, elapsed, fwd, right, up, render_pos)
         self.vao.render(moderngl.TRIANGLE_STRIP)
-
         self.ctx.screen.use()
         self.ctx.clear(0, 0, 0)
         self._scene_tex.use(location=0)
         pl = self._post_uloc
-        if 'u_scene' in pl:      pl['u_scene'].value      = 0
+        if 'u_scene'      in pl: pl['u_scene'].value      = 0
         if 'u_resolution' in pl: pl['u_resolution'].value = self.wnd.size
         if 'u_gamma'      in pl: pl['u_gamma'].value      = p.gamma
         if 'u_exposure'   in pl: pl['u_exposure'].value   = p.exposure
         if 'u_saturation' in pl: pl['u_saturation'].value = p.saturation
         self.post_vao.render(moderngl.TRIANGLE_STRIP)
-
         if self._pending_screenshot or p.screenshot_requested:
-            self._pending_screenshot  = False
-            p.screenshot_requested    = False
+            self._pending_screenshot = False
+            p.screenshot_requested   = False
             self._save_screenshot()
-
-        self._render_debug_overlay()
 
     def _save_screenshot(self):
         try:
@@ -3495,6 +3618,12 @@ class ControlGUI(QMainWindow):
         self._build_settings_section()
         self._vbox.addStretch()
         tabs.addTab(tab_settings, "Settings")
+
+        tab_vr, vbox = self._make_scroll_tab()
+        self._vbox = vbox
+        self._build_vr_section()
+        self._vbox.addStretch()
+        tabs.addTab(tab_vr, "VR")
 
         self.setCentralWidget(root)
 
@@ -5375,6 +5504,165 @@ class ControlGUI(QMainWindow):
                 subprocess.Popen(["xdg-open", folder])
         except Exception as e:
             QMessageBox.information(self, "Themes folder", folder)
+    def _build_vr_section(self):
+        avail = vr_mode.is_available()
+        status_grp = _section("VR STATUS")
+        st_l = QVBoxLayout(status_grp)
+        st_l.setSpacing(6)
+        _lbl_hint(st_l, "OpenXR backend (Windows only). Requires a running SteamVR / Oculus runtime.")
+        avail_lbl = QLabel(
+            "pyopenxr: INSTALLED" if avail else "pyopenxr: NOT INSTALLED  (pip install pyopenxr)"
+        )
+        avail_lbl.setStyleSheet(
+            "color: #44cc88;" if avail else "color: #cc4444;"
+        )
+        st_l.addWidget(avail_lbl)
+        self._vr_active_lbl = QLabel("VR: INACTIVE")
+        self._vr_active_lbl.setStyleSheet("color: #aaaacc; font-weight: bold;")
+        st_l.addWidget(self._vr_active_lbl)
+        toggle_btn = QPushButton("Toggle VR  (F2)")
+        toggle_btn.setFixedHeight(30)
+        toggle_btn.clicked.connect(self._toolbar_toggle_vr)
+        st_l.addWidget(toggle_btn)
+        reset_origin_btn = QPushButton("Reset HMD Origin")
+        reset_origin_btn.setToolTip("Re-zero head position tracking")
+        reset_origin_btn.clicked.connect(lambda: vr_mode.reset_hmd_origin())
+        st_l.addWidget(reset_origin_btn)
+        self._add_section(status_grp)
+
+        optics_grp = _section("OPTICS")
+        op_l = QVBoxLayout(optics_grp)
+        op_l.setSpacing(4)
+        _lbl_hint(op_l, "IPD: interpupillary distance. Also adjustable in-headset by squeezing both controllers.")
+        sr_ipd = SliderRow("IPD (m)", 0.010, 0.200, _params.vr_ipd, 0.001)
+        sr_ipd._params_attr = 'vr_ipd'
+        def _on_ipd(v):
+            _params.vr_ipd = v
+            vr_mode._vr_state.ipd_override = v
+        sr_ipd.on_change(_on_ipd)
+        setattr(self, '_sl_vr_ipd', sr_ipd)
+        op_l.addWidget(sr_ipd)
+        self._add_section(optics_grp)
+
+        res_grp = _section("VR RENDER RESOLUTION")
+        res_l = QVBoxLayout(res_grp)
+        res_l.setSpacing(4)
+        _lbl_hint(res_l,
+            "VR renders each eye at this fraction of the HMD's native resolution.\n"
+            "100% = full native. Lower = faster, blurrier.")
+        vr_scale_row = QWidget()
+        vr_scale_row_l = QHBoxLayout(vr_scale_row)
+        vr_scale_row_l.setContentsMargins(4, 2, 4, 2)
+        vr_scale_row_l.setSpacing(6)
+        vr_scale_lbl = QLabel("Scale %")
+        vr_scale_lbl.setFixedWidth(80)
+        vr_scale_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._vr_res_slider = QSlider(Qt.Horizontal)
+        self._vr_res_slider.setRange(10, 200)
+        self._vr_res_slider.setValue(_params.vr_render_scale)
+        self._vr_res_val_lbl = QLabel(f'{_params.vr_render_scale}%')
+        self._vr_res_val_lbl.setFixedWidth(50)
+        self._vr_res_val_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        vr_scale_row_l.addWidget(vr_scale_lbl)
+        vr_scale_row_l.addWidget(self._vr_res_slider, 1)
+        vr_scale_row_l.addWidget(self._vr_res_val_lbl)
+        res_l.addWidget(vr_scale_row)
+        def _on_vr_scale(v):
+            _params.vr_render_scale = v
+            self._vr_res_val_lbl.setText(f'{v}%')
+        self._vr_res_slider.valueChanged.connect(_on_vr_scale)
+        dyn_vr_row = QHBoxLayout()
+        self._vr_dyn_res_cb = QCheckBox("Dynamic Resolution")
+        self._vr_dyn_res_cb.setChecked(_params.vr_dyn_res_enabled)
+        self._vr_dyn_res_cb.stateChanged.connect(lambda s: setattr(_params, 'vr_dyn_res_enabled', bool(s)))
+        dyn_vr_hint = QLabel("auto-adjust VR scale to hit target FPS")
+        dyn_vr_row.addWidget(self._vr_dyn_res_cb)
+        dyn_vr_row.addWidget(dyn_vr_hint, 1)
+        res_l.addLayout(dyn_vr_row)
+        _lbl_hint(res_l,
+            "When enabled, shares the same Target/Min FPS settings as the main\n"
+            "dynamic resolution (Performance tab) but applies only to VR eyes.")
+        self._add_section(res_grp)
+
+        ss_grp = _section("SUPERSAMPLING")
+        ss_l = QVBoxLayout(ss_grp)
+        ss_l.setSpacing(4)
+        _lbl_hint(ss_l,
+            "Render each eye at a multiple of the requested resolution and downscale.\n"
+            "1x = off, 2x = 4 samples per pixel (expensive).")
+        ss_row = QHBoxLayout()
+        self._vr_ss_grp = QButtonGroup(self)
+        for i, lbl in enumerate(["1x (off)", "2x"]):
+            rb = QRadioButton(lbl)
+            rb.setChecked(i + 1 == _params.vr_supersampling)
+            self._vr_ss_grp.addButton(rb, i + 1)
+            ss_row.addWidget(rb)
+        self._vr_ss_grp.idClicked.connect(lambda idx: setattr(_params, 'vr_supersampling', idx))
+        ss_l.addLayout(ss_row)
+        self._add_section(ss_grp)
+
+        comfort_grp = _section("COMFORT")
+        cf_l = QVBoxLayout(comfort_grp)
+        cf_l.setSpacing(4)
+        _lbl_hint(cf_l, "Vignette darkens screen edges during fast movement to reduce motion sickness.")
+        vig_row = QHBoxLayout()
+        self._vr_vignette_cb = QCheckBox("Comfort Vignette")
+        self._vr_vignette_cb.setChecked(_params.vr_comfort_vignette)
+        self._vr_vignette_cb.stateChanged.connect(lambda s: setattr(_params, 'vr_comfort_vignette', bool(s)))
+        vig_row.addWidget(self._vr_vignette_cb)
+        cf_l.addLayout(vig_row)
+        sr_pred = SliderRow("Prediction Mult", 0.5, 3.0, _params.vr_prediction_mult, 0.05)
+        sr_pred._params_attr = 'vr_prediction_mult'
+        sr_pred.on_change(lambda v: setattr(_params, 'vr_prediction_mult', v))
+        setattr(self, '_sl_vr_prediction_mult', sr_pred)
+        _lbl_hint(cf_l, "Prediction Mult: multiplier on XR predicted display time offset. 1.0 = standard.")
+        cf_l.addWidget(sr_pred)
+        self._add_section(comfort_grp)
+
+        diag_grp = _section("DIAGNOSTICS")
+        dg_l = QVBoxLayout(diag_grp)
+        dg_l.setSpacing(4)
+        _lbl_hint(dg_l, "Current VR runtime information.")
+        self._vr_diag_lbl = QLabel("No active VR session.")
+        self._vr_diag_lbl.setWordWrap(True)
+        dg_l.addWidget(self._vr_diag_lbl)
+        self._add_section(diag_grp)
+
+        self._vr_diag_timer = QTimer(self)
+        self._vr_diag_timer.timeout.connect(self._update_vr_diag)
+        self._vr_diag_timer.start(500)
+
+    def _update_vr_diag(self):
+        active = vr_mode.vr_enabled()
+        if active:
+            self._vr_active_lbl.setText("VR: ACTIVE")
+            self._vr_active_lbl.setStyleSheet("color: #44cc88; font-weight: bold;")
+            ipd = vr_mode.get_ipd()
+            w, h = vr_mode.VRState.EYE_TEX_W, vr_mode.VRState.EYE_TEX_H
+            self._vr_diag_lbl.setText(
+                f"Session: running\n"
+                f"Eye texture: {w} x {h}\n"
+                f"IPD (current): {ipd*1000:.1f} mm\n"
+                f"XR active: {vr_mode.is_active()}"
+            )
+        else:
+            self._vr_active_lbl.setText("VR: INACTIVE")
+            self._vr_active_lbl.setStyleSheet("color: #aaaacc; font-weight: bold;")
+            self._vr_diag_lbl.setText("No active VR session.")
+
+    def _toolbar_toggle_vr(self):
+        p = _params
+        if not p.vr_mode:
+            if not vr_mode.is_available():
+                QMessageBox.warning(
+                    self, "VR Mode",
+                    "pyopenxr not installed.",
+                )
+                return
+            p.vr_mode = True
+        else:
+            p.vr_mode = False
+            vr_mode.toggle_vr(None)
 
     def _build_toolbar(self):
         style = QApplication.style()
@@ -5438,6 +5726,13 @@ class ControlGUI(QMainWindow):
         _act(QStyle.SP_DesktopIcon, "Screenshot",
              "Save screenshot of the current render (F12)",
              self._trigger_screenshot)
+
+        tb.addSeparator()
+
+        _act(QStyle.SP_ComputerIcon, "VR Mode",
+             "Toggle VR mode (F2) — requires OpenXR runtime",
+             self._toolbar_toggle_vr)
+
 
         tb.addSeparator()
 

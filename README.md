@@ -11,11 +11,18 @@ Tested on:
 | GT 740 2Gb | Windows 10 22H2 | Working |
 | Intel HD4000 | Windows 10 22H2 | GLSL Compile error |
 | AMD RX580 4Gb | Windows 10 21H2 | GLSL Compile error |
+So, the program currently only works on NVIDIA.
 
 The renderer is designed more like a sandbox than a fixed viewer: almost every part of the fractal pipeline can be modified in real time — folds, rotations, orbit traps, spatial warping, raymarch settings, lighting, post-processing and animation.
+
 ![img.png](Screenshots/img.png)
 ---
+# Requirements
+* Python 3.8+
+* OpenGL 3.3 compatible GPU
+* Modern graphics drivers
 
+---
 # Features
 
 * Real-time GLSL raymarching
@@ -54,13 +61,6 @@ The renderer is designed more like a sandbox than a fixed viewer: almost every p
 
 ---
 
-# Requirements
-
-* Python 3.10+
-* OpenGL 3.3 compatible GPU
-* Modern graphics drivers
-
----
 
 # Installation
 
@@ -494,8 +494,6 @@ No textures are required.
 * Volumetric rendering
 * Temporal accumulation
 * Signed distance material blending
-* VR support
-* Animation timeline system
 * Node-based fractal graph editor
 * Hybrid DE composition
 
