@@ -25,7 +25,7 @@ from moderngl_window.conf import settings as mglw_settings
 import app_config
 import vr_mode
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 
 try:
     from animation_editor import (
@@ -345,13 +345,14 @@ float sdTetra(vec3 p, float r) {
 }
 
 float orbitTrap(vec3 p, float s) {
-    if (u_feat_orbit_trap == 0) return dot(p, p) / (s * s);
+    if (u_feat_orbit_trap == 0) return dot(p, p) * (1.0 / (s * s));
+    float sinvs = 1.0 / (abs(s) + 0.0001);
     if (u_orbit_trap_type == 0) {
-        return dot(p, p) / (s * s);
+        return dot(p, p) * (1.0 / (s * s));
     } else if (u_orbit_trap_type == 1) {
-        return abs(p.y) / (abs(s) + 0.0001);
+        return abs(p.y) * sinvs;
     } else if (u_orbit_trap_type == 2) {
-        return max(abs(p.x), max(abs(p.y), abs(p.z))) / (abs(s) + 0.0001);
+        return max(abs(p.x), max(abs(p.y), abs(p.z))) * sinvs;
     } else {
         float r = length(p.xz);
         return length(vec2(r - abs(s) * 0.4, p.y)) / (abs(s) * 0.3 + 0.0001);
@@ -362,20 +363,17 @@ vec2 mandelbox(vec3 pos) {
     vec3 p = pos;
     float trap = 1e10;
     float dr = 1.0;
-    float foldX = (u_mb_fold_x > 0.001) ? u_mb_fold_x : u_mb_fold_limit;
-    float foldY = (u_mb_fold_y > 0.001) ? u_mb_fold_y : u_mb_fold_limit;
-    float foldZ = (u_mb_fold_z > 0.001) ? u_mb_fold_z : u_mb_fold_limit;
-    float sphIn = u_mb_sphere_inner;
-    float sphOut = u_mb_sphere_outer * u_mb_fixed_radius;
-    float sx = (u_mb_scale_x > 0.001) ? u_mb_scale_x : u_scale;
-    float sy = (u_mb_scale_y > 0.001) ? u_mb_scale_y : u_scale;
-    float sz = (u_mb_scale_z > 0.001) ? u_mb_scale_z : u_scale;
-    vec3 joff = (u_mb_julia_mode == 1)
-        ? vec3(u_julia_x, u_julia_y, u_julia_z)
-        : vec3(0.0);
+    float foldX = (u_mb_fold_x > 0.0) ? u_mb_fold_x : u_mb_fold_limit;
+    float foldY = (u_mb_fold_y > 0.0) ? u_mb_fold_y : u_mb_fold_limit;
+    float foldZ = (u_mb_fold_z > 0.0) ? u_mb_fold_z : u_mb_fold_limit;
+    float sphIn  = u_mb_sphere_inner;
+    float sphOut = u_mb_sphere_outer;
+    float sc     = u_scale;
+    float absSc  = abs(sc);
     vec3 posOff = (u_mb_offset_x != 0.0 || u_mb_offset_y != 0.0 || u_mb_offset_z != 0.0)
         ? vec3(u_mb_offset_x, u_mb_offset_y, u_mb_offset_z)
-        : pos * (1.0 - u_scale) * 0.1;
+        : pos;
+    vec3 joff = vec3(u_julia_x, u_julia_y, u_julia_z);
     if (u_mb_inversion_radius > 0.001) {
         float r2 = dot(p, p);
         float k  = (u_mb_inversion_radius * u_mb_inversion_radius) / max(r2, 1e-6);
@@ -388,33 +386,33 @@ vec2 mandelbox(vec3 pos) {
             p.x = clamp(p.x, -foldX, foldX) * 2.0 - p.x;
             p.y = clamp(p.y, -foldY, foldY) * 2.0 - p.y;
             p.z = clamp(p.z, -foldZ, foldZ) * 2.0 - p.z;
-        } else if (u_mb_fold_mode == 1) {
+        } else {
             p.x = abs(p.x + foldX) - abs(p.x - foldX) - p.x;
             p.y = abs(p.y + foldY) - abs(p.y - foldY) - p.y;
             p.z = abs(p.z + foldZ) - abs(p.z - foldZ) - p.z;
-        } else {
-            p.x = sin(p.x * PI / (2.0 * foldX)) * foldX;
-            p.y = sin(p.y * PI / (2.0 * foldY)) * foldY;
-            p.z = sin(p.z * PI / (2.0 * foldZ)) * foldZ;
         }
         float r2 = dot(p, p);
-        if (r2 < sphIn) {
-            float k = sphOut / sphIn;
-            p *= k; dr *= k;
-        } else if (r2 < sphOut) {
-            float k = sphOut / r2;
-            p *= k; dr *= k;
-        }
-        if (u_mb_julia_mode == 1) {
-            p = vec3(p.x * sx, p.y * sy, p.z * sz) + joff;
+        float r  = sqrt(r2);
+        float sphK;
+        if (r < sphIn) {
+            sphK = (sphOut * sphOut) / (sphIn * sphIn);
+        } else if (r < sphOut) {
+            sphK = (sphOut * sphOut) / r2;
         } else {
-            p = vec3(p.x * sx, p.y * sy, p.z * sz) + posOff;
+            sphK = 1.0;
         }
-        dr = dr * abs(u_scale) + 1.0;
+        p  *= sphK;
+        dr *= sphK;
+        dr  = dr * absSc + 1.0;
+        if (u_mb_julia_mode == 1) {
+            p = p * sc + joff;
+        } else {
+            p = p * sc + posOff;
+        }
         trap = min(trap, orbitTrap(p, u_mb_color_scale));
-        if (dot(p,p) > u_bailout * u_bailout) break;
+        if (dot(p, p) > u_bailout * u_bailout) break;
     }
-    return vec2(length(p) / abs(dr) * u_de_multiplier, trap);
+    return vec2(length(p) / max(abs(dr), 1e-6) * u_de_multiplier, trap);
 }
 
 vec2 mengerSponge(vec3 pos) {
@@ -422,8 +420,8 @@ vec2 mengerSponge(vec3 pos) {
     float s = 1.0;
     float trap = 1e10;
     float ms = u_ms_scale;
-    float sy = (u_ms_scale_y > 0.001) ? u_ms_scale_y : ms;
-    float sz = (u_ms_scale_z > 0.001) ? u_ms_scale_z : ms;
+    float sy = (u_ms_scale_y > 0.0) ? u_ms_scale_y : ms;
+    float sz = (u_ms_scale_z > 0.0) ? u_ms_scale_z : ms;
     float ox = (u_ms_offset_x != 0.0) ? u_ms_offset_x : u_ms_offset;
     float oy = (u_ms_offset_y != 0.0) ? u_ms_offset_y : u_ms_offset;
     float oz = (u_ms_offset_z != 0.0) ? u_ms_offset_z : u_ms_offset;
@@ -444,7 +442,8 @@ vec2 mengerSponge(vec3 pos) {
         p.x = p.x * ms - ox;
         p.y = p.y * sy - oy;
         p.z = p.z * sz - oz;
-        p.z += oz * clamp(p.z / oz * 0.5 + 0.5, 0.0, 1.0) * u_ms_cross_width;
+        if (abs(oz) > 0.0001)
+            p.z += oz * clamp(p.z / oz * 0.5 + 0.5, 0.0, 1.0) * u_ms_cross_width;
         s *= ms;
         trap = min(trap, orbitTrap(p, s));
     }
@@ -475,9 +474,9 @@ vec2 sierpinski(vec3 pos) {
     }
     vec3 p = pos;
     p.y *= u_si_squash;
-    float scX = (u_si_scale_x > 0.001) ? u_si_scale_x : u_si_fold_bias;
-    float scY = (u_si_scale_y > 0.001) ? u_si_scale_y : u_si_fold_bias;
-    float scZ = (u_si_scale_z > 0.001) ? u_si_scale_z : u_si_fold_bias;
+    float scX = (u_si_scale_x > 0.0) ? u_si_scale_x : u_si_fold_bias;
+    float scY = (u_si_scale_y > 0.0) ? u_si_scale_y : u_si_fold_bias;
+    float scZ = (u_si_scale_z > 0.0) ? u_si_scale_z : u_si_fold_bias;
     vec3 siOff = vec3(u_si_offset_x, u_si_offset_y, u_si_offset_z);
     float scale = 1.0;
     float trap = 1e10;
@@ -500,7 +499,7 @@ vec2 sierpinski(vec3 pos) {
         scale *= u_si_fold_bias;
         trap = min(trap, orbitTrap(p, scale));
     }
-    return vec2(sdTetra(p, scale) / scale * u_de_multiplier, trap);
+    return vec2(sdTetra(p, 1.0) / scale * u_de_multiplier, trap);
 }
 
 vec2 octahedronIFS(vec3 pos) {
@@ -508,12 +507,12 @@ vec2 octahedronIFS(vec3 pos) {
     float s = 1.0;
     float trap = 1e10;
     float IFS_SCALE = u_oc_ifs_scale;
-    float scY = (u_oc_scale_y > 0.001) ? u_oc_scale_y : IFS_SCALE;
-    float scZ = (u_oc_scale_z > 0.001) ? u_oc_scale_z : IFS_SCALE;
+    float scY = (u_oc_scale_y > 0.0) ? u_oc_scale_y : IFS_SCALE;
+    float scZ = (u_oc_scale_z > 0.0) ? u_oc_scale_z : IFS_SCALE;
     vec3 off = vec3(
-        (u_oc_offset_x > 0.0001) ? u_oc_offset_x : u_offset_x * u_oc_offset_uni,
-        (u_oc_offset_y > 0.0001) ? u_oc_offset_y : u_offset_y * u_oc_offset_uni,
-        (u_oc_offset_z > 0.0001) ? u_oc_offset_z : u_offset_z * u_oc_offset_uni
+        (u_oc_offset_x > 0.0) ? u_oc_offset_x : u_oc_offset_uni,
+        (u_oc_offset_y > 0.0) ? u_oc_offset_y : u_oc_offset_uni,
+        (u_oc_offset_z > 0.0) ? u_oc_offset_z : u_oc_offset_uni
     );
     vec3 juliaC = vec3(u_oc_julia_x, u_oc_julia_y, u_oc_julia_z);
     for (int i = 0; i < u_iterations; i++) {
@@ -554,14 +553,14 @@ vec2 mandelbulb(vec3 pos) {
     float r = 0.0;
     float pw = max(u_mb2_power, 1.0);
     float bail = u_mb2_bailout;
-    if (u_mb2_abs_x == 1) p.x = abs(p.x);
-    if (u_mb2_abs_y == 1) p.y = abs(p.y);
-    if (u_mb2_abs_z == 1) p.z = abs(p.z);
     for (int i = 0; i < u_iterations; i++) {
         r = length(p);
         if (r > bail) break;
         if (u_mb2_rot_per_iter > 0.0001) p = rotY(u_mb2_rot_per_iter * float(i)) * p;
-        float theta = acos(clamp(p.z / r, -1.0, 1.0));
+        if (u_mb2_abs_x == 1) p.x = abs(p.x);
+        if (u_mb2_abs_y == 1) p.y = abs(p.y);
+        if (u_mb2_abs_z == 1) p.z = abs(p.z);
+        float theta = acos(clamp(p.z / max(r, 1e-9), -1.0, 1.0));
         float phi   = atan(p.y, p.x);
         dr = pow(r, pw - 1.0) * pw * dr + 1.0;
         float zr = pow(r, pw);
@@ -570,11 +569,13 @@ vec2 mandelbulb(vec3 pos) {
         float thetaFin = mix(thetaSph, thetaCyl, u_mb2_polar_mix);
         phi   *= pw;
         vec3 np = zr * vec3(sin(thetaFin)*cos(phi), sin(thetaFin)*sin(phi), cos(thetaFin));
-        if (u_mb2_fold_type == 1) {
+        if (u_mb2_fold_type == 1 && u_mb2_fold_strength > 0.0) {
             float fs = u_mb2_fold_strength;
             np = clamp(np, -fs, fs) * 2.0 - np;
-        } else if (u_mb2_fold_type == 2) {
+            dr *= 2.0;
+        } else if (u_mb2_fold_type == 2 && u_mb2_fold_strength > 0.0) {
             np = abs(np + u_mb2_fold_strength) - abs(np - u_mb2_fold_strength) - np;
+            dr *= 2.0;
         }
         if (u_mb2_julia_mode == 1) {
             p = np + vec3(u_mb2_julia_x, u_mb2_julia_y, u_mb2_julia_z);
@@ -593,9 +594,9 @@ vec2 pseudoKleinian(vec3 pos) {
     float kscale = u_kl_scale;
     vec3  c = vec3(u_kl_cx, u_kl_cy, u_kl_cz);
     float fl = u_kl_fold_limit;
-    float flX = (u_kl_fold_limit_x > 0.001) ? u_kl_fold_limit_x : fl;
-    float flY = (u_kl_fold_limit_y > 0.001) ? u_kl_fold_limit_y : fl;
-    float flZ = (u_kl_fold_limit_z > 0.001) ? u_kl_fold_limit_z : fl;
+    float flX = (u_kl_fold_limit_x > 0.0) ? u_kl_fold_limit_x : fl;
+    float flY = (u_kl_fold_limit_y > 0.0) ? u_kl_fold_limit_y : fl;
+    float flZ = (u_kl_fold_limit_z > 0.0) ? u_kl_fold_limit_z : fl;
     float sr = u_kl_sph_radius;
     vec3 klOff = vec3(u_kl_offset_x, u_kl_offset_y, u_kl_offset_z);
     for (int i = 0; i < u_iterations; i++) {
@@ -617,7 +618,8 @@ vec2 pseudoKleinian(vec3 pos) {
         if (r2 > u_bailout * u_bailout) break;
     }
     float d = (length(p) - abs(kscale - 1.0)) / abs(dr);
-    return vec2(mix(d, d * 0.5, u_kl_mix_factor) * u_de_multiplier, trap);
+    float d2 = length(p) / abs(dr);
+    return vec2(mix(d, d2, clamp(u_kl_mix_factor, 0.0, 1.0)) * u_de_multiplier, trap);
 }
 
 vec3 applySpaceOps(vec3 p) {
@@ -687,14 +689,15 @@ vec2 sceneDist(vec3 p) {
     return pseudoKleinian(p);
 }
 
-vec3 calcNormal(vec3 p) {
-    float e = u_normal_eps;
+vec3 calcNormalEps(vec3 p, float e) {
     if (u_feat_normals_full == 1) {
-        return normalize(vec3(
-            sceneDist(p+vec3(e,0,0)).x - sceneDist(p-vec3(e,0,0)).x,
-            sceneDist(p+vec3(0,e,0)).x - sceneDist(p-vec3(0,e,0)).x,
-            sceneDist(p+vec3(0,0,e)).x - sceneDist(p-vec3(0,0,e)).x
-        ));
+        vec2 k = vec2(1.0, -1.0);
+        return normalize(
+            k.xyy * sceneDist(p + k.xyy*e).x +
+            k.yyx * sceneDist(p + k.yyx*e).x +
+            k.yxy * sceneDist(p + k.yxy*e).x +
+            k.xxx * sceneDist(p + k.xxx*e).x
+        );
     } else {
         float base = sceneDist(p).x;
         return normalize(vec3(
@@ -705,34 +708,45 @@ vec3 calcNormal(vec3 p) {
     }
 }
 
+vec3 calcNormal(vec3 p) {
+    return calcNormalEps(p, u_normal_eps);
+}
+
 float softShadow(vec3 ro, vec3 rd, float mint, float maxt, float k) {
-    float res = 1.0;
-    float t = mint;
-    int ns = clamp(u_shadow_steps, 4, 64);
+    float res  = 1.0;
+    float t    = mint;
+    float ph   = 1e10;
+    int   ns   = clamp(u_shadow_steps, 4, 64);
     for (int i = 0; i < 64; i++) {
         if (i >= ns) break;
-        float h = sceneDist(ro + rd*t).x;
-        if (h < 0.0001) return 0.0;
-        res = min(res, k * h / t);
-        t += clamp(h, 0.01, 0.2);
+        float h = sceneDist(ro + rd * t).x;
+        float shadowHitEps = max(0.0001, t * 0.0001);
+        if (h < shadowHitEps) return 0.0;
+        float y = h * h / (2.0 * ph);
+        float d = sqrt(h * h - y * y);
+        res = min(res, k * d / max(t - y, 0.0001));
+        ph  = h;
+        t  += clamp(h, 0.005, 0.3);
         if (t > maxt) break;
     }
     return clamp(res, 0.0, 1.0);
 }
 
-float ambientOcclusion(vec3 p, vec3 n) {
+float ambientOcclusion(vec3 p, vec3 n, float dist) {
     if (u_feat_ao == 0) return 1.0;
-    float occ = 0.0, scale = 1.0;
-    int ns = clamp(u_ao_samples, 1, 16);
-    float stepBase = u_ao_radius * u_ao_step_scale;
+    float occ     = 0.0;
+    float scale   = 1.0;
+    int   ns      = clamp(u_ao_samples, 1, 16);
+    float minStep = max(u_ao_radius * u_ao_step_scale * 0.05, dist * 0.002);
+    float stepInc = u_ao_radius * u_ao_step_scale / float(ns);
     for (int i = 0; i < 16; i++) {
         if (i >= ns) break;
-        float h = stepBase * 0.1 + stepBase * float(i) / float(ns);
-        float d = sceneDist(p + n*h).x;
+        float h = minStep + stepInc * float(i);
+        float d = sceneDist(p + n * h).x;
         occ += (h - d) * scale;
-        scale *= 0.95;
+        scale *= 0.9;
     }
-    return clamp(1.0 - 3.0*occ * u_ao_strength, 0.0, 1.0);
+    return clamp(1.0 - 3.0 * occ * u_ao_strength, 0.0, 1.0);
 }
 
 vec3 palette(float t) {
@@ -865,42 +879,70 @@ vec3 castRay(vec2 uv, float t) {
     float trap      = 0.0;
     int   steps     = 0;
     bool  hit       = false;
-    float hitEps    = u_hit_eps * 0.001;
+    float absHitEps = u_hit_eps * 0.001;
     int   ms        = clamp(u_max_steps, 4, MAX_STEPS);
     float md        = max(u_max_dist, 1.0);
     float prevD     = 1e10;
+    float prevT     = 0.0;
 
     for (int i = 0; i < MAX_STEPS; i++) {
         if (i >= ms) break;
-        vec3 p   = ro + rd * totalDist;
-        vec2 res = sceneDist(p);
-        float d  = res.x;
-        trap     = res.y;
-        minDist  = min(minDist, d);
-        if (d < hitEps) { hit = true; steps = i; break; }
+        vec3  p   = ro + rd * totalDist;
+        vec2  res = sceneDist(p);
+        float d   = res.x;
+        trap = res.y;
+        if (d < minDist) minDist = d;
+
+        if (d < absHitEps) { hit = true; steps = i; break; }
         if (totalDist > md) break;
-        float stepD = d * u_step_scale;
+
+        float stepD;
         if (u_rm_overrelax == 1) {
             float candD = d * u_overrelax_factor;
-            if (candD < prevD * 2.0) stepD = candD;
+            if (candD + d < prevD + 1e-5) {
+                stepD = candD;
+            } else {
+                stepD = d * u_step_scale;
+            }
+        } else {
+            stepD = d * u_step_scale;
         }
-        totalDist += stepD;
+        stepD = max(stepD, absHitEps * 0.1);
+        prevT = totalDist;
         prevD = d;
+        totalDist += stepD;
         steps = i;
+    }
+
+    if (hit && prevD > absHitEps) {
+        float tLo = prevT;
+        float tHi = totalDist;
+        for (int b = 0; b < 12; b++) {
+            float tMid = (tLo + tHi) * 0.5;
+            float dMid = sceneDist(ro + rd * tMid).x;
+            if (dMid < absHitEps) {
+                tHi = tMid;
+            } else {
+                tLo = tMid;
+            }
+        }
+        totalDist = tHi;
     }
 
     vec3 bg = background(rd, t);
     vec3 col;
+    vec3 lightDir = u_light_dir;
     if (hit) {
         vec3 p   = ro + rd * totalDist;
-        vec3 n   = calcNormal(p);
-        vec3 lightDir = normalize(u_light_dir);
+        float adaptEps = max(u_normal_eps, absHitEps * 2.0);
+        vec3 n   = calcNormalEps(p, adaptEps);
 
         float diff   = max(dot(n, lightDir), 0.0);
         float spec   = pow(max(dot(reflect(-lightDir, n), -rd), 0.0), u_specular_power);
-        float ao     = ambientOcclusion(p, n);
+        float ao     = ambientOcclusion(p, n, totalDist);
+        float adaptMint = max(u_shadow_mint, absHitEps * 8.0);
         float shadow = (u_feat_shadows == 1 && u_shadows == 1)
-                       ? softShadow(p, lightDir, u_shadow_mint, u_shadow_maxt, u_shadow_soft) : 1.0;
+                       ? softShadow(p, lightDir, adaptMint, u_shadow_maxt, u_shadow_soft) : 1.0;
 
         float colorParam;
         if (u_color_mode == 0)      colorParam = float(steps) / float(u_iterations * 2);
@@ -920,7 +962,7 @@ vec3 castRay(vec2 uv, float t) {
         col += baseCol * u_glow_intensity * 0.04;
 
         if (u_feat_second_light == 1) {
-            vec3 ld2   = normalize(u_light2_dir);
+            vec3 ld2   = u_light2_dir;
             float d2   = max(dot(n, ld2), 0.0);
             float sp2  = pow(max(dot(reflect(-ld2, n), -rd), 0.0), u_specular_power);
             col += (baseCol * d2 + sp2 * u_specular_strength) * u_light2_color * u_light2_strength;
@@ -968,7 +1010,7 @@ vec3 castRay(vec2 uv, float t) {
 void main() {
     float aspect  = u_resolution.x / u_resolution.y;
     float t       = u_animate == 1 ? u_time * u_anim_speed : 0.0;
-    vec2  pixSize = vec2(1.0 / u_resolution.x, 1.0 / u_resolution.y);
+    vec2  pixSize = 1.0 / u_resolution;
 
     vec3 col = vec3(0.0);
     if (u_aa_samples <= 1) {
@@ -1152,7 +1194,7 @@ class FractalParams:
         self.julia_y      = -0.5
         self.julia_z      = -0.5
         self.fractal_type = 0
-        self.bailout      = 20.0
+        self.bailout      = 100.0
         self.min_dist     = 1.0
         self.fog_density  = 0.5
         self.color1       = (0.5, 0.5, 0.5)
@@ -1174,9 +1216,9 @@ class FractalParams:
         self.mb_sphere_inner  = 0.25
         self.mb_sphere_outer  = 1.0
         self.mb_fixed_radius  = 1.0
-        self.mb_color_scale   = 0.5
+        self.mb_color_scale   = 5.0
         self.mb_rot_per_iter  = 0.0
-        self.mb_fold_mode     = 0   # 0=clamp 1=abs 2=sin
+        self.mb_fold_mode     = 0
         # --- Menger Sponge fine-tune ---
         self.ms_cross_width   = 1.0
         self.ms_scale         = 3.0
@@ -1202,7 +1244,7 @@ class FractalParams:
         self.oc_rot_z         = 0.0
         # --- Mandelbulb fine-tune ---
         self.mb2_power        = 8.0
-        self.mb2_bailout      = 4.0
+        self.mb2_bailout      = 2.0
         self.mb2_julia_x      = 0.0
         self.mb2_julia_y      = 0.0
         self.mb2_julia_z      = 0.0
@@ -1211,8 +1253,8 @@ class FractalParams:
         self.mb2_fold_type    = 0
         # --- Pseudo-Kleinian fine-tune ---
         self.kl_scale         = 1.5
-        self.kl_cx            = 0.0
-        self.kl_cy            = 0.0
+        self.kl_cx            = 0.3
+        self.kl_cy            = 0.3
         self.kl_cz            = 0.0
         self.kl_fold_limit    = 1.0
         self.kl_sph_radius    = 0.5
@@ -1315,18 +1357,18 @@ class FractalParams:
         self.color_anim_speed = 0.05
         self.color_offset     = 0.0
         # --- Raymarching ---
-        self.step_scale       = 0.5
-        self.normal_eps       = 0.001
+        self.step_scale       = 0.85
+        self.normal_eps       = 0.0005
         self.reflection       = 0.0
         self.max_steps        = 200
         self.max_dist         = 100.0
-        self.hit_eps          = 1.0
+        self.hit_eps          = 0.5
         self.shadow_steps     = 32
         self.shadow_mint      = 0.02
         self.shadow_maxt      = 10.0
         self.ao_step_scale    = 1.0
         self.rm_overrelax     = False
-        self.overrelax_factor = 1.6
+        self.overrelax_factor = 1.2
         # --- FOV ---
         self.fov              = 1.5
         # --- AO ---
@@ -1588,7 +1630,7 @@ class InfiniteEvolution:
         ('julia_z',        -15.0, 15.0,   0.5),
         ('mb_fold_limit',    0.2,  2.5,   0.4),
         ('mb_sphere_inner',  0.05, 0.9,   0.3),
-        ('mb_sphere_outer',  0.2,  3.5,   0.25),
+        ('mb_sphere_outer',  0.5,  3.0,   0.25),
         ('mb_rot_per_iter',  0.0,  0.45,  0.2),
         ('rot_x',            0.0,  6.28,  0.15),
         ('rot_y',            0.0,  6.28,  0.15),
@@ -1821,11 +1863,17 @@ def _py_sdf_mandelbox(ox, oy, oz):
     p = _params
     px, py, pz = ox, oy, oz
     dr = 1.0
-    fldx = p.mb_fold_x if p.mb_fold_x > 0.001 else p.mb_fold_limit
-    fldy = p.mb_fold_y if p.mb_fold_y > 0.001 else p.mb_fold_limit
-    fldz = p.mb_fold_z if p.mb_fold_z > 0.001 else p.mb_fold_limit
-    si = p.mb_sphere_inner
-    so = p.mb_sphere_outer * p.mb_fixed_radius
+    fldx = p.mb_fold_x if p.mb_fold_x > 0.0 else p.mb_fold_limit
+    fldy = p.mb_fold_y if p.mb_fold_y > 0.0 else p.mb_fold_limit
+    fldz = p.mb_fold_z if p.mb_fold_z > 0.0 else p.mb_fold_limit
+    si  = p.mb_sphere_inner
+    so  = p.mb_sphere_outer
+    sc  = p.scale
+    absSc = abs(sc)
+    if p.mb_offset_x != 0.0 or p.mb_offset_y != 0.0 or p.mb_offset_z != 0.0:
+        posOff = (p.mb_offset_x, p.mb_offset_y, p.mb_offset_z)
+    else:
+        posOff = (ox, oy, oz)
     for i in range(p.iterations):
         if p.mb_rot_per_iter > 0.0001:
             px, py, pz = _rot_y(px, py, pz, p.mb_rot_per_iter * i)
@@ -1833,31 +1881,28 @@ def _py_sdf_mandelbox(ox, oy, oz):
             px = max(-fldx, min(fldx, px)) * 2.0 - px
             py = max(-fldy, min(fldy, py)) * 2.0 - py
             pz = max(-fldz, min(fldz, pz)) * 2.0 - pz
-        elif p.mb_fold_mode == 1:
+        else:
             px = abs(px + fldx) - abs(px - fldx) - px
             py = abs(py + fldy) - abs(py - fldy) - py
             pz = abs(pz + fldz) - abs(pz - fldz) - pz
-        else:
-            PI = math.pi
-            px = math.sin(px * PI / (2.0 * fldx)) * fldx
-            py = math.sin(py * PI / (2.0 * fldy)) * fldy
-            pz = math.sin(pz * PI / (2.0 * fldz)) * fldz
         r2 = px*px + py*py + pz*pz
-        if r2 < si * si:
-            k = so / si
-            px *= k; py *= k; pz *= k; dr *= k
-        elif r2 < so * so:
-            k = so * so / r2
-            px *= k; py *= k; pz *= k; dr *= k
-        if p.mb_julia_mode == 1:
-            px = px * p.scale + p.julia_x
-            py = py * p.scale + p.julia_y
-            pz = pz * p.scale + p.julia_z
+        r  = math.sqrt(r2)
+        if r < si:
+            sphK = (so * so) / (si * si)
+        elif r < so:
+            sphK = (so * so) / r2
         else:
-            px = px * p.scale + ox * (1.0 - p.scale) * 0.1
-            py = py * p.scale + oy * (1.0 - p.scale) * 0.1
-            pz = pz * p.scale + oz * (1.0 - p.scale) * 0.1
-        dr = dr * abs(p.scale) + 1.0
+            sphK = 1.0
+        px *= sphK; py *= sphK; pz *= sphK; dr *= sphK
+        dr = dr * absSc + 1.0
+        if p.mb_julia_mode == 1:
+            px = px * sc + p.julia_x
+            py = py * sc + p.julia_y
+            pz = pz * sc + p.julia_z
+        else:
+            px = px * sc + posOff[0]
+            py = py * sc + posOff[1]
+            pz = pz * sc + posOff[2]
         if px*px + py*py + pz*pz > p.bailout * p.bailout:
             break
     ln = math.sqrt(px*px + py*py + pz*pz)
@@ -1869,8 +1914,8 @@ def _py_sdf_menger(ox, oy, oz):
     s = 1.0
     ms = p.ms_scale
     mo = p.ms_offset
-    sy = p.ms_scale_y if p.ms_scale_y > 0.001 else ms
-    sz = p.ms_scale_z if p.ms_scale_z > 0.001 else ms
+    sy = p.ms_scale_y if p.ms_scale_y > 0.0 else ms
+    sz = p.ms_scale_z if p.ms_scale_z > 0.0 else ms
     for _ in range(p.iterations):
         if p.ms_twist > 0.001:   px, py, pz = _rot_y(px, py, pz, p.ms_twist)
         if p.ms_rot_x > 0.001:   px, py, pz = _rot_x(px, py, pz, p.ms_rot_x)
@@ -1915,8 +1960,7 @@ def _py_sdf_sierpinski(ox, oy, oz):
         pz = fb * pz - best[2] * (fb - 1.0)
         scale *= fb
     md = max(max(-px-py-pz, px+py-pz), max(-px+py+pz, px-py+pz))
-    r = scale * math.sqrt(3.0)
-    return (md - r) / max(r, 1e-9) * p.de_multiplier
+    return (md - 1.0) / (math.sqrt(3.0) * max(scale, 1e-9)) * p.de_multiplier
 
 def _py_sdf_octa(ox, oy, oz):
     p = _params
@@ -1924,9 +1968,9 @@ def _py_sdf_octa(ox, oy, oz):
     s = 1.0
     ifs_s = p.oc_ifs_scale
     off = p.oc_offset_uni
-    ox2 = p.oc_offset_x if p.oc_offset_x > 0.0001 else p.offset_x * off
-    oy2 = p.oc_offset_y if p.oc_offset_y > 0.0001 else p.offset_y * off
-    oz2 = p.oc_offset_z if p.oc_offset_z > 0.0001 else p.offset_z * off
+    ox2 = p.oc_offset_x if p.oc_offset_x > 0.0 else off
+    oy2 = p.oc_offset_y if p.oc_offset_y > 0.0 else off
+    oz2 = p.oc_offset_z if p.oc_offset_z > 0.0 else off
     for _ in range(p.iterations):
         if p.oc_twist > 0.001: px, py, pz = _rot_y(px, py, pz, p.oc_twist)
         if p.oc_rot_x > 0.001: px, py, pz = _rot_x(px, py, pz, p.oc_rot_x)
@@ -1963,6 +2007,11 @@ def _py_sdf_mandelbulb(ox, oy, oz):
         r = math.sqrt(px*px + py*py + pz*pz)
         if r > bail:
             break
+        if p.mb2_rot_per_iter > 0.0001:
+            px, py, pz = _rot_y(px, py, pz, p.mb2_rot_per_iter * _)
+        if p.mb2_abs_x: px = abs(px)
+        if p.mb2_abs_y: py = abs(py)
+        if p.mb2_abs_z: pz = abs(pz)
         theta = math.acos(max(-1.0, min(1.0, pz / max(r, 1e-9))))
         phi = math.atan2(py, px)
         dr = r**(pw - 1.0) * pw * dr + 1.0
@@ -1975,10 +2024,12 @@ def _py_sdf_mandelbulb(ox, oy, oz):
             np_x = max(-fs, min(fs, np_x)) * 2.0 - np_x
             np_y = max(-fs, min(fs, np_y)) * 2.0 - np_y
             np_z = max(-fs, min(fs, np_z)) * 2.0 - np_z
+            dr *= 2.0
         elif p.mb2_fold_type == 2 and fs > 0.0:
             np_x = abs(np_x + fs) - abs(np_x - fs) - np_x
             np_y = abs(np_y + fs) - abs(np_y - fs) - np_y
             np_z = abs(np_z + fs) - abs(np_z - fs) - np_z
+            dr *= 2.0
         if p.mb2_julia_mode == 1:
             px = np_x + p.mb2_julia_x
             py = np_y + p.mb2_julia_y
@@ -2014,8 +2065,9 @@ def _py_sdf_kleinian(ox, oy, oz):
             break
     ln = math.sqrt(px*px + py*py + pz*pz)
     d = (ln - abs(ksc - 1.0)) / max(abs(dr), 1e-9)
-    mix = p.kl_mix_factor
-    return (d * (1.0 - mix) + d * 0.5 * mix) * p.de_multiplier
+    d2 = ln / max(abs(dr), 1e-9)
+    mix = max(0.0, min(1.0, p.kl_mix_factor))
+    return (d * (1.0 - mix) + d2 * mix) * p.de_multiplier
 
 def _py_sdf_normal(pos, eps=None):
     if eps is None:
@@ -2360,6 +2412,7 @@ class FractalWindow(mglw.WindowConfig):
             raise
         _compile_event.set()
         self._uloc = {name: self.prog[name] for name in self.prog}
+        self._build_uniform_cache()
         verts = np.array([-1,-1, 1,-1, -1,1, 1,1], dtype='f4')
         vbo = self.ctx.buffer(verts)
         self.vao = self.ctx.simple_vertex_array(self.prog, vbo, 'in_position')
@@ -2430,219 +2483,261 @@ class FractalWindow(mglw.WindowConfig):
             self._gl_funcs = vr_mode._load_gl_funcs()
         return self._gl_funcs
 
+    def _build_uniform_cache(self):
+        self._uc = self._uloc
+        _mm3 = self.__mm3_static
+        self.__mm3_static = _mm3
+        self._u_time           = self._uloc.get('u_time')
+        self._u_resolution     = self._uloc.get('u_resolution')
+        self._u_iterations     = self._uloc.get('u_iterations')
+        self._u_scale          = self._uloc.get('u_scale')
+        self._u_rot_mat        = self._uloc.get('u_rot_mat')
+        self._u_fractal_type   = self._uloc.get('u_fractal_type')
+        self._u_cam_pos        = self._uloc.get('u_cam_pos')
+        self._u_cam_fwd        = self._uloc.get('u_cam_fwd')
+        self._u_cam_right      = self._uloc.get('u_cam_right')
+        self._u_cam_up         = self._uloc.get('u_cam_up')
+        self._u_fov            = self._uloc.get('u_fov')
+        self._u_color1         = self._uloc.get('u_color1')
+        self._u_color2         = self._uloc.get('u_color2')
+        self._u_color3         = self._uloc.get('u_color3')
+        self._u_bg_color1      = self._uloc.get('u_bg_color1')
+        self._u_bg_color2      = self._uloc.get('u_bg_color2')
+        self._u_fog_color      = self._uloc.get('u_fog_color')
+
+    @staticmethod
+    def __mm3_static(a, b):
+        return (
+            a[0]*b[0]+a[1]*b[3]+a[2]*b[6],
+            a[0]*b[1]+a[1]*b[4]+a[2]*b[7],
+            a[0]*b[2]+a[1]*b[5]+a[2]*b[8],
+            a[3]*b[0]+a[4]*b[3]+a[5]*b[6],
+            a[3]*b[1]+a[4]*b[4]+a[5]*b[7],
+            a[3]*b[2]+a[4]*b[5]+a[5]*b[8],
+            a[6]*b[0]+a[7]*b[3]+a[8]*b[6],
+            a[6]*b[1]+a[7]*b[4]+a[8]*b[7],
+            a[6]*b[2]+a[7]*b[5]+a[8]*b[8],
+        )
+
     def _set_shared_uniforms(self, p, elapsed, fwd, right, up, render_pos):
         s = self._set
+        uc = self._uloc
         cx, sx = math.cos(p.rot_x), math.sin(p.rot_x)
         cy, sy = math.cos(p.rot_y), math.sin(p.rot_y)
         cz, sz = math.cos(p.rot_z), math.sin(p.rot_z)
         rx = (1,0,0, 0,cx,-sx, 0,sx,cx)
         ry = (cy,0,sy, 0,1,0, -sy,0,cy)
         rz = (cz,-sz,0, sz,cz,0, 0,0,1)
-        def _mm3(a, b):
-            out = [0.0]*9
-            for r in range(3):
-                for c in range(3):
-                    out[r*3+c] = a[r*3+0]*b[0*3+c]+a[r*3+1]*b[1*3+c]+a[r*3+2]*b[2*3+c]
-            return tuple(out)
+        _mm3 = self.__mm3_static
         rot_mat = _mm3(_mm3(rz, ry), rx)
-        s('u_time',           elapsed)
-        s('u_iterations',     p.iterations)
-        s('u_scale',          p.scale)
-        s('u_fold_x',         1.0 if p.fold_x else 0.0)
-        s('u_fold_y',         1.0 if p.fold_y else 0.0)
-        s('u_fold_z',         1.0 if p.fold_z else 0.0)
-        s('u_rot_x',          p.rot_x)
-        s('u_rot_y',          p.rot_y)
-        s('u_rot_z',          p.rot_z)
-        s('u_rot_mat',        rot_mat)
-        s('u_offset_x',       p.offset_x)
-        s('u_offset_y',       p.offset_y)
-        s('u_offset_z',       p.offset_z)
-        s('u_julia_x',        p.julia_x)
-        s('u_julia_y',        p.julia_y)
-        s('u_julia_z',        p.julia_z)
-        s('u_fractal_type',   p.fractal_type)
-        s('u_bailout',        p.bailout)
-        s('u_min_dist',       p.min_dist)
-        s('u_fog_density',    p.fog_density)
-        s('u_color1',         tuple(self._smooth_color1))
-        s('u_color2',         tuple(self._smooth_color2))
-        s('u_color3',         tuple(self._smooth_color3))
-        s('u_color_mode',     p.color_mode)
-        s('u_ao_strength',    p.ao_strength)
-        s('u_shadow_soft',    p.shadow_soft)
-        s('u_shadows',        1 if p.shadows else 0)
-        s('u_glow',           p.glow)
-        s('u_cam_pos',        tuple(render_pos))
-        s('u_cam_fwd',        fwd)
-        s('u_cam_right',      right)
-        s('u_cam_up',         up)
-        s('u_animate',        1 if p.animate else 0)
-        s('u_anim_speed',     p.anim_speed)
-        s('u_fov',            p.fov)
-        s('u_de_multiplier',  p.de_multiplier)
-        s('u_orbit_trap_type', p.orbit_trap_type)
-        s('u_fog_color',      tuple(self._smooth_fog_color))
-        s('u_ao_radius',      p.ao_radius)
-        s('u_ao_samples',     p.ao_samples)
-        s('u_glow_intensity', p.glow_intensity)
-        s('u_glow_falloff',   p.glow_falloff)
-        s('u_glow_radius',    p.glow_radius)
-        s('u_rim_strength',   p.rim_strength)
-        s('u_emission',       p.emission)
-        s('u_bg_color1',      tuple(self._smooth_bg_color1))
-        s('u_bg_color2',      tuple(self._smooth_bg_color2))
-        s('u_bg_mode',        p.bg_mode)
-        s('u_aa_samples',     p.aa_samples)
-        s('u_mb_fold_limit',   p.mb_fold_limit)
-        s('u_mb_sphere_inner', p.mb_sphere_inner)
-        s('u_mb_sphere_outer', p.mb_sphere_outer)
-        s('u_mb_fixed_radius', p.mb_fixed_radius)
-        s('u_mb_color_scale',  p.mb_color_scale)
-        s('u_mb_rot_per_iter', p.mb_rot_per_iter)
-        s('u_mb_fold_mode',    p.mb_fold_mode)
-        s('u_ms_cross_width',  p.ms_cross_width)
-        s('u_ms_scale',        p.ms_scale)
-        s('u_ms_offset',       p.ms_offset)
-        s('u_ms_twist',        p.ms_twist)
-        s('u_ms_sharpness',    p.ms_sharpness)
-        s('u_si_vertex_spread', p.si_vertex_spread)
-        s('u_si_fold_bias',     p.si_fold_bias)
-        s('u_si_twist',         p.si_twist)
-        s('u_si_squash',        p.si_squash)
-        s('u_si_vertex_jitter', p.si_vertex_jitter)
-        s('u_oc_ifs_scale',    p.oc_ifs_scale)
-        s('u_oc_twist',        p.oc_twist)
-        s('u_oc_sharpness',    p.oc_sharpness)
-        s('u_oc_offset_uni',   p.oc_offset_uni)
-        s('u_oc_fold_amount',  p.oc_fold_amount)
-        s('u_oc_offset_x',     p.oc_offset_x)
-        s('u_oc_offset_y',     p.oc_offset_y)
-        s('u_oc_offset_z',     p.oc_offset_z)
-        s('u_oc_rot_x',        p.oc_rot_x)
-        s('u_oc_rot_z',        p.oc_rot_z)
-        s('u_mb2_power',        p.mb2_power)
-        s('u_mb2_bailout',      p.mb2_bailout)
-        s('u_mb2_julia_x',      p.mb2_julia_x)
-        s('u_mb2_julia_y',      p.mb2_julia_y)
-        s('u_mb2_julia_z',      p.mb2_julia_z)
-        s('u_mb2_julia_mode',   p.mb2_julia_mode)
-        s('u_mb2_fold_strength', p.mb2_fold_strength)
-        s('u_mb2_fold_type',    p.mb2_fold_type)
-        s('u_kl_scale',         p.kl_scale)
-        s('u_kl_cx',            p.kl_cx)
-        s('u_kl_cy',            p.kl_cy)
-        s('u_kl_cz',            p.kl_cz)
-        s('u_kl_fold_limit',    p.kl_fold_limit)
-        s('u_kl_sph_radius',    p.kl_sph_radius)
-        s('u_kl_rot_per_iter',  p.kl_rot_per_iter)
-        s('u_kl_mix_factor',    p.kl_mix_factor)
-        s('u_mb_fold_x',        p.mb_fold_x)
-        s('u_mb_fold_y',        p.mb_fold_y)
-        s('u_mb_fold_z',        p.mb_fold_z)
-        s('u_mb_julia_mode',    p.mb_julia_mode)
-        s('u_ms_rot_x',         p.ms_rot_x)
-        s('u_ms_rot_z',         p.ms_rot_z)
-        s('u_ms_scale_y',       p.ms_scale_y)
-        s('u_ms_scale_z',       p.ms_scale_z)
-        s('u_ms_offset_x',      p.ms_offset_x)
-        s('u_ms_offset_y',      p.ms_offset_y)
-        s('u_ms_offset_z',      p.ms_offset_z)
-        s('u_ms_fold_type',     p.ms_fold_type)
-        s('u_ms_fold_abs_amount', p.ms_fold_abs_amount)
-        s('u_si_rot_x',         p.si_rot_x)
-        s('u_si_rot_z',         p.si_rot_z)
-        s('u_si_scale_x',       p.si_scale_x)
-        s('u_si_scale_y',       p.si_scale_y)
-        s('u_si_scale_z',       p.si_scale_z)
-        s('u_si_offset_x',      p.si_offset_x)
-        s('u_si_offset_y',      p.si_offset_y)
-        s('u_si_offset_z',      p.si_offset_z)
-        s('u_si_rot_y',         p.si_rot_y)
-        s('u_mb_scale_x',       p.mb_scale_x)
-        s('u_mb_scale_y',       p.mb_scale_y)
-        s('u_mb_scale_z',       p.mb_scale_z)
-        s('u_mb_offset_x',      p.mb_offset_x)
-        s('u_mb_offset_y',      p.mb_offset_y)
-        s('u_mb_offset_z',      p.mb_offset_z)
-        s('u_mb_inversion_radius', p.mb_inversion_radius)
-        s('u_mb2_polar_mix',    p.mb2_polar_mix)
-        s('u_mb2_rot_per_iter', p.mb2_rot_per_iter)
-        s('u_mb2_abs_x',        1 if p.mb2_abs_x else 0)
-        s('u_mb2_abs_y',        1 if p.mb2_abs_y else 0)
-        s('u_mb2_abs_z',        1 if p.mb2_abs_z else 0)
-        s('u_oc_scale_y',       p.oc_scale_y)
-        s('u_oc_scale_z',       p.oc_scale_z)
-        s('u_oc_julia_mode',    p.oc_julia_mode)
-        s('u_oc_julia_x',       p.oc_julia_x)
-        s('u_oc_julia_y',       p.oc_julia_y)
-        s('u_oc_julia_z',       p.oc_julia_z)
-        s('u_kl_fold_limit_x',  p.kl_fold_limit_x)
-        s('u_kl_fold_limit_y',  p.kl_fold_limit_y)
-        s('u_kl_fold_limit_z',  p.kl_fold_limit_z)
-        s('u_kl_julia_mode',    p.kl_julia_mode)
-        s('u_kl_offset_x',      p.kl_offset_x)
-        s('u_kl_offset_y',      p.kl_offset_y)
-        s('u_kl_offset_z',      p.kl_offset_z)
-        s('u_sph_inv_enabled',  1 if p.sph_inv_enabled else 0)
-        s('u_sph_inv_radius',   p.sph_inv_radius)
-        s('u_sph_inv_cx',       p.sph_inv_cx)
-        s('u_sph_inv_cy',       p.sph_inv_cy)
-        s('u_sph_inv_cz',       p.sph_inv_cz)
-        s('u_lattice_fold_enabled', 1 if p.lattice_fold_enabled else 0)
-        s('u_lattice_fold_x',   p.lattice_fold_x)
-        s('u_lattice_fold_y',   p.lattice_fold_y)
-        s('u_lattice_fold_z',   p.lattice_fold_z)
-        s('u_warp_enabled',     1 if p.warp_enabled  else 0)
-        s('u_warp_strength',    p.warp_strength)
-        s('u_warp_freq',        p.warp_freq)
-        s('u_warp_type',        p.warp_type)
-        s('u_twist_axis',       p.twist_axis)
-        s('u_twist_amount',     p.twist_amount)
-        s('u_fold_mirror_x',    1 if p.fold_mirror_x else 0)
-        s('u_fold_mirror_y',    1 if p.fold_mirror_y else 0)
-        s('u_fold_mirror_z',    1 if p.fold_mirror_z else 0)
-        s('u_rep_enabled',      1 if p.rep_enabled   else 0)
-        s('u_rep_cell_x',       p.rep_cell_x)
-        s('u_rep_cell_y',       p.rep_cell_y)
-        s('u_rep_cell_z',       p.rep_cell_z)
-        s('u_light_dir',        (p.light_x, p.light_y, p.light_z))
-        s('u_specular_power',   p.specular_power)
-        s('u_specular_strength', p.specular_strength)
-        s('u_ambient',          p.ambient)
-        s('u_subsurface',       p.subsurface)
-        s('u_fresnel_power',    p.fresnel_power)
-        s('u_light2_dir',       (p.light2_x, p.light2_y, p.light2_z))
-        s('u_light2_color',     (p.light2_r, p.light2_g, p.light2_b))
-        s('u_light2_strength',  p.light2_strength)
-        s('u_color_anim_speed', p.color_anim_speed)
-        s('u_color_offset',     p.color_offset)
-        s('u_step_scale',       p.step_scale)
-        s('u_normal_eps',       p.normal_eps)
-        s('u_reflection',       p.reflection)
-        s('u_max_steps',        p.max_steps)
-        s('u_max_dist',         p.max_dist)
-        s('u_hit_eps',          p.hit_eps)
-        s('u_shadow_steps',     p.shadow_steps)
-        s('u_shadow_mint',      p.shadow_mint)
-        s('u_shadow_maxt',      p.shadow_maxt)
-        s('u_ao_step_scale',    p.ao_step_scale)
-        s('u_rm_overrelax',     1 if p.rm_overrelax else 0)
-        s('u_overrelax_factor', p.overrelax_factor)
-        s('u_feat_ao',           1 if p.feat_ao           else 0)
-        s('u_feat_shadows',      1 if p.feat_shadows      else 0)
-        s('u_feat_normals_full', 1 if p.feat_normals_full else 0)
-        s('u_feat_second_light', 1 if p.feat_second_light else 0)
-        s('u_feat_fog',          1 if p.feat_fog          else 0)
-        s('u_feat_glow',         1 if p.feat_glow         else 0)
-        s('u_feat_reflection',   1 if p.feat_reflection   else 0)
-        s('u_feat_subsurface',   1 if p.feat_subsurface   else 0)
-        s('u_feat_orbit_trap',   1 if p.feat_orbit_trap   else 0)
-        s('u_star_density',      getattr(p, 'star_density',   0.5))
-        s('u_star_brightness',   getattr(p, 'star_brightness', 1.0))
-        s('u_star_twinkle',      getattr(p, 'star_twinkle',   0.0))
-        s('u_star_size',         getattr(p, 'star_size',      1.0))
-        s('u_milkyway',          1 if getattr(p, 'milkyway', False) else 0)
+
+        def _sv(name, val):
+            u = uc.get(name)
+            if u is not None:
+                u.value = val
+
+        _sv('u_time',           elapsed)
+        _sv('u_iterations',     p.iterations)
+        _sv('u_scale',          p.scale)
+        _sv('u_fold_x',         1.0 if p.fold_x else 0.0)
+        _sv('u_fold_y',         1.0 if p.fold_y else 0.0)
+        _sv('u_fold_z',         1.0 if p.fold_z else 0.0)
+        _sv('u_rot_x',          p.rot_x)
+        _sv('u_rot_y',          p.rot_y)
+        _sv('u_rot_z',          p.rot_z)
+        _sv('u_rot_mat',        rot_mat)
+        _sv('u_offset_x',       p.offset_x)
+        _sv('u_offset_y',       p.offset_y)
+        _sv('u_offset_z',       p.offset_z)
+        _sv('u_julia_x',        p.julia_x)
+        _sv('u_julia_y',        p.julia_y)
+        _sv('u_julia_z',        p.julia_z)
+        _sv('u_fractal_type',   p.fractal_type)
+        _sv('u_bailout',        p.bailout)
+        _sv('u_min_dist',       p.min_dist)
+        _sv('u_fog_density',    p.fog_density)
+        _sv('u_color1',         tuple(self._smooth_color1))
+        _sv('u_color2',         tuple(self._smooth_color2))
+        _sv('u_color3',         tuple(self._smooth_color3))
+        _sv('u_color_mode',     p.color_mode)
+        _sv('u_ao_strength',    p.ao_strength)
+        _sv('u_shadow_soft',    p.shadow_soft)
+        _sv('u_shadows',        1 if p.shadows else 0)
+        _sv('u_glow',           p.glow)
+        _sv('u_cam_pos',        tuple(render_pos))
+        _sv('u_cam_fwd',        fwd)
+        _sv('u_cam_right',      right)
+        _sv('u_cam_up',         up)
+        _sv('u_animate',        1 if p.animate else 0)
+        _sv('u_anim_speed',     p.anim_speed)
+        _sv('u_fov',            p.fov)
+        _sv('u_de_multiplier',  p.de_multiplier)
+        _sv('u_orbit_trap_type', p.orbit_trap_type)
+        _sv('u_fog_color',      tuple(self._smooth_fog_color))
+        _sv('u_ao_radius',      p.ao_radius)
+        _sv('u_ao_samples',     p.ao_samples)
+        _sv('u_glow_intensity', p.glow_intensity)
+        _sv('u_glow_falloff',   p.glow_falloff)
+        _sv('u_glow_radius',    p.glow_radius)
+        _sv('u_rim_strength',   p.rim_strength)
+        _sv('u_emission',       p.emission)
+        _sv('u_bg_color1',      tuple(self._smooth_bg_color1))
+        _sv('u_bg_color2',      tuple(self._smooth_bg_color2))
+        _sv('u_bg_mode',        p.bg_mode)
+        _sv('u_aa_samples',     p.aa_samples)
+        _sv('u_mb_fold_limit',   p.mb_fold_limit)
+        _sv('u_mb_sphere_inner', p.mb_sphere_inner)
+        _sv('u_mb_sphere_outer', p.mb_sphere_outer)
+        _sv('u_mb_fixed_radius', p.mb_fixed_radius)
+        _sv('u_mb_color_scale',  p.mb_color_scale)
+        _sv('u_mb_rot_per_iter', p.mb_rot_per_iter)
+        _sv('u_mb_fold_mode',    p.mb_fold_mode)
+        _sv('u_ms_cross_width',  p.ms_cross_width)
+        _sv('u_ms_scale',        p.ms_scale)
+        _sv('u_ms_offset',       p.ms_offset)
+        _sv('u_ms_twist',        p.ms_twist)
+        _sv('u_ms_sharpness',    p.ms_sharpness)
+        _sv('u_si_vertex_spread', p.si_vertex_spread)
+        _sv('u_si_fold_bias',     p.si_fold_bias)
+        _sv('u_si_twist',         p.si_twist)
+        _sv('u_si_squash',        p.si_squash)
+        _sv('u_si_vertex_jitter', p.si_vertex_jitter)
+        _sv('u_oc_ifs_scale',    p.oc_ifs_scale)
+        _sv('u_oc_twist',        p.oc_twist)
+        _sv('u_oc_sharpness',    p.oc_sharpness)
+        _sv('u_oc_offset_uni',   p.oc_offset_uni)
+        _sv('u_oc_fold_amount',  p.oc_fold_amount)
+        _sv('u_oc_offset_x',     p.oc_offset_x)
+        _sv('u_oc_offset_y',     p.oc_offset_y)
+        _sv('u_oc_offset_z',     p.oc_offset_z)
+        _sv('u_oc_rot_x',        p.oc_rot_x)
+        _sv('u_oc_rot_z',        p.oc_rot_z)
+        _sv('u_mb2_power',        p.mb2_power)
+        _sv('u_mb2_bailout',      p.mb2_bailout)
+        _sv('u_mb2_julia_x',      p.mb2_julia_x)
+        _sv('u_mb2_julia_y',      p.mb2_julia_y)
+        _sv('u_mb2_julia_z',      p.mb2_julia_z)
+        _sv('u_mb2_julia_mode',   p.mb2_julia_mode)
+        _sv('u_mb2_fold_strength', p.mb2_fold_strength)
+        _sv('u_mb2_fold_type',    p.mb2_fold_type)
+        _sv('u_kl_scale',         p.kl_scale)
+        _sv('u_kl_cx',            p.kl_cx)
+        _sv('u_kl_cy',            p.kl_cy)
+        _sv('u_kl_cz',            p.kl_cz)
+        _sv('u_kl_fold_limit',    p.kl_fold_limit)
+        _sv('u_kl_sph_radius',    p.kl_sph_radius)
+        _sv('u_kl_rot_per_iter',  p.kl_rot_per_iter)
+        _sv('u_kl_mix_factor',    p.kl_mix_factor)
+        _sv('u_mb_fold_x',        p.mb_fold_x)
+        _sv('u_mb_fold_y',        p.mb_fold_y)
+        _sv('u_mb_fold_z',        p.mb_fold_z)
+        _sv('u_mb_julia_mode',    p.mb_julia_mode)
+        _sv('u_ms_rot_x',         p.ms_rot_x)
+        _sv('u_ms_rot_z',         p.ms_rot_z)
+        _sv('u_ms_scale_y',       p.ms_scale_y)
+        _sv('u_ms_scale_z',       p.ms_scale_z)
+        _sv('u_ms_offset_x',      p.ms_offset_x)
+        _sv('u_ms_offset_y',      p.ms_offset_y)
+        _sv('u_ms_offset_z',      p.ms_offset_z)
+        _sv('u_ms_fold_type',     p.ms_fold_type)
+        _sv('u_ms_fold_abs_amount', p.ms_fold_abs_amount)
+        _sv('u_si_rot_x',         p.si_rot_x)
+        _sv('u_si_rot_z',         p.si_rot_z)
+        _sv('u_si_scale_x',       p.si_scale_x)
+        _sv('u_si_scale_y',       p.si_scale_y)
+        _sv('u_si_scale_z',       p.si_scale_z)
+        _sv('u_si_offset_x',      p.si_offset_x)
+        _sv('u_si_offset_y',      p.si_offset_y)
+        _sv('u_si_offset_z',      p.si_offset_z)
+        _sv('u_si_rot_y',         p.si_rot_y)
+        _sv('u_mb_scale_x',       p.mb_scale_x)
+        _sv('u_mb_scale_y',       p.mb_scale_y)
+        _sv('u_mb_scale_z',       p.mb_scale_z)
+        _sv('u_mb_offset_x',      p.mb_offset_x)
+        _sv('u_mb_offset_y',      p.mb_offset_y)
+        _sv('u_mb_offset_z',      p.mb_offset_z)
+        _sv('u_mb_inversion_radius', p.mb_inversion_radius)
+        _sv('u_mb2_polar_mix',    p.mb2_polar_mix)
+        _sv('u_mb2_rot_per_iter', p.mb2_rot_per_iter)
+        _sv('u_mb2_abs_x',        1 if p.mb2_abs_x else 0)
+        _sv('u_mb2_abs_y',        1 if p.mb2_abs_y else 0)
+        _sv('u_mb2_abs_z',        1 if p.mb2_abs_z else 0)
+        _sv('u_oc_scale_y',       p.oc_scale_y)
+        _sv('u_oc_scale_z',       p.oc_scale_z)
+        _sv('u_oc_julia_mode',    p.oc_julia_mode)
+        _sv('u_oc_julia_x',       p.oc_julia_x)
+        _sv('u_oc_julia_y',       p.oc_julia_y)
+        _sv('u_oc_julia_z',       p.oc_julia_z)
+        _sv('u_kl_fold_limit_x',  p.kl_fold_limit_x)
+        _sv('u_kl_fold_limit_y',  p.kl_fold_limit_y)
+        _sv('u_kl_fold_limit_z',  p.kl_fold_limit_z)
+        _sv('u_kl_julia_mode',    p.kl_julia_mode)
+        _sv('u_kl_offset_x',      p.kl_offset_x)
+        _sv('u_kl_offset_y',      p.kl_offset_y)
+        _sv('u_kl_offset_z',      p.kl_offset_z)
+        _sv('u_sph_inv_enabled',  1 if p.sph_inv_enabled else 0)
+        _sv('u_sph_inv_radius',   p.sph_inv_radius)
+        _sv('u_sph_inv_cx',       p.sph_inv_cx)
+        _sv('u_sph_inv_cy',       p.sph_inv_cy)
+        _sv('u_sph_inv_cz',       p.sph_inv_cz)
+        _sv('u_lattice_fold_enabled', 1 if p.lattice_fold_enabled else 0)
+        _sv('u_lattice_fold_x',   p.lattice_fold_x)
+        _sv('u_lattice_fold_y',   p.lattice_fold_y)
+        _sv('u_lattice_fold_z',   p.lattice_fold_z)
+        _sv('u_warp_enabled',     1 if p.warp_enabled  else 0)
+        _sv('u_warp_strength',    p.warp_strength)
+        _sv('u_warp_freq',        p.warp_freq)
+        _sv('u_warp_type',        p.warp_type)
+        _sv('u_twist_axis',       p.twist_axis)
+        _sv('u_twist_amount',     p.twist_amount)
+        _sv('u_fold_mirror_x',    1 if p.fold_mirror_x else 0)
+        _sv('u_fold_mirror_y',    1 if p.fold_mirror_y else 0)
+        _sv('u_fold_mirror_z',    1 if p.fold_mirror_z else 0)
+        _sv('u_rep_enabled',      1 if p.rep_enabled   else 0)
+        _sv('u_rep_cell_x',       p.rep_cell_x)
+        _sv('u_rep_cell_y',       p.rep_cell_y)
+        _sv('u_rep_cell_z',       p.rep_cell_z)
+        lx, ly, lz = p.light_x, p.light_y, p.light_z
+        ll = math.sqrt(lx*lx + ly*ly + lz*lz) or 1.0
+        _sv('u_light_dir',        (lx/ll, ly/ll, lz/ll))
+        _sv('u_specular_power',   p.specular_power)
+        _sv('u_specular_strength', p.specular_strength)
+        _sv('u_ambient',          p.ambient)
+        _sv('u_subsurface',       p.subsurface)
+        _sv('u_fresnel_power',    p.fresnel_power)
+        l2x, l2y, l2z = p.light2_x, p.light2_y, p.light2_z
+        ll2 = math.sqrt(l2x*l2x + l2y*l2y + l2z*l2z) or 1.0
+        _sv('u_light2_dir',       (l2x/ll2, l2y/ll2, l2z/ll2))
+        _sv('u_light2_color',     (p.light2_r, p.light2_g, p.light2_b))
+        _sv('u_light2_strength',  p.light2_strength)
+        _sv('u_color_anim_speed', p.color_anim_speed)
+        _sv('u_color_offset',     p.color_offset)
+        _sv('u_step_scale',       p.step_scale)
+        _sv('u_normal_eps',       p.normal_eps)
+        _sv('u_reflection',       p.reflection)
+        _sv('u_max_steps',        p.max_steps)
+        _sv('u_max_dist',         p.max_dist)
+        _sv('u_hit_eps',          p.hit_eps)
+        _sv('u_shadow_steps',     p.shadow_steps)
+        _sv('u_shadow_mint',      p.shadow_mint)
+        _sv('u_shadow_maxt',      p.shadow_maxt)
+        _sv('u_ao_step_scale',    p.ao_step_scale)
+        _sv('u_rm_overrelax',     1 if p.rm_overrelax else 0)
+        _sv('u_overrelax_factor', p.overrelax_factor)
+        _sv('u_feat_ao',           1 if p.feat_ao           else 0)
+        _sv('u_feat_shadows',      1 if p.feat_shadows      else 0)
+        _sv('u_feat_normals_full', 1 if p.feat_normals_full else 0)
+        _sv('u_feat_second_light', 1 if p.feat_second_light else 0)
+        _sv('u_feat_fog',          1 if p.feat_fog          else 0)
+        _sv('u_feat_glow',         1 if p.feat_glow         else 0)
+        _sv('u_feat_reflection',   1 if p.feat_reflection   else 0)
+        _sv('u_feat_subsurface',   1 if p.feat_subsurface   else 0)
+        _sv('u_feat_orbit_trap',   1 if p.feat_orbit_trap   else 0)
+        _sv('u_star_density',      getattr(p, 'star_density',   0.5))
+        _sv('u_star_brightness',   getattr(p, 'star_brightness', 1.0))
+        _sv('u_star_twinkle',      getattr(p, 'star_twinkle',   0.0))
+        _sv('u_star_size',         getattr(p, 'star_size',      1.0))
+        _sv('u_milkyway',          1 if getattr(p, 'milkyway', False) else 0)
 
     def _render_eye_for_vr(self, eye_fbo, ew, eh, eye: dict):
         p = _params
@@ -2946,10 +3041,9 @@ class FractalWindow(mglw.WindowConfig):
             self._fbo_size  = (rw, rh)
 
     def _set(self, name, val):
-        try:
-            self._uloc[name].value = val
-        except KeyError:
-            pass
+        u = self._uloc.get(name)
+        if u is not None:
+            u.value = val
     def _speed_mul(self):
         try:
             import pyglet
@@ -3159,13 +3253,16 @@ class FractalWindow(mglw.WindowConfig):
         fwd, right, up = self._calc_basis()
         elapsed = time.time() - self.start
         _ca = 1.0 - math.exp(-self._COLOR_SMOOTH * ft) if ft > 0.0 else 1.0
-        for _ci in range(3):
-            self._smooth_color1[_ci]    += (p.color1[_ci]    - self._smooth_color1[_ci])    * _ca
-            self._smooth_color2[_ci]    += (p.color2[_ci]    - self._smooth_color2[_ci])    * _ca
-            self._smooth_color3[_ci]    += (p.color3[_ci]    - self._smooth_color3[_ci])    * _ca
-            self._smooth_bg_color1[_ci] += (p.bg_color1[_ci] - self._smooth_bg_color1[_ci]) * _ca
-            self._smooth_bg_color2[_ci] += (p.bg_color2[_ci] - self._smooth_bg_color2[_ci]) * _ca
-            self._smooth_fog_color[_ci] += (p.fog_color[_ci] - self._smooth_fog_color[_ci]) * _ca
+        sc1, sc2, sc3 = self._smooth_color1, self._smooth_color2, self._smooth_color3
+        sbg1, sbg2, sfog = self._smooth_bg_color1, self._smooth_bg_color2, self._smooth_fog_color
+        c1, c2, c3 = p.color1, p.color2, p.color3
+        bg1, bg2, fc = p.bg_color1, p.bg_color2, p.fog_color
+        sc1[0] += (c1[0] - sc1[0]) * _ca;  sc1[1] += (c1[1] - sc1[1]) * _ca;  sc1[2] += (c1[2] - sc1[2]) * _ca
+        sc2[0] += (c2[0] - sc2[0]) * _ca;  sc2[1] += (c2[1] - sc2[1]) * _ca;  sc2[2] += (c2[2] - sc2[2]) * _ca
+        sc3[0] += (c3[0] - sc3[0]) * _ca;  sc3[1] += (c3[1] - sc3[1]) * _ca;  sc3[2] += (c3[2] - sc3[2]) * _ca
+        sbg1[0] += (bg1[0] - sbg1[0]) * _ca; sbg1[1] += (bg1[1] - sbg1[1]) * _ca; sbg1[2] += (bg1[2] - sbg1[2]) * _ca
+        sbg2[0] += (bg2[0] - sbg2[0]) * _ca; sbg2[1] += (bg2[1] - sbg2[1]) * _ca; sbg2[2] += (bg2[2] - sbg2[2]) * _ca
+        sfog[0] += (fc[0] - sfog[0]) * _ca;  sfog[1] += (fc[1] - sfog[1]) * _ca;  sfog[2] += (fc[2] - sfog[2]) * _ca
 
         if p.vr_mode and vr_mode.vr_enabled():
             hx, hy, hz = vr_mode.get_hmd_pos_offset()
@@ -3205,7 +3302,10 @@ class FractalWindow(mglw.WindowConfig):
             return
         self._scene_fbo.use()
         self._scene_fbo.clear(0, 0, 0)
-        self._set('u_resolution', (rw, rh))
+        if self._u_resolution is not None:
+            self._u_resolution.value = (rw, rh)
+        else:
+            self._set('u_resolution', (rw, rh))
         self._set_shared_uniforms(p, elapsed, fwd, right, up, render_pos)
         self.vao.render(moderngl.TRIANGLE_STRIP)
         self.ctx.screen.use()
@@ -3773,7 +3873,7 @@ class ControlGUI(QMainWindow):
         base_layout.setSpacing(2)
         for label, attr, mn, mx, val, step in [
             ("Scale",      'scale',        -3.0, 3.0,  _params.scale,        0.01),
-            ("Bailout",    'bailout',       1.0, 50.0, _params.bailout,       0.1),
+            ("Bailout",    'bailout',       1.0, 200.0, _params.bailout,       1.0),
             ("Min Dist",   'min_dist',      0.1, 5.0,  _params.min_dist,      0.1),
             ("DE Mult",    'de_multiplier', 0.1, 3.0,  _params.de_multiplier, 0.01),
         ]:
@@ -3806,10 +3906,9 @@ class ControlGUI(QMainWindow):
             ("Fold X",        'mb_fold_x',       0.0, 3.0,  _params.mb_fold_x,       0.01),
             ("Fold Y",        'mb_fold_y',       0.0, 3.0,  _params.mb_fold_y,       0.01),
             ("Fold Z",        'mb_fold_z',       0.0, 3.0,  _params.mb_fold_z,       0.01),
-            ("Sph Inner r\u00b2", 'mb_sphere_inner', 0.01,2.0,  _params.mb_sphere_inner, 0.005),
-            ("Sph Outer r\u00b2", 'mb_sphere_outer', 0.1, 5.0,  _params.mb_sphere_outer, 0.01),
-            ("Fixed Radius",  'mb_fixed_radius', 0.1, 4.0,  _params.mb_fixed_radius, 0.01),
-            ("Color Scale",   'mb_color_scale',  0.01,5.0,  _params.mb_color_scale,  0.01),
+            ("Sph Min r",     'mb_sphere_inner', 0.01, 2.0, _params.mb_sphere_inner, 0.005),
+            ("Sph Fixed r",   'mb_sphere_outer', 0.1,  5.0, _params.mb_sphere_outer, 0.01),
+            ("Color Scale",   'mb_color_scale',  0.01,20.0, _params.mb_color_scale,  0.1),
             ("Rot/Iter",      'mb_rot_per_iter', 0.0, 0.5,  _params.mb_rot_per_iter, 0.002),
             ("Scale X",       'mb_scale_x',      0.0, 5.0,  _params.mb_scale_x,      0.01),
             ("Scale Y",       'mb_scale_y',      0.0, 5.0,  _params.mb_scale_y,      0.01),
@@ -3831,7 +3930,7 @@ class ControlGUI(QMainWindow):
         mb_l.addWidget(fold_mode_lbl)
         fold_mode_row = QHBoxLayout()
         self._fold_mode_grp = QButtonGroup(self)
-        for i, name in enumerate(["Clamp", "Abs", "Sin"]):
+        for i, name in enumerate(["Clamp", "Abs"]):
             rb = QRadioButton(name)
             rb.setChecked(i == _params.mb_fold_mode)
             self._fold_mode_grp.addButton(rb, i)
@@ -3868,7 +3967,7 @@ class ControlGUI(QMainWindow):
         ms = _section("MENGER SPONGE FINE-TUNE")
         ms_l = QVBoxLayout(ms)
         ms_l.setSpacing(2)
-        _lbl_hint(ms_l, "IFS scale per axis, cross gap, twist per axis, per-axis offset, fold mode")
+        _lbl_hint(ms_l, "IFS scale=3 is canonical Menger Sponge. Per-axis scale breaks cubic symmetry. Offset=2 is standard.")
         for label, attr, mn, mx, val, step in [
             ("IFS Scale",    'ms_scale',         2.0, 5.0, _params.ms_scale,         0.01),
             ("Scale Y",      'ms_scale_y',       0.0, 5.0, _params.ms_scale_y,       0.01),
@@ -3906,7 +4005,7 @@ class ControlGUI(QMainWindow):
         si = _section("SIERPINSKI FINE-TUNE")
         si_l = QVBoxLayout(si)
         si_l.setSpacing(2)
-        _lbl_hint(si_l, "Vertex spread, fold bias, squash, twist per axis, per-axis scale/offset")
+        _lbl_hint(si_l, "Fold Bias = IFS scale (2.0 = canonical Sierpinski). Vertex spread sets tetrahedron size.")
         for label, attr, mn, mx, val, step in [
             ("Vertex Spread", 'si_vertex_spread', 0.2, 3.0, _params.si_vertex_spread, 0.01),
             ("Fold Bias",     'si_fold_bias',      1.2, 4.0, _params.si_fold_bias,     0.01),
@@ -3934,7 +4033,7 @@ class ControlGUI(QMainWindow):
         oc = _section("OCTAHEDRON IFS FINE-TUNE")
         oc_l = QVBoxLayout(oc)
         oc_l.setSpacing(2)
-        _lbl_hint(oc_l, "IFS scale, per-axis offset/scale, rotation per axis, norm sharpness, Julia mode")
+        _lbl_hint(oc_l, "IFS scale=2 is standard. Norm Sharp=1.0 gives octahedron (L1-norm). Fold Amount=0 = full abs-fold (canonical).")
         for label, attr, mn, mx, val, step in [
             ("IFS Scale",     'oc_ifs_scale',   1.2, 4.0,  _params.oc_ifs_scale,   0.01),
             ("Scale Y",       'oc_scale_y',     0.0, 4.0,  _params.oc_scale_y,     0.01),
@@ -3974,10 +4073,10 @@ class ControlGUI(QMainWindow):
         mb2 = _section("MANDELBULB FINE-TUNE")
         mb2_l = QVBoxLayout(mb2)
         mb2_l.setSpacing(2)
-        _lbl_hint(mb2_l, "Power N (2=sphere, 8=classic), Julia mode, pre-fold, polar mix, rot/iter, conditional abs")
+        _lbl_hint(mb2_l, "Power N: 8 is canonical (classic bulb). Bailout 2.0 is mathematically sufficient. Julia/fold modes approximate DE.")
         for label, attr, mn, mx, val, step in [
             ("Power N",       'mb2_power',        2.0, 16.0, _params.mb2_power,        0.05),
-            ("Bailout",       'mb2_bailout',       1.0, 10.0, _params.mb2_bailout,      0.1),
+            ("Bailout",       'mb2_bailout',       1.0,  6.0, _params.mb2_bailout,      0.05),
             ("Julia X",       'mb2_julia_x',      -2.0, 2.0,  _params.mb2_julia_x,      0.005),
             ("Julia Y",       'mb2_julia_y',      -2.0, 2.0,  _params.mb2_julia_y,      0.005),
             ("Julia Z",       'mb2_julia_z',      -2.0, 2.0,  _params.mb2_julia_z,      0.005),
@@ -4028,9 +4127,9 @@ class ControlGUI(QMainWindow):
         kl = _section("PSEUDO-KLEINIAN FINE-TUNE")
         kl_l = QVBoxLayout(kl)
         kl_l.setSpacing(2)
-        _lbl_hint(kl_l, "Sphere inversion IFS. Scale, C offset, fold limit per axis, sphere radius, Julia mode.")
+        _lbl_hint(kl_l, "Scale must stay in (-2, -1) or (1, 2) for a bounded fractal. C offset drives structure; try cx=0.3, cy=0.3. DE Mix blends two distance estimates.")
         for label, attr, mn, mx, val, step in [
-            ("Scale",        'kl_scale',        0.5,  3.0,  _params.kl_scale,        0.01),
+            ("Scale",        'kl_scale',        0.5,  2.0,  _params.kl_scale,        0.01),
             ("C x",          'kl_cx',          -2.0,  2.0,  _params.kl_cx,           0.005),
             ("C y",          'kl_cy',          -2.0,  2.0,  _params.kl_cy,           0.005),
             ("C z",          'kl_cz',          -2.0,  2.0,  _params.kl_cz,           0.005),
@@ -4205,6 +4304,11 @@ class ControlGUI(QMainWindow):
         setattr(_params, 'fractal_type', idx)
         for ftype, panel in self._fractal_panels.items():
             panel.setVisible(ftype == idx)
+        canonical_bailout = {0: 100.0, 1: 100.0, 2: 100.0, 3: 100.0, 4: 4.0, 5: 100.0}
+        b = canonical_bailout.get(idx, 100.0)
+        _params.bailout = b
+        if hasattr(self, '_sl_bailout'):
+            self._sl_bailout.set_value(b)
     def _build_transform_section(self):
         grp = _section("GLOBAL ROTATION")
         layout = QVBoxLayout(grp)
@@ -4521,13 +4625,13 @@ class ControlGUI(QMainWindow):
         march_l = QVBoxLayout(march_grp)
         march_l.setSpacing(2)
         _lbl_hint(march_l,
-            "Max Steps: budget per ray.  Step Scale: fraction of DE used per step.\n"
-            "Max Dist: ray kill distance.  Hit Eps: surface threshold (* 0.001).")
+            "Step Scale: fraction of DE per step (0.85 default). Hit Eps: surface threshold (* 0.001) — adaptive with distance.\n"
+            "Overrelaxation speeds up marching; factor 1.2 is safe for fractals.")
         for label, attr, mn, mx, val, step in [
             ("Max Steps",  'max_steps',  4,    512,   _params.max_steps,  1),
-            ("Step Scale", 'step_scale', 0.05, 1.5,   _params.step_scale, 0.005),
+            ("Step Scale", 'step_scale', 0.1,  1.5,   _params.step_scale, 0.005),
             ("Max Dist",   'max_dist',   5.0,  500.0, _params.max_dist,   1.0),
-            ("Hit Eps",    'hit_eps',    0.1,  10.0,  _params.hit_eps,    0.05),
+            ("Hit Eps",    'hit_eps',    0.05, 5.0,   _params.hit_eps,    0.025),
         ]:
             sr = SliderRow(label, mn, mx, val, step)
             sr.on_change(lambda v, a=attr: setattr(_params, a, int(round(v)) if a == 'max_steps' else v))
@@ -4543,20 +4647,20 @@ class ControlGUI(QMainWindow):
         )
         overrelax_row.addWidget(self._overrelax_check)
         march_l.addLayout(overrelax_row)
-        sr_or = SliderRow("Relax Factor", 1.0, 2.0, _params.overrelax_factor, 0.01)
+        sr_or = SliderRow("Relax Factor", 1.0, 1.8, _params.overrelax_factor, 0.01)
         sr_or.on_change(lambda v: setattr(_params, 'overrelax_factor', v))
         setattr(self, '_sl_overrelax_factor', sr_or)
         march_l.addWidget(sr_or)
-        _lbl_hint(march_l, "Overrelaxation can speed up marching but may miss thin features.")
+        _lbl_hint(march_l, "Overrelaxation speeds up marching. Factor > 1.3 may cause missed geometry in thin features.")
         layout.addWidget(march_grp)
 
         normals_grp = _section("NORMALS")
         normals_l = QVBoxLayout(normals_grp)
         normals_l.setSpacing(2)
         _lbl_hint(normals_l,
-            "Eps: offset used for finite-difference normal estimation.\n"
-            "Smaller = sharper but more noise-sensitive.")
-        sr_neps = SliderRow("Normal Eps", 0.00005, 0.02, _params.normal_eps, 0.00005)
+            "Eps: finite-difference offset for normals — now adaptive (scales with distance).\n"
+            "Smaller = sharper, more noise-sensitive. 0.0005 default works well for most scenes.")
+        sr_neps = SliderRow("Normal Eps", 0.00005, 0.01, _params.normal_eps, 0.00005)
         sr_neps.on_change(lambda v: setattr(_params, 'normal_eps', v))
         setattr(self, '_sl_normal_eps', sr_neps)
         normals_l.addWidget(sr_neps)
@@ -5129,12 +5233,28 @@ class ControlGUI(QMainWindow):
 
         for attr in [
             'scale', 'bailout', 'min_dist', 'de_multiplier', 'fov',
-            'mb_fold_limit','mb_sphere_inner','mb_sphere_outer','mb_fixed_radius',
+            'mb_fold_limit','mb_sphere_inner','mb_sphere_outer',
             'mb_color_scale','mb_rot_per_iter',
+            'mb_fold_x','mb_fold_y','mb_fold_z',
+            'mb_scale_x','mb_scale_y','mb_scale_z',
+            'mb_offset_x','mb_offset_y','mb_offset_z','mb_inversion_radius',
             'julia_x','julia_y','julia_z',
             'ms_scale','ms_offset','ms_cross_width','ms_twist','ms_sharpness',
+            'ms_scale_y','ms_scale_z','ms_offset_x','ms_offset_y','ms_offset_z',
+            'ms_rot_x','ms_rot_z','ms_fold_abs_amount',
             'si_vertex_spread','si_fold_bias','si_squash','si_twist','si_vertex_jitter',
+            'si_rot_x','si_rot_z','si_rot_y',
+            'si_scale_x','si_scale_y','si_scale_z',
+            'si_offset_x','si_offset_y','si_offset_z',
             'oc_ifs_scale','oc_sharpness','oc_twist','oc_offset_uni','oc_fold_amount',
+            'oc_offset_x','oc_offset_y','oc_offset_z','oc_rot_x','oc_rot_z',
+            'oc_scale_y','oc_scale_z','oc_julia_x','oc_julia_y','oc_julia_z',
+            'mb2_power','mb2_bailout','mb2_julia_x','mb2_julia_y','mb2_julia_z',
+            'mb2_fold_strength','mb2_polar_mix','mb2_rot_per_iter',
+            'kl_scale','kl_cx','kl_cy','kl_cz','kl_fold_limit','kl_sph_radius',
+            'kl_rot_per_iter','kl_mix_factor',
+            'kl_fold_limit_x','kl_fold_limit_y','kl_fold_limit_z',
+            'kl_offset_x','kl_offset_y','kl_offset_z',
             'offset_x','offset_y','offset_z',
             'light_x','light_y','light_z',
             'specular_power','specular_strength','ambient','subsurface','fresnel_power',
@@ -5145,6 +5265,11 @@ class ControlGUI(QMainWindow):
             'shadow_soft','shadow_steps',
             'ao_strength','ao_radius','fog_density','glow',
             'gamma','exposure','saturation',
+            'glow_intensity','glow_falloff','glow_radius','rim_strength','emission',
+            'warp_strength','warp_freq','twist_amount',
+            'rep_cell_x','rep_cell_y','rep_cell_z',
+            'sph_inv_radius','sph_inv_cx','sph_inv_cy','sph_inv_cz',
+            'lattice_fold_x','lattice_fold_y','lattice_fold_z',
         ]:
             sl = getattr(self, f'_sl_{attr}', None)
             if sl is not None:
