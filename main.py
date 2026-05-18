@@ -24,6 +24,7 @@ from moderngl_window.conf import settings as mglw_settings
 
 import app_config
 import vr_mode
+import params_manager
 
 APP_VERSION = "1.9.0"
 
@@ -1709,46 +1710,10 @@ _ZKF_VERSION = 1
 _ZKS_VERSION = 1
 _SAVES_DIR = Path(__file__).parent / "saves"
 
-_FRACTAL_FIELDS = [
-    'iterations', 'scale', 'fold_x', 'fold_y', 'fold_z',
-    'rot_x', 'rot_y', 'rot_z', 'offset_x', 'offset_y', 'offset_z',
-    'julia_x', 'julia_y', 'julia_z', 'fractal_type', 'bailout', 'min_dist',
-    'fog_density', 'color1', 'color2', 'color3', 'color_mode',
-    'ao_strength', 'shadow_soft', 'shadows', 'glow', 'animate', 'anim_speed',
-    'mb_fold_limit', 'mb_sphere_inner', 'mb_sphere_outer', 'mb_fixed_radius',
-    'mb_color_scale', 'mb_rot_per_iter', 'mb_fold_mode',
-    'ms_cross_width', 'ms_scale', 'ms_offset', 'ms_twist', 'ms_sharpness',
-    'si_vertex_spread', 'si_fold_bias', 'si_twist', 'si_squash', 'si_vertex_jitter',
-    'oc_ifs_scale', 'oc_twist', 'oc_sharpness', 'oc_offset_uni', 'oc_fold_amount',
-    'oc_offset_x', 'oc_offset_y', 'oc_offset_z', 'oc_rot_x', 'oc_rot_z',
-    'mb2_power', 'mb2_bailout', 'mb2_julia_x', 'mb2_julia_y', 'mb2_julia_z',
-    'mb2_julia_mode', 'mb2_fold_strength', 'mb2_fold_type',
-    'kl_scale', 'kl_cx', 'kl_cy', 'kl_cz', 'kl_fold_limit', 'kl_sph_radius',
-    'kl_rot_per_iter', 'kl_mix_factor',
-    'qj_cx', 'qj_cy', 'qj_cz', 'qj_cw', 'qj_w_slice', 'qj_bailout',
-    'qj_slice_rot_xw', 'qj_slice_rot_yw', 'qj_slice_rot_zw',
-    'mb_fold_x', 'mb_fold_y', 'mb_fold_z', 'mb_julia_mode',
-    'ms_rot_x', 'ms_rot_z', 'ms_scale_y', 'ms_scale_z',
-    'si_rot_x', 'si_rot_z',
-    'warp_enabled', 'warp_strength', 'warp_freq', 'warp_type',
-    'twist_axis', 'twist_amount',
-    'fold_mirror_x', 'fold_mirror_y', 'fold_mirror_z',
-    'rep_enabled', 'rep_cell_x', 'rep_cell_y', 'rep_cell_z',
-    'orbit_trap_type', 'de_multiplier',
-    'light_x', 'light_y', 'light_z', 'specular_power', 'specular_strength',
-    'ambient', 'subsurface', 'fresnel_power',
-    'light2_x', 'light2_y', 'light2_z', 'light2_r', 'light2_g', 'light2_b', 'light2_strength',
-    'color_anim_speed', 'color_offset',
-    'step_scale', 'normal_eps', 'reflection', 'max_steps', 'max_dist', 'hit_eps',
-    'shadow_steps', 'shadow_mint', 'shadow_maxt', 'ao_step_scale',
-    'rm_overrelax', 'overrelax_factor', 'fov', 'ao_radius', 'ao_samples',
-    'fog_color', 'gamma', 'exposure', 'saturation',
-    'feat_ao', 'feat_shadows', 'feat_normals_full', 'feat_second_light',
-    'feat_fog', 'feat_glow', 'feat_reflection', 'feat_subsurface', 'feat_orbit_trap',
-    'glow_intensity', 'glow_falloff', 'glow_radius', 'rim_strength', 'emission',
-    'bg_color1', 'bg_color2', 'bg_mode', 'aa_samples',
-]
-_SESSION_EXTRA_FIELDS = ['cam_pos', 'cam_yaw', 'cam_pitch', 'cam_roll', 'player_mode']
+_FRACTAL_FIELDS = params_manager.FRACTAL_FIELDS
+_SESSION_EXTRA_FIELDS = params_manager.SESSION_EXTRA_FIELDS
+_INTERP_FLOAT_ATTRS = params_manager.INTERP_FLOAT_ATTRS
+_INTERP_COLOR_ATTRS = params_manager.INTERP_COLOR_ATTRS
 
 def _params_to_dict(fields):
     out = {}
@@ -1798,37 +1763,6 @@ def load_zks(path):
         _player_state.vel = ps['vel']
     if 'on_ground' in ps:
         _player_state.on_ground = ps['on_ground']
-
-INTERP_FLOAT_ATTRS = [
-    'scale', 'rot_x', 'rot_y', 'rot_z',
-    'offset_x', 'offset_y', 'offset_z',
-    'julia_x', 'julia_y', 'julia_z',
-    'bailout', 'min_dist', 'fog_density',
-    'ao_strength', 'ao_radius', 'shadow_soft', 'glow',
-    'anim_speed', 'fov', 'de_multiplier',
-    'glow_intensity', 'glow_falloff', 'glow_radius', 'rim_strength', 'emission',
-    'mb_fold_limit', 'mb_sphere_inner', 'mb_sphere_outer', 'mb_fixed_radius', 'mb_color_scale',
-    'mb_rot_per_iter',
-    'ms_cross_width', 'ms_scale', 'ms_offset', 'ms_twist', 'ms_sharpness',
-    'si_vertex_spread', 'si_fold_bias', 'si_twist', 'si_squash', 'si_vertex_jitter',
-    'oc_ifs_scale', 'oc_twist', 'oc_sharpness', 'oc_offset_uni', 'oc_fold_amount',
-    'oc_offset_x', 'oc_offset_y', 'oc_offset_z', 'oc_rot_x', 'oc_rot_z',
-    'mb2_power', 'mb2_bailout', 'mb2_julia_x', 'mb2_julia_y', 'mb2_julia_z', 'mb2_fold_strength',
-    'kl_scale', 'kl_cx', 'kl_cy', 'kl_cz', 'kl_fold_limit', 'kl_sph_radius', 'kl_rot_per_iter', 'kl_mix_factor',
-    'mb_fold_x', 'mb_fold_y', 'mb_fold_z',
-    'ms_rot_x', 'ms_rot_z', 'ms_scale_y', 'ms_scale_z',
-    'si_rot_x', 'si_rot_z',
-    'warp_strength', 'warp_freq', 'twist_amount',
-    'rep_cell_x', 'rep_cell_y', 'rep_cell_z',
-    'light_x', 'light_y', 'light_z',
-    'specular_power', 'specular_strength', 'ambient', 'subsurface', 'fresnel_power',
-    'light2_x', 'light2_y', 'light2_z', 'light2_r', 'light2_g', 'light2_b', 'light2_strength',
-    'color_anim_speed', 'color_offset',
-    'step_scale', 'normal_eps', 'reflection',
-    'max_dist', 'hit_eps', 'shadow_mint', 'shadow_maxt', 'ao_step_scale', 'overrelax_factor',
-    'gamma', 'exposure', 'saturation',
-]
-INTERP_COLOR_ATTRS = ['color1', 'color2', 'color3', 'bg_color1', 'bg_color2', 'fog_color']
 
 class PresetInterpolator:
     DURATION_MS  = 1200
