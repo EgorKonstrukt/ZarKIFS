@@ -21,11 +21,6 @@ try:
 except ImportError:
     _app_config = None
 
-try:
-    import params_manager as _params_mgr
-except ImportError:
-    _params_mgr = None
-
 ANIM_VERSION = 1
 
 COLORS = {
@@ -120,27 +115,7 @@ PROP_COLOR = 'color'
 PROP_BOOL  = 'bool'
 PROP_INT   = 'int'
 
-if _params_mgr is not None:
-    ALL_PROPERTIES = {}
-    for name, defn in _params_mgr.PARAM_DEFINITIONS.items():
-        if defn.prop_type == _params_mgr.PropType.FLOAT:
-            ptype = PROP_FLOAT
-        elif defn.prop_type == _params_mgr.PropType.COLOR:
-            ptype = PROP_COLOR
-        elif defn.prop_type == _params_mgr.PropType.BOOL:
-            ptype = PROP_BOOL
-        elif defn.prop_type == _params_mgr.PropType.INT:
-            ptype = PROP_INT
-        else:
-            ptype = PROP_FLOAT
-        ALL_PROPERTIES[name] = (ptype, defn.min_val, defn.max_val)
-    
-    ALL_PROPERTIES['cam_pos_x'] = (PROP_FLOAT, -50.0, 50.0)
-    ALL_PROPERTIES['cam_pos_y'] = (PROP_FLOAT, -50.0, 50.0)
-    ALL_PROPERTIES['cam_pos_z'] = (PROP_FLOAT, -50.0, 50.0)
-    ALL_PROPERTIES['light2_color'] = (PROP_COLOR, None, None)
-else:
-    ALL_PROPERTIES = {
+ALL_PROPERTIES = {
     'scale':             (PROP_FLOAT, 0.1,   10.0),
     'iterations':        (PROP_INT,   1,     20),
     'rot_x':             (PROP_FLOAT, -3.14, 3.14),
@@ -289,40 +264,33 @@ else:
     'kl_julia_mode':     (PROP_INT,   0,     1),
 }
 
-if _params_mgr is None:
-    PROP_GROUPS = {
-        'Camera':       ['cam_pos_x', 'cam_pos_y', 'cam_pos_z', 'cam_yaw', 'cam_pitch', 'fov'],
-        'Fractal Core': ['fractal_type', 'iterations', 'scale', 'bailout', 'de_multiplier',
-                         'rot_x', 'rot_y', 'rot_z', 'offset_x', 'offset_y', 'offset_z',
-                         'julia_x', 'julia_y', 'julia_z'],
-        'Colors':       ['color_mode', 'color1', 'color2', 'color3', 'color_offset', 'color_anim_speed'],
-        'Lighting':     ['ambient', 'specular_power', 'specular_strength', 'subsurface', 'fresnel_power',
-                         'light_x', 'light_y', 'light_z', 'light2_x', 'light2_y', 'light2_z',
-                         'light2_strength', 'light2_color', 'shadows'],
-        'Glow & Fog':   ['glow', 'glow_intensity', 'glow_falloff', 'glow_radius', 'rim_strength',
-                         'emission', 'fog_density', 'fog_color'],
-        'Background':   ['bg_mode', 'bg_color1', 'bg_color2'],
-        'Post-Process': ['gamma', 'exposure', 'saturation', 'aa_samples'],
-        'Raymarching':  ['max_steps', 'step_scale', 'normal_eps', 'reflection', 'max_dist',
-                         'hit_eps', 'shadow_steps', 'shadow_soft', 'ao_strength', 'ao_radius'],
-        'Space Ops':    ['warp_enabled', 'warp_strength', 'warp_freq', 'twist_amount',
-                         'rep_enabled', 'rep_cell_x', 'rep_cell_y', 'rep_cell_z',
-                         'fold_mirror_x', 'fold_mirror_y', 'fold_mirror_z'],
-        'Mandelbox':    ['mb_fold_limit', 'mb_sphere_inner', 'mb_sphere_outer',
-                         'mb_fixed_radius', 'mb_rot_per_iter'],
-        'Menger':       ['ms_scale', 'ms_offset', 'ms_twist', 'ms_cross_width'],
-        'Sierpinski':   ['si_vertex_spread', 'si_fold_bias', 'si_squash'],
-        'Octahedron':   ['oc_ifs_scale', 'oc_twist', 'oc_fold_amount'],
-        'Mandelbulb':   ['mb2_power', 'mb2_bailout', 'mb2_fold_strength'],
-        'Kleinian':     ['kl_scale', 'kl_fold_limit', 'kl_sph_radius', 'kl_mix_factor'],
-        'Animation':    ['animate', 'anim_speed'],
-    }
-else:
-    PROP_GROUPS = {}
-    for cat in _params_mgr.get_all_categories():
-        props = list(_params_mgr.get_params_by_category(cat).keys())
-        if props:
-            PROP_GROUPS[cat] = props
+PROP_GROUPS = {
+    'Camera':       ['cam_pos_x', 'cam_pos_y', 'cam_pos_z', 'cam_yaw', 'cam_pitch', 'fov'],
+    'Fractal Core': ['fractal_type', 'iterations', 'scale', 'bailout', 'de_multiplier',
+                     'rot_x', 'rot_y', 'rot_z', 'offset_x', 'offset_y', 'offset_z',
+                     'julia_x', 'julia_y', 'julia_z'],
+    'Colors':       ['color_mode', 'color1', 'color2', 'color3', 'color_offset', 'color_anim_speed'],
+    'Lighting':     ['ambient', 'specular_power', 'specular_strength', 'subsurface', 'fresnel_power',
+                     'light_x', 'light_y', 'light_z', 'light2_x', 'light2_y', 'light2_z',
+                     'light2_strength', 'light2_color', 'shadows'],
+    'Glow & Fog':   ['glow', 'glow_intensity', 'glow_falloff', 'glow_radius', 'rim_strength',
+                     'emission', 'fog_density', 'fog_color'],
+    'Background':   ['bg_mode', 'bg_color1', 'bg_color2'],
+    'Post-Process': ['gamma', 'exposure', 'saturation', 'aa_samples'],
+    'Raymarching':  ['max_steps', 'step_scale', 'normal_eps', 'reflection', 'max_dist',
+                     'hit_eps', 'shadow_steps', 'shadow_soft', 'ao_strength', 'ao_radius'],
+    'Space Ops':    ['warp_enabled', 'warp_strength', 'warp_freq', 'twist_amount',
+                     'rep_enabled', 'rep_cell_x', 'rep_cell_y', 'rep_cell_z',
+                     'fold_mirror_x', 'fold_mirror_y', 'fold_mirror_z'],
+    'Mandelbox':    ['mb_fold_limit', 'mb_sphere_inner', 'mb_sphere_outer',
+                     'mb_fixed_radius', 'mb_rot_per_iter'],
+    'Menger':       ['ms_scale', 'ms_offset', 'ms_twist', 'ms_cross_width'],
+    'Sierpinski':   ['si_vertex_spread', 'si_fold_bias', 'si_squash'],
+    'Octahedron':   ['oc_ifs_scale', 'oc_twist', 'oc_fold_amount'],
+    'Mandelbulb':   ['mb2_power', 'mb2_bailout', 'mb2_fold_strength'],
+    'Kleinian':     ['kl_scale', 'kl_fold_limit', 'kl_sph_radius', 'kl_mix_factor'],
+    'Animation':    ['animate', 'anim_speed'],
+}
 
 KEY_R = 6
 
