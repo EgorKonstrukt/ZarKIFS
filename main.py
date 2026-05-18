@@ -9,23 +9,23 @@ from pathlib import Path
 import moderngl
 import moderngl_window as mglw
 import numpy as np
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QSize
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QSize, QThread
 from PyQt5.QtGui import QColor, QPalette, QIcon, QPixmap, QPainter, QLinearGradient, QBrush, QPen
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QScrollArea,
+    QApplication, QMainWindow, QWidget, QScrollArea, QLineEdit,
     QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QSlider, QRadioButton, QCheckBox, QPushButton,
     QButtonGroup, QGroupBox, QColorDialog, QTabWidget,
     QFileDialog, QInputDialog, QMessageBox, QProgressBar,
     QSizePolicy, QComboBox, QStyle, QDoubleSpinBox,
-    QToolBar, QAction,
+    QToolBar, QAction, QProgressDialog,
 )
 from moderngl_window.conf import settings as mglw_settings
 
 import app_config
 import vr_mode
 
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.9.0"
 
 try:
     from animation_editor import (
@@ -44,6 +44,214 @@ class _GLSignals(QObject):
     ready = pyqtSignal()
     error = pyqtSignal(str)
 _gl_signals = _GLSignals()
+_gl_window_ref = [None]
+_vsync_limiter_last = [0.0]
+
+import queue as _queue_mod
+import collections as _collections_mod
+import threading as _threading_mod
+_video_frame_queue    = _queue_mod.Queue(maxsize=4)
+_video_render_req     = [None]
+_video_render_result  = _queue_mod.Queue(maxsize=1)
+_video_req_event      = _threading_mod.Event()
+_video_rendering_flag = _threading_mod.Event()
+
+
+def _ffmpeg_in_path() -> bool:
+    import shutil
+    return shutil.which('ffmpeg') is not None
+
+
+def _ffmpeg_install_dir() -> Path:
+    return Path(__file__).parent / '_ffmpeg'
+
+
+def _ffmpeg_local_exe() -> Path:
+    if sys.platform == 'win32':
+        return _ffmpeg_install_dir() / 'bin' / 'ffmpeg.exe'
+    return _ffmpeg_install_dir() / 'ffmpeg'
+
+
+def _ensure_ffmpeg_in_env():
+    local = _ffmpeg_local_exe()
+    if local.exists():
+        bin_dir = str(local.parent)
+        if bin_dir not in os.environ.get('PATH', ''):
+            os.environ['PATH'] = bin_dir + os.pathsep + os.environ.get('PATH', '')
+
+
+def _ffmpeg_available() -> bool:
+    _ensure_ffmpeg_in_env()
+    return _ffmpeg_in_path()
+
+
+class FfmpegInstaller(QObject):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+
+    def run(self):
+        try:
+            self._do_install()
+        except Exception as e:
+            import traceback
+            self.finished.emit(False, traceback.format_exc())
+
+    def _do_install(self):
+        import subprocess, zipfile, tarfile, stat, shutil
+
+        install_dir = _ffmpeg_install_dir()
+        install_dir.mkdir(parents=True, exist_ok=True)
+
+        if sys.platform == 'win32':
+            self._install_windows(install_dir, subprocess, zipfile)
+        elif sys.platform == 'darwin':
+            self._install_macos(subprocess)
+        else:
+            self._install_linux(install_dir, subprocess, shutil, tarfile, stat)
+
+        _ensure_ffmpeg_in_env()
+        if not _ffmpeg_available():
+            raise RuntimeError('ffmpeg binary not found after installation.')
+        self.finished.emit(True, 'ffmpeg installed successfully.')
+
+    def _install_windows(self, install_dir, subprocess, zipfile):
+        url = (
+            'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/'
+            'ffmpeg-master-latest-win64-gpl.zip'
+        )
+        archive = install_dir / 'ffmpeg.zip'
+        bin_dir = install_dir / 'bin'
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        dest = bin_dir / 'ffmpeg.exe'
+
+        self.progress.emit('Downloading ffmpeg for Windows...')
+        ps_script = (
+            f'[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; '
+            f'$ProgressPreference = "SilentlyContinue"; '
+            f'Invoke-WebRequest -Uri "{url}" -OutFile "{archive}"'
+        )
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps_script],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f'Download failed:\n{result.stderr[-1000:]}')
+
+        self.progress.emit('Extracting ffmpeg.exe...')
+        with zipfile.ZipFile(str(archive), 'r') as zf:
+            entry = next((m for m in zf.namelist() if m.endswith('/bin/ffmpeg.exe')), None)
+            if entry is None:
+                raise RuntimeError('ffmpeg.exe not found inside zip archive.')
+            data = zf.read(entry)
+            dest.write_bytes(data)
+
+        try:
+            archive.unlink()
+        except Exception:
+            pass
+
+    def _install_macos(self, subprocess):
+        self.progress.emit('Installing ffmpeg via brew...')
+        result = subprocess.run(
+            ['brew', 'install', 'ffmpeg'],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[-1000:])
+
+    def _install_linux(self, install_dir, subprocess, shutil, tarfile, stat):
+        self.progress.emit('Trying package manager...')
+        managers = [
+            ['apt-get', 'install', '-y', 'ffmpeg'],
+            ['dnf',     'install', '-y', 'ffmpeg'],
+            ['pacman',  '-S',  '--noconfirm', 'ffmpeg'],
+            ['zypper',  'install', '-y', 'ffmpeg'],
+        ]
+        for cmd in managers:
+            if shutil.which(cmd[0]):
+                result = subprocess.run(['sudo'] + cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    return
+
+        url = (
+            'https://johnvansickle.com/ffmpeg/releases/'
+            'ffmpeg-release-amd64-static.tar.xz'
+        )
+        archive = install_dir / 'ffmpeg.tar.xz'
+        self.progress.emit('Downloading static ffmpeg build for Linux...')
+        result = subprocess.run(
+            ['curl', '-L', '-o', str(archive), url],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f'Download failed:\n{result.stderr[-500:]}')
+
+        self.progress.emit('Extracting...')
+        with tarfile.open(str(archive), 'r:xz') as tf:
+            for member in tf.getmembers():
+                if member.name.endswith('/ffmpeg') or member.name == 'ffmpeg':
+                    member.name = 'ffmpeg'
+                    tf.extract(member, path=str(install_dir))
+                    break
+        exe = install_dir / 'ffmpeg'
+        exe.chmod(exe.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        try:
+            archive.unlink()
+        except Exception:
+            pass
+
+
+_ffmpeg_installer_refs = []
+
+
+def _run_ffmpeg_installer_dialog(parent=None):
+    if _ffmpeg_available():
+        QMessageBox.information(parent, 'ffmpeg', 'ffmpeg is already installed and available in PATH.')
+        return
+
+    reply = QMessageBox.question(
+        parent,
+        'Install ffmpeg',
+        'ffmpeg is not found in PATH.\n\nDownload and install it automatically?\n'
+        '(~100 MB, placed in the project folder)',
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.Yes,
+    )
+    if reply != QMessageBox.Yes:
+        return
+
+    dlg = QProgressDialog('Preparing...', None, 0, 0, parent)
+    dlg.setWindowTitle('ffmpeg Installer')
+    dlg.setWindowModality(Qt.WindowModal)
+    dlg.setMinimumWidth(420)
+    dlg.setCancelButton(None)
+    dlg.show()
+
+    installer = FfmpegInstaller()
+    thread = QThread()
+    installer.moveToThread(thread)
+    thread.started.connect(installer.run)
+
+    def _on_progress(msg):
+        dlg.setLabelText(msg)
+
+    def _on_finished(ok, msg):
+        thread.quit()
+        thread.wait()
+        dlg.close()
+        _ffmpeg_installer_refs.clear()
+        if ok:
+            QMessageBox.information(parent, 'ffmpeg', msg)
+        else:
+            QMessageBox.critical(parent, 'ffmpeg Install Failed', msg)
+
+    installer.progress.connect(_on_progress)
+    installer.finished.connect(_on_finished)
+
+    _ffmpeg_installer_refs.clear()
+    _ffmpeg_installer_refs.extend([installer, thread, dlg])
+
+    thread.start()
 
 
 VERT_SHADER = """
@@ -288,6 +496,17 @@ uniform int   u_kl_julia_mode;
 uniform float u_kl_offset_x;
 uniform float u_kl_offset_y;
 uniform float u_kl_offset_z;
+
+// --- Quaternion Julia 4D ---
+uniform float u_qj_cx;
+uniform float u_qj_cy;
+uniform float u_qj_cz;
+uniform float u_qj_cw;
+uniform float u_qj_w_slice;
+uniform float u_qj_bailout;
+uniform float u_qj_slice_rot_xw;
+uniform float u_qj_slice_rot_yw;
+uniform float u_qj_slice_rot_zw;
 
 // --- Global space operators ---
 uniform int   u_warp_enabled;
@@ -678,6 +897,56 @@ vec3 applySpaceOps(vec3 p) {
     return p;
 }
 
+vec4 qmul(vec4 a, vec4 b) {
+    return vec4(
+        a.x*b.x - a.y*b.y - a.z*b.z - a.w*b.w,
+        a.x*b.y + a.y*b.x + a.z*b.w - a.w*b.z,
+        a.x*b.z - a.y*b.w + a.z*b.x + a.w*b.y,
+        a.x*b.w + a.y*b.z - a.z*b.y + a.w*b.x
+    );
+}
+
+vec4 qsq(vec4 q) {
+    return vec4(
+        q.x*q.x - q.y*q.y - q.z*q.z - q.w*q.w,
+        2.0*q.x*q.y,
+        2.0*q.x*q.z,
+        2.0*q.x*q.w
+    );
+}
+
+vec2 quaternionJulia(vec3 pos) {
+    float cxw = cos(u_qj_slice_rot_xw);
+    float sxw = sin(u_qj_slice_rot_xw);
+    float cyw = cos(u_qj_slice_rot_yw);
+    float syw = sin(u_qj_slice_rot_yw);
+    float czw = cos(u_qj_slice_rot_zw);
+    float szw = sin(u_qj_slice_rot_zw);
+    float wx = u_qj_w_slice;
+    float wy = pos.x * sxw + wx * cxw;
+    float wz = pos.y * syw + wy * cyw;
+    float w  = pos.z * szw + wz * czw;
+    vec4 q  = vec4(pos.x * cxw - wx * sxw,
+                   pos.y * cyw - wy * syw,
+                   pos.z * czw - wz * szw,
+                   w);
+    vec4 c  = vec4(u_qj_cx, u_qj_cy, u_qj_cz, u_qj_cw);
+    vec4 dq = vec4(1.0, 0.0, 0.0, 0.0);
+    float bail2 = u_qj_bailout * u_qj_bailout;
+    float trap  = 1e10;
+    float r2    = 0.0;
+    for (int i = 0; i < u_iterations; i++) {
+        dq = 2.0 * qmul(q, dq);
+        q  = qsq(q) + c;
+        r2 = dot(q, q);
+        trap = min(trap, orbitTrap(q.xyz, u_qj_bailout * 0.5));
+        if (r2 > bail2) break;
+    }
+    float r  = sqrt(r2);
+    float dr = length(dq);
+    return vec2(0.5 * r * log(max(r, 1e-9)) / max(dr, 1e-9) * u_de_multiplier, trap);
+}
+
 vec2 sceneDist(vec3 p) {
     p = u_rot_mat * p;
     p = applySpaceOps(p);
@@ -686,6 +955,7 @@ vec2 sceneDist(vec3 p) {
     if (u_fractal_type == 2) return sierpinski(p);
     if (u_fractal_type == 3) return octahedronIFS(p);
     if (u_fractal_type == 4) return mandelbulb(p);
+    if (u_fractal_type == 6) return quaternionJulia(p);
     return pseudoKleinian(p);
 }
 
@@ -884,12 +1154,14 @@ vec3 castRay(vec2 uv, float t) {
     float md        = max(u_max_dist, 1.0);
     float prevD     = 1e10;
     float prevT     = 0.0;
+    vec3  p         = ro;
+    float d         = 1e10;
 
     for (int i = 0; i < MAX_STEPS; i++) {
         if (i >= ms) break;
-        vec3  p   = ro + rd * totalDist;
-        vec2  res = sceneDist(p);
-        float d   = res.x;
+        p   = ro + rd * totalDist;
+        vec2 res = sceneDist(p);
+        d   = res.x;
         trap = res.y;
         if (d < minDist) minDist = d;
 
@@ -929,11 +1201,12 @@ vec3 castRay(vec2 uv, float t) {
         totalDist = tHi;
     }
 
-    vec3 bg = background(rd, t);
-    vec3 col;
+    vec3 bg       = background(rd, t);
+    vec3 col      = bg;
     vec3 lightDir = u_light_dir;
+
     if (hit) {
-        vec3 p   = ro + rd * totalDist;
+        p = ro + rd * totalDist;
         float adaptEps = max(u_normal_eps, absHitEps * 2.0);
         vec3 n   = calcNormalEps(p, adaptEps);
 
@@ -962,7 +1235,7 @@ vec3 castRay(vec2 uv, float t) {
         col += baseCol * u_glow_intensity * 0.04;
 
         if (u_feat_second_light == 1) {
-            vec3 ld2   = u_light2_dir;
+            vec3  ld2  = u_light2_dir;
             float d2   = max(dot(n, ld2), 0.0);
             float sp2  = pow(max(dot(reflect(-ld2, n), -rd), 0.0), u_specular_power);
             col += (baseCol * d2 + sp2 * u_specular_strength) * u_light2_color * u_light2_strength;
@@ -987,20 +1260,12 @@ vec3 castRay(vec2 uv, float t) {
             col = mix(fogC, col, fog);
         }
     } else {
-        col = bg;
         if (u_feat_glow == 1) {
-            float falloff = max(u_glow_falloff, 0.1);
-
-            // Single smooth exponential envelope — no discontinuous pieces
-            float d       = max(minDist, 0.0001);
-            float glow    = exp(-d * falloff * u_glow_radius);
-
-            // Use minDist continuously for color to avoid step-count banding
-            // log(d) maps [near..far] to a smooth continuous range
-            float colorT  = clamp(-log(d * falloff + 0.001) * 0.15, 0.0, 1.0)
-                            + t * 0.04;
-            vec3  glowCol = palette(colorT);
-
+            float falloff  = max(u_glow_falloff, 0.1);
+            float gd       = max(minDist, 0.0001);
+            float glow     = exp(-gd * falloff * u_glow_radius);
+            float colorT   = clamp(-log(gd * falloff + 0.001) * 0.15, 0.0, 1.0) + t * 0.04;
+            vec3  glowCol  = palette(colorT);
             col += glowCol * glow * u_glow_intensity * 0.8;
         }
     }
@@ -1059,9 +1324,11 @@ uniform sampler2D u_scene;
 uniform float u_gamma;
 uniform float u_exposure;
 uniform float u_saturation;
+uniform int   u_flip_y;
 
 void main() {
-    vec3 col = texture(u_scene, v_uv).rgb;
+    vec2 uv = u_flip_y != 0 ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
+    vec3 col = texture(u_scene, uv).rgb;
 
     col *= u_exposure;
 
@@ -1309,6 +1576,15 @@ class FractalParams:
         self.kl_offset_x      = 0.0
         self.kl_offset_y      = 0.0
         self.kl_offset_z      = 0.0
+        self.qj_cx            = -0.2
+        self.qj_cy            =  0.6
+        self.qj_cz            =  0.2
+        self.qj_cw            =  0.2
+        self.qj_w_slice       =  0.0
+        self.qj_bailout       =  4.0
+        self.qj_slice_rot_xw  =  0.0
+        self.qj_slice_rot_yw  =  0.0
+        self.qj_slice_rot_zw  =  0.0
         self.sph_inv_enabled  = False
         self.sph_inv_radius   = 1.0
         self.sph_inv_cx       = 0.0
@@ -1404,12 +1680,16 @@ class FractalParams:
         self.aa_samples       = 1   # 1=off 2=4xRGSS 3=9x
         # --- Screenshot ---
         self.screenshot_requested = False
+        self.screenshot_width     = 0
+        self.screenshot_height    = 0
         self.player_mode = False
         # --- Render resolution ---
         self.render_scale        = 100
         self.dyn_res_enabled     = False
         self.dyn_res_target_fps  = 60
         self.dyn_res_min_fps     = 30
+        self.vsync               = False
+        self.fps_cap             = 0
 
         self.vr_mode = False
         # --- VR settings ---
@@ -1445,6 +1725,8 @@ _FRACTAL_FIELDS = [
     'mb2_julia_mode', 'mb2_fold_strength', 'mb2_fold_type',
     'kl_scale', 'kl_cx', 'kl_cy', 'kl_cz', 'kl_fold_limit', 'kl_sph_radius',
     'kl_rot_per_iter', 'kl_mix_factor',
+    'qj_cx', 'qj_cy', 'qj_cz', 'qj_cw', 'qj_w_slice', 'qj_bailout',
+    'qj_slice_rot_xw', 'qj_slice_rot_yw', 'qj_slice_rot_zw',
     'mb_fold_x', 'mb_fold_y', 'mb_fold_z', 'mb_julia_mode',
     'ms_rot_x', 'ms_rot_z', 'ms_scale_y', 'ms_scale_z',
     'si_rot_x', 'si_rot_z',
@@ -1646,6 +1928,13 @@ class InfiniteEvolution:
         ('oc_twist',         0.0,  0.28,  0.15),
         ('oc_fold_amount',   0.0,  1.0,   0.25),
         ('oc_offset_uni',    0.15, 2.8,   0.2),
+        ('qj_cx',           -0.8,  0.8,   0.2),
+        ('qj_cy',           -0.8,  0.8,   0.2),
+        ('qj_cz',           -0.8,  0.8,   0.15),
+        ('qj_cw',           -0.8,  0.8,   0.15),
+        ('qj_w_slice',      -1.5,  1.5,   0.3),
+        ('qj_slice_rot_xw', -3.14, 3.14,  0.1),
+        ('qj_slice_rot_yw', -3.14, 3.14,  0.1),
         ('glow_intensity',   0.5, 18.0,   0.15),
         ('emission',         0.0,  2.8,   0.1),
         ('rim_strength',     0.0,  2.5,   0.12),
@@ -1857,6 +2146,7 @@ def _py_sdf(pos):
     elif ft == 2: return _py_sdf_sierpinski(px, py, pz)
     elif ft == 3: return _py_sdf_octa(px, py, pz)
     elif ft == 4: return _py_sdf_mandelbulb(px, py, pz)
+    elif ft == 6: return _py_sdf_qjulia(px, py, pz)
     else:         return _py_sdf_kleinian(px, py, pz)
 
 def _py_sdf_mandelbox(ox, oy, oz):
@@ -2068,6 +2358,40 @@ def _py_sdf_kleinian(ox, oy, oz):
     d2 = ln / max(abs(dr), 1e-9)
     mix = max(0.0, min(1.0, p.kl_mix_factor))
     return (d * (1.0 - mix) + d2 * mix) * p.de_multiplier
+
+def _py_sdf_qjulia(ox, oy, oz):
+    p = _params
+    cxw = math.cos(p.qj_slice_rot_xw); sxw = math.sin(p.qj_slice_rot_xw)
+    cyw = math.cos(p.qj_slice_rot_yw); syw = math.sin(p.qj_slice_rot_yw)
+    czw = math.cos(p.qj_slice_rot_zw); szw = math.sin(p.qj_slice_rot_zw)
+    wx = p.qj_w_slice
+    wy = ox * sxw + wx * cxw
+    wz = oy * syw + wy * cyw
+    w  = oz * szw + wz * czw
+    qx = ox * cxw - wx * sxw
+    qy = oy * cyw - wy * syw
+    qz = oz * czw - wz * szw
+    qw = w
+    cx, cy, cz, cw = p.qj_cx, p.qj_cy, p.qj_cz, p.qj_cw
+    dx, dy, dz, dw = 1.0, 0.0, 0.0, 0.0
+    bail2 = p.qj_bailout * p.qj_bailout
+    for _ in range(p.iterations):
+        ndx = 2.0*(qx*dx - qy*dy - qz*dz - qw*dw)
+        ndy = 2.0*(qx*dy + qy*dx + qz*dw - qw*dz)
+        ndz = 2.0*(qx*dz - qy*dw + qz*dx + qw*dy)
+        ndw = 2.0*(qx*dw + qy*dz - qz*dy + qw*dx)
+        dx, dy, dz, dw = ndx, ndy, ndz, ndw
+        nqx = qx*qx - qy*qy - qz*qz - qw*qw + cx
+        nqy = 2.0*qx*qy + cy
+        nqz = 2.0*qx*qz + cz
+        nqw = 2.0*qx*qw + cw
+        qx, qy, qz, qw = nqx, nqy, nqz, nqw
+        r2 = qx*qx + qy*qy + qz*qz + qw*qw
+        if r2 > bail2:
+            break
+    r  = math.sqrt(max(r2, 1e-18))
+    dr = math.sqrt(dx*dx + dy*dy + dz*dz + dw*dw)
+    return 0.5 * r * math.log(max(r, 1e-9)) / max(dr, 1e-9) * p.de_multiplier
 
 def _py_sdf_normal(pos, eps=None):
     if eps is None:
@@ -2403,6 +2727,7 @@ class FractalWindow(mglw.WindowConfig):
     SMOOTHING        = 12.0
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        _gl_window_ref[0] = self
         try:
             self.prog = self.ctx.program(vertex_shader=VERT_SHADER,
                                          fragment_shader=FRAG_SHADER)
@@ -2459,6 +2784,14 @@ class FractalWindow(mglw.WindowConfig):
         self._vr_fbos           = [None, None]
         self._gl_funcs          = None
         _interpolator.set_smooth_color_source(self._get_smooth_colors)
+
+        self._vid_fbo_size   = (0, 0)
+        self._vid_scene_bufs = [None, None]
+        self._vid_out_bufs   = [None, None]
+        self._vid_buf_idx    = 0
+        self._vid_pbos       = [None, None]
+        self._vid_pbo_size   = 0
+        self._vid_pbo_ready  = [False, False]
 
     def _ensure_vr_fbos(self, w, h):
         if self._vr_fbo_size == (w, h):
@@ -2675,6 +3008,15 @@ class FractalWindow(mglw.WindowConfig):
         _sv('u_kl_offset_x',      p.kl_offset_x)
         _sv('u_kl_offset_y',      p.kl_offset_y)
         _sv('u_kl_offset_z',      p.kl_offset_z)
+        _sv('u_qj_cx',            p.qj_cx)
+        _sv('u_qj_cy',            p.qj_cy)
+        _sv('u_qj_cz',            p.qj_cz)
+        _sv('u_qj_cw',            p.qj_cw)
+        _sv('u_qj_w_slice',       p.qj_w_slice)
+        _sv('u_qj_bailout',       p.qj_bailout)
+        _sv('u_qj_slice_rot_xw',  p.qj_slice_rot_xw)
+        _sv('u_qj_slice_rot_yw',  p.qj_slice_rot_yw)
+        _sv('u_qj_slice_rot_zw',  p.qj_slice_rot_zw)
         _sv('u_sph_inv_enabled',  1 if p.sph_inv_enabled else 0)
         _sv('u_sph_inv_radius',   p.sph_inv_radius)
         _sv('u_sph_inv_cx',       p.sph_inv_cx)
@@ -3070,7 +3412,7 @@ class FractalWindow(mglw.WindowConfig):
                 pw.set_exclusive_mouse(exclusive)
         except Exception:
             pass
-    def key_event(self, key, action, modifiers):
+    def on_key_event(self, key, action, modifiers):
         from moderngl_window.context.pyglet.keys import Keys
         import pyglet
         km = pyglet.window.key
@@ -3145,13 +3487,13 @@ class FractalWindow(mglw.WindowConfig):
         if k is not None:
             if action == PRESS:   _cam_input.keys_pressed.add(k)
             elif action == RELEASE: _cam_input.keys_pressed.discard(k)
-    def mouse_press_event(self, x, y, button):
+    def on_mouse_press_event(self, x, y, button):
         if button == 1:
             _cam_input.mouse_dragging = True
-    def mouse_release_event(self, x, y, button):
+    def on_mouse_release_event(self, x, y, button):
         if button == 1:
             _cam_input.mouse_dragging = False
-    def mouse_drag_event(self, x, y, dx, dy):
+    def on_mouse_drag_event(self, x, y, dx, dy):
         if _params.player_mode:
             return
         if not _cam_input.mouse_dragging:
@@ -3159,13 +3501,13 @@ class FractalWindow(mglw.WindowConfig):
         _params.cam_yaw   += dx * self.MOUSE_SENS_YAW
         _params.cam_pitch  = max(-self.PITCH_LIMIT, min(self.PITCH_LIMIT,
             _params.cam_pitch - dy * self.MOUSE_SENS_PITCH))
-    def mouse_position_event(self, x, y, dx, dy):
+    def on_mouse_position_event(self, x, y, dx, dy):
         if not _params.player_mode:
             return
         _params.cam_yaw   += dx * self.MOUSE_SENS_YAW
         _params.cam_pitch  = max(-self.PITCH_LIMIT, min(self.PITCH_LIMIT,
             _params.cam_pitch - dy * self.MOUSE_SENS_PITCH))
-    def mouse_scroll_event(self, x_offset, y_offset):
+    def on_mouse_scroll_event(self, x_offset, y_offset):
         mul = self._speed_mul()
         fwd, _, _ = self._calc_basis()
         p = _params.cam_pos
@@ -3233,7 +3575,17 @@ class FractalWindow(mglw.WindowConfig):
         _cam_vel = [_cam_vel[i] + (target[i] - _cam_vel[i]) * alpha for i in range(3)]
         p = _params.cam_pos
         _params.cam_pos = [p[i] + _cam_vel[i] * dt for i in range(3)]
-    def render(self, t, ft):
+    def render(self, t: float, frame_time: float):
+        self.on_render(t, frame_time)
+
+    def on_render(self, t, ft):
+        if not _params.vsync:
+            now = time.time()
+            elapsed_since = now - _vsync_limiter_last[0]
+            limit = 1.0 / max(_params.fps_cap, 1) if _params.fps_cap > 0 else 0.0
+            if limit > 0.0 and elapsed_since < limit:
+                time.sleep(limit - elapsed_since)
+            _vsync_limiter_last[0] = time.time()
         self._update_dyn_res(ft)
         self._title_accum += ft
         if self._title_accum >= self._title_interval:
@@ -3323,22 +3675,443 @@ class FractalWindow(mglw.WindowConfig):
             p.screenshot_requested   = False
             self._save_screenshot()
 
+        req = _video_render_req[0]
+        if req is not None:
+            _video_render_req[0] = None
+            tw, th, anim_t = req
+            try:
+                raw = self._render_frame_offscreen(tw, th, anim_t)
+                _video_render_result.put(('ok', raw))
+            except Exception as _ve:
+                _video_render_result.put(('err', str(_ve)))
+            self._render_debug_overlay()
+            return
+        if _video_rendering_flag.is_set():
+            self._render_debug_overlay()
+            return
+
+    def _ensure_vid_fbos(self, tw, th):
+        if self._vid_fbo_size == (tw, th):
+            return
+        for b in self._vid_scene_bufs:
+            if b is not None:
+                try: b['fbo'].release(); b['tex'].release()
+                except Exception: pass
+        for b in self._vid_out_bufs:
+            if b is not None:
+                try: b['fbo'].release(); b['tex'].release()
+                except Exception: pass
+        for pbo in self._vid_pbos:
+            if pbo is not None:
+                try: pbo.release()
+                except Exception: pass
+        self._vid_scene_bufs = []
+        self._vid_out_bufs   = []
+        self._vid_pbos       = []
+        self._vid_pbo_ready  = []
+        frame_bytes = tw * th * 3
+        for _ in range(2):
+            st = self.ctx.texture((tw, th), 3, dtype='f4')
+            st.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            sf = self.ctx.framebuffer(color_attachments=[st])
+            self._vid_scene_bufs.append({'tex': st, 'fbo': sf})
+            ot = self.ctx.texture((tw, th), 3, dtype='f1')
+            of = self.ctx.framebuffer(color_attachments=[ot])
+            self._vid_out_bufs.append({'tex': ot, 'fbo': of})
+            pbo = self.ctx.buffer(reserve=frame_bytes)
+            self._vid_pbos.append(pbo)
+            self._vid_pbo_ready.append(False)
+        self._vid_fbo_size  = (tw, th)
+        self._vid_buf_idx   = 0
+        self._vid_pbo_size  = frame_bytes
+
+    def _render_frame_offscreen(self, tw, th, anim_time):
+        p = _params
+        fwd, right, up = self._calc_basis()
+        render_pos = list(p.cam_pos)
+        self._ensure_vid_fbos(tw, th)
+        idx      = self._vid_buf_idx
+        prev_idx = 1 - idx
+        sb = self._vid_scene_bufs[idx]
+        ob = self._vid_out_bufs[idx]
+        self._vid_buf_idx = prev_idx
+        prev_res = self._u_resolution.value if self._u_resolution is not None else None
+        if self._u_resolution is not None:
+            self._u_resolution.value = (tw, th)
+        else:
+            self._set('u_resolution', (tw, th))
+        sb['fbo'].use()
+        sb['fbo'].clear(0, 0, 0)
+        self._set_shared_uniforms(p, anim_time, fwd, right, up, render_pos)
+        self.vao.render(moderngl.TRIANGLE_STRIP)
+        if prev_res is not None and self._u_resolution is not None:
+            self._u_resolution.value = prev_res
+        ob['fbo'].use()
+        ob['fbo'].clear(0, 0, 0)
+        sb['tex'].use(location=0)
+        pl = self._post_uloc
+        if 'u_scene'      in pl: pl['u_scene'].value      = 0
+        if 'u_resolution' in pl: pl['u_resolution'].value = (tw, th)
+        if 'u_gamma'      in pl: pl['u_gamma'].value      = p.gamma
+        if 'u_exposure'   in pl: pl['u_exposure'].value   = p.exposure
+        if 'u_saturation' in pl: pl['u_saturation'].value = p.saturation
+        if 'u_flip_y'     in pl: pl['u_flip_y'].value     = 1
+        self.post_vao.render(moderngl.TRIANGLE_STRIP)
+        if 'u_flip_y' in pl: pl['u_flip_y'].value = 0
+        self.ctx.screen.use()
+        self.ctx.finish()
+        raw = bytes(ob['fbo'].read(components=3))
+        return raw
+
     def _save_screenshot(self):
+        import datetime
+        from PIL import Image
+        p = _params
+        sw = p.screenshot_width  if p.screenshot_width  > 0 else None
+        sh = p.screenshot_height if p.screenshot_height > 0 else None
+        ww, wh = self.wnd.size
+        tw = sw if sw else ww
+        th = sh if sh else wh
+        ss_tex = None
+        ss_fbo = None
+        out_tex = None
+        out_fbo = None
         try:
-            import datetime
-            w, h = self.wnd.size
-            data = self.ctx.screen.read(components=3)
-            from PIL import Image
-            img  = Image.frombytes('RGB', (w, h), data)
-            img  = img.transpose(Image.FLIP_TOP_BOTTOM)
+            ss_tex = self.ctx.texture((tw, th), 3, dtype='f4')
+            ss_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            ss_fbo = self.ctx.framebuffer(color_attachments=[ss_tex])
+            out_tex = self.ctx.texture((tw, th), 3, dtype='f1')
+            out_fbo = self.ctx.framebuffer(color_attachments=[out_tex])
+            fwd, right, up = self._calc_basis()
+            elapsed = time.time() - self.start
+            render_pos = (
+                _player_state.get_render_pos(0)
+                if p.player_mode
+                else list(p.cam_pos)
+            )
+            ss_fbo.use()
+            ss_fbo.clear(0, 0, 0)
+            prev_res = self._u_resolution.value if self._u_resolution is not None else None
+            if self._u_resolution is not None:
+                self._u_resolution.value = (tw, th)
+            else:
+                self._set('u_resolution', (tw, th))
+            self._set_shared_uniforms(p, elapsed, fwd, right, up, render_pos)
+            self.vao.render(moderngl.TRIANGLE_STRIP)
+            if prev_res is not None and self._u_resolution is not None:
+                self._u_resolution.value = prev_res
+            out_fbo.use()
+            out_fbo.clear(0, 0, 0)
+            ss_tex.use(location=0)
+            pl = self._post_uloc
+            if 'u_scene'      in pl: pl['u_scene'].value      = 0
+            if 'u_resolution' in pl: pl['u_resolution'].value = (tw, th)
+            if 'u_gamma'      in pl: pl['u_gamma'].value      = p.gamma
+            if 'u_exposure'   in pl: pl['u_exposure'].value   = p.exposure
+            if 'u_saturation' in pl: pl['u_saturation'].value = p.saturation
+            self.post_vao.render(moderngl.TRIANGLE_STRIP)
+            self.ctx.finish()
+            raw = out_fbo.read(components=3)
+            img = Image.frombytes('RGB', (tw, th), raw)
+            img = img.transpose(Image.FLIP_TOP_BOTTOM)
             ts   = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            path = Path(__file__).parent / f'fractal_{ts}.png'
-            img.save(str(path))
-            print(f'[screenshot] saved → {path}')
+            res_tag = f'_{tw}x{th}' if (sw or sh) else ''
+            path = Path(__file__).parent / f'fractal_{ts}{res_tag}.png'
+            img.save(str(path), optimize=False)
+            print(f'[screenshot] saved {tw}x{th} → {path}')
             if callable(getattr(_params, '_on_screenshot', None)):
                 _params._on_screenshot(str(path))
         except Exception as e:
             print(f'[screenshot] failed: {e}')
+            import traceback; traceback.print_exc()
+        finally:
+            for obj in (ss_fbo, ss_tex, out_fbo, out_tex):
+                if obj is not None:
+                    try: obj.release()
+                    except Exception: pass
+            self.ctx.screen.use()
+
+
+class VideoRenderWorker(QObject):
+    progress        = pyqtSignal(int, int, float)
+    encode_progress = pyqtSignal(int, int)
+    finished        = pyqtSignal(str)
+    error           = pyqtSignal(str)
+    log             = pyqtSignal(str)
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        self._cfg   = cfg
+        self._abort = False
+
+    def abort(self):
+        self._abort = True
+
+    _GPU_ENCODER_MAP = {
+        'nvenc_h264':  {'c:v': 'h264_nvenc',  'ext': '.mp4', 'has_crf': False, 'has_preset': True,
+                        'presets': ['p1','p2','p3','p4','p5','p6','p7'], 'default_preset': 'p4'},
+        'nvenc_h265':  {'c:v': 'hevc_nvenc',  'ext': '.mp4', 'has_crf': False, 'has_preset': True,
+                        'presets': ['p1','p2','p3','p4','p5','p6','p7'], 'default_preset': 'p4'},
+        'amf_h264':    {'c:v': 'h264_amf',    'ext': '.mp4', 'has_crf': False, 'has_preset': False},
+        'amf_h265':    {'c:v': 'hevc_amf',    'ext': '.mp4', 'has_crf': False, 'has_preset': False},
+        'qsv_h264':    {'c:v': 'h264_qsv',    'ext': '.mp4', 'has_crf': False, 'has_preset': True,
+                        'presets': ['veryfast','faster','fast','medium','slow'], 'default_preset': 'fast'},
+        'qsv_h265':    {'c:v': 'hevc_qsv',    'ext': '.mp4', 'has_crf': False, 'has_preset': True,
+                        'presets': ['veryfast','faster','fast','medium','slow'], 'default_preset': 'fast'},
+        'cpu':         None,
+    }
+    def _build_ffmpeg_cmd(self, cfg, tw, th):
+        import shlex
+        codec        = cfg['codec']
+        crf          = cfg['crf']
+        preset       = cfg['preset']
+        pix_fmt      = cfg['pix_fmt']
+        output       = cfg['output']
+        bitrate      = cfg.get('bitrate', '')
+        extra_args   = cfg.get('extra_args', '')
+        vf_filter    = cfg.get('vf_filter', '')
+        fps          = cfg['fps']
+        gpu_encoder  = cfg.get('gpu_encoder', 'cpu')
+        gpu_info     = self._GPU_ENCODER_MAP.get(gpu_encoder)
+        use_gpu      = gpu_info is not None and gpu_encoder != 'cpu'
+        cmd = ['ffmpeg', '-y',
+            '-probesize', '32',
+            '-analyzeduration', '0',
+            '-f', 'rawvideo', '-vcodec', 'rawvideo',
+            '-s', f'{tw}x{th}', '-pix_fmt', 'rgb24',
+            '-r', str(fps), '-i', 'pipe:0',
+            '-threads', '0',
+        ]
+        if vf_filter:
+            cmd += ['-vf', vf_filter]
+        if use_gpu:
+            cmd += ['-c:v', gpu_info['c:v']]
+            if gpu_info.get('has_preset') and preset:
+                cmd += ['-preset', preset]
+            if bitrate:
+                cmd += ['-b:v', bitrate]
+            else:
+                cmd += ['-b:v', '0', '-cq', str(max(1, crf))]
+            cmd += ['-pix_fmt', pix_fmt, output]
+        elif codec in ('libx264', 'libx265', 'libvpx-vp9', 'libaom-av1'):
+            cmd += ['-c:v', codec]
+            if bitrate:
+                cmd += ['-b:v', bitrate]
+            else:
+                cmd += ['-crf', str(crf)]
+            if codec in ('libx264', 'libx265'):
+                cmd += ['-preset', preset]
+            cmd += ['-pix_fmt', pix_fmt, output]
+        elif codec == 'prores_ks':
+            profile_map = {'proxy': '0', 'lt': '1', 'standard': '2', 'hq': '3', '4444': '4'}
+            cmd += ['-c:v', 'prores_ks', '-profile:v', profile_map.get(preset, '3'), output]
+        elif codec == 'png_sequence':
+            return None, output
+        elif codec == 'rawvideo':
+            cmd += ['-c:v', 'rawvideo', '-pix_fmt', pix_fmt, output]
+        else:
+            cmd += ['-c:v', codec, '-pix_fmt', pix_fmt, output]
+        if extra_args:
+            cmd = cmd[:-1] + shlex.split(extra_args) + [cmd[-1]]
+        return cmd, output
+
+    def run(self):
+        import subprocess, threading as _threading
+        from concurrent.futures import ThreadPoolExecutor
+        _ensure_ffmpeg_in_env()
+        cfg          = self._cfg
+        tw, th       = cfg['width'], cfg['height']
+        fps          = cfg['fps']
+        duration     = cfg['duration']
+        start_t      = cfg['start_time']
+        total_frames = max(1, int(round(duration * fps)))
+        codec        = cfg['codec']
+        output       = cfg['output']
+        png_workers  = cfg.get('png_workers', max(2, (os.cpu_count() or 4) - 1))
+
+        seq_dir = None
+        if codec == 'png_sequence':
+            seq_dir = Path(output).with_suffix('')
+            seq_dir.mkdir(parents=True, exist_ok=True)
+            ffmpeg_cmd = None
+        else:
+            ffmpeg_cmd, output = self._build_ffmpeg_cmd(cfg, tw, th)
+
+        self.log.emit(f'ffmpeg cmd: {" ".join(ffmpeg_cmd) if ffmpeg_cmd else "PNG sequence -> " + output}')
+
+        proc = None
+        write_err     = [None]
+        stderr_thread = None
+        _STDERR_MAXLINES = 200
+        stderr_lines  = _collections_mod.deque(maxlen=_STDERR_MAXLINES)
+
+        if ffmpeg_cmd is not None:
+            try:
+                proc = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+            except FileNotFoundError:
+                self.error.emit('ffmpeg not found. Use the "Install ffmpeg" button in the Video Render section.')
+                return
+            except Exception as e:
+                self.error.emit(f'Failed to start ffmpeg: {e}')
+                return
+
+            def _stderr_reader():
+                import re
+                _frame_re = re.compile(r'frame=\s*(\d+)')
+                for raw_line in proc.stderr:
+                    line = raw_line.decode(errors='replace')
+                    stderr_lines.append(line)
+                    m = _frame_re.search(line)
+                    if m:
+                        self.encode_progress.emit(int(m.group(1)), total_frames)
+            stderr_thread = _threading.Thread(target=_stderr_reader, daemon=True)
+            stderr_thread.start()
+
+        _QUEUE_DEPTH = 4
+        write_queue = _queue_mod.Queue(maxsize=_QUEUE_DEPTH)
+
+        _WIN_PIPE_CHUNK = 65536
+        def _write_pipe(raw):
+            data = raw if isinstance(raw, (bytes, bytearray)) else bytes(raw)
+            offset = 0
+            while offset < len(data):
+                proc.stdin.write(data[offset:offset + _WIN_PIPE_CHUNK])
+                offset += _WIN_PIPE_CHUNK
+            proc.stdin.flush()
+
+        def _writer_video():
+            while True:
+                item = write_queue.get()
+                if item is None:
+                    break
+                idx, raw = item
+                try:
+                    if write_err[0] is None:
+                        _write_pipe(raw)
+                except (BrokenPipeError, OSError) as e:
+                    if write_err[0] is None:
+                        write_err[0] = str(e)
+                finally:
+                    del raw
+
+        def _writer_png():
+            with ThreadPoolExecutor(max_workers=png_workers) as pool:
+                futures = {}
+                while True:
+                    item = write_queue.get()
+                    if item is None:
+                        for fut in futures.values():
+                            try:
+                                fut.result()
+                            except Exception as e:
+                                if write_err[0] is None:
+                                    write_err[0] = str(e)
+                        break
+                    fi, raw = item
+                    frame_path = str(seq_dir / f'frame_{fi:05d}.png')
+                    fut = pool.submit(_save_png_raw, raw, tw, th, frame_path)
+                    futures[fi] = fut
+                    done = [k for k, f in futures.items() if f.done()]
+                    for k in done:
+                        try:
+                            futures.pop(k).result()
+                        except Exception as e:
+                            if write_err[0] is None:
+                                write_err[0] = str(e)
+
+        if proc is not None:
+            writer_fn = _writer_video
+        else:
+            writer_fn = _writer_png
+
+        writer_thread = _threading.Thread(target=writer_fn, daemon=True)
+        writer_thread.start()
+
+        t0 = time.time()
+        for fi in range(total_frames):
+            if self._abort:
+                self.log.emit('Render aborted.')
+                break
+            if write_err[0] is not None:
+                self.error.emit(f'Write error: {write_err[0]}')
+                break
+
+            anim_t = start_t + fi / fps
+            if _ANIM_AVAILABLE:
+                try:
+                    clip = _anim_state.current_clip
+                    if clip is not None:
+                        values = clip.evaluate_all(anim_t)
+                        apply_anim_to_params(values)
+                except Exception:
+                    pass
+
+            _video_rendering_flag.set()
+            _video_render_req[0] = (tw, th, anim_t)
+            _video_req_event.set()
+            deadline = time.time() + 60.0
+            result = None
+            while time.time() < deadline:
+                try:
+                    result = _video_render_result.get(timeout=0.005)
+                    break
+                except _queue_mod.Empty:
+                    pass
+                if self._abort:
+                    break
+
+            if result is None:
+                self.error.emit(f'Frame {fi} timed out waiting for GL render.')
+                break
+            status, data = result
+            if status == 'err':
+                self.error.emit(f'Frame {fi} GL error: {data}')
+                break
+
+            write_queue.put((fi, data))
+            del data
+
+            elapsed = time.time() - t0
+            fps_actual = (fi + 1) / elapsed if elapsed > 0 else 0
+            self.progress.emit(fi + 1, total_frames, fps_actual)
+
+        write_queue.put(None)
+        writer_thread.join()
+        _video_rendering_flag.clear()
+
+        if proc is not None:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            proc.wait()
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=5.0)
+            stderr_out = ''.join(stderr_lines)
+            if write_err[0] is not None and not self._abort:
+                self.error.emit(
+                    f'Write error: {write_err[0]}\n'
+                    f'ffmpeg exit code: {proc.returncode}\n'
+                    + (f'ffmpeg stderr:\n{stderr_out[-2000:]}' if stderr_out.strip() else '')
+                )
+                return
+            if proc.returncode != 0 and not self._abort:
+                self.error.emit(f'ffmpeg error (code {proc.returncode}):\n{stderr_out[-2000:]}')
+                return
+            if stderr_out.strip():
+                self.log.emit(f'ffmpeg stderr:\n{stderr_out[-1000:]}')
+        if not self._abort:
+            self.finished.emit(output)
+
+
+def _save_png_raw(raw: bytes, w: int, h: int, path: str):
+    from PIL import Image
+    Image.frombytes('RGB', (w, h), raw).save(path)
 
 def _make_icon() -> QIcon:
     path = _ICON_PATH
@@ -3478,6 +4251,11 @@ def _lbl_hint(layout, text: str):
     lbl = QLabel(text)
     lbl.setWordWrap(True)
     layout.addWidget(lbl)
+def _make_line_edit(default='', placeholder='') -> QLineEdit:
+    le = QLineEdit(default)
+    le.setPlaceholderText(placeholder)
+    return le
+
 
 class SliderSmoother:
     TICK_MS   = 16
@@ -3634,7 +4412,6 @@ class ControlGUI(QMainWindow):
         self._build_toolbar()
 
         tabs = QTabWidget()
-
         root_layout.addWidget(tabs, 1)
 
         tab_fractal, vbox = self._make_scroll_tab()
@@ -3686,7 +4463,6 @@ class ControlGUI(QMainWindow):
         self._build_presets_section()
         self._vbox.addStretch()
         tabs.addTab(tab_presets, "Presets")
-
 
         tab_saves, vbox = self._make_scroll_tab()
         self._vbox = vbox
@@ -3774,6 +4550,421 @@ class ControlGUI(QMainWindow):
         _anim_state.clip_changed.connect(self._on_anim_clip)
         _anim_state.time_changed.connect(self._sync_sliders_from_anim)
         self._refresh_clip_combo()
+        self._build_video_render_section()
+
+
+    def _build_video_render_section(self):
+        self._vrender_thread  = None
+        self._vrender_worker  = None
+
+        grp = _section("VIDEO RENDER")
+        layout = QVBoxLayout(grp)
+        layout.setSpacing(4)
+        _lbl_hint(layout, "Render animation to video via ffmpeg. Requires ffmpeg in PATH.")
+
+        ffmpeg_row = QHBoxLayout()
+        ffmpeg_status_lbl = QLabel()
+        ffmpeg_install_btn = QPushButton("Install ffmpeg")
+        ffmpeg_install_btn.setFixedHeight(24)
+
+        def _refresh_ffmpeg_status():
+            if _ffmpeg_available():
+                import shutil
+                exe = shutil.which('ffmpeg') or str(_ffmpeg_local_exe())
+                ffmpeg_status_lbl.setText(f'ffmpeg: found ({exe})')
+                ffmpeg_status_lbl.setStyleSheet('color: #88cc88; font-size: 10px;')
+                ffmpeg_install_btn.setText('Reinstall ffmpeg')
+            else:
+                ffmpeg_status_lbl.setText('ffmpeg: NOT FOUND')
+                ffmpeg_status_lbl.setStyleSheet('color: #cc8888; font-size: 10px;')
+                ffmpeg_install_btn.setText('Install ffmpeg')
+
+        _refresh_ffmpeg_status()
+        ffmpeg_install_btn.clicked.connect(lambda: (_run_ffmpeg_installer_dialog(self), _refresh_ffmpeg_status()))
+        ffmpeg_row.addWidget(ffmpeg_status_lbl, 1)
+        ffmpeg_row.addWidget(ffmpeg_install_btn)
+        layout.addLayout(ffmpeg_row)
+
+        res_grp = _section("OUTPUT RESOLUTION")
+        res_l = QVBoxLayout(res_grp)
+        res_l.setSpacing(4)
+        res_combo = QComboBox()
+        VR_PRESETS = [
+            ("Window size", 0, 0),
+            ("1280×720 (HD)",       1280, 720),
+            ("1920×1080 (Full HD)", 1920, 1080),
+            ("2560×1440 (2K)",      2560, 1440),
+            ("3840×2160 (4K)",      3840, 2160),
+            ("Custom…",             -1, -1),
+        ]
+        for lbl, w, h in VR_PRESETS:
+            res_combo.addItem(lbl, (w, h))
+        res_combo.setCurrentIndex(2)
+        res_l.addWidget(res_combo)
+
+        custom_res_row = QWidget()
+        crr_l = QHBoxLayout(custom_res_row)
+        crr_l.setContentsMargins(4, 0, 4, 0)
+        crr_l.setSpacing(4)
+        vr_w_spin = QDoubleSpinBox(); vr_w_spin.setDecimals(0); vr_w_spin.setRange(64, 16384); vr_w_spin.setValue(1920); vr_w_spin.setSuffix(" px")
+        vr_h_spin = QDoubleSpinBox(); vr_h_spin.setDecimals(0); vr_h_spin.setRange(64, 16384); vr_h_spin.setValue(1080); vr_h_spin.setSuffix(" px")
+        crr_l.addWidget(QLabel("W:")); crr_l.addWidget(vr_w_spin, 1)
+        crr_l.addWidget(QLabel("H:")); crr_l.addWidget(vr_h_spin, 1)
+        custom_res_row.setVisible(False)
+        res_l.addWidget(custom_res_row)
+        def _on_vr_res(idx):
+            w, h = res_combo.itemData(idx)
+            custom_res_row.setVisible(w == -1)
+        res_combo.currentIndexChanged.connect(_on_vr_res)
+        layout.addWidget(res_grp)
+
+        time_grp = _section("TIMELINE")
+        time_l = QVBoxLayout(time_grp)
+        time_l.setSpacing(4)
+
+        def _make_time_row(label, default_val):
+            row = QWidget(); row_l = QHBoxLayout(row)
+            row_l.setContentsMargins(4, 1, 4, 1); row_l.setSpacing(6)
+            lbl = QLabel(label); lbl.setFixedWidth(80); lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            spin = QDoubleSpinBox(); spin.setDecimals(2); spin.setRange(0.0, 3600.0); spin.setValue(default_val); spin.setSuffix(" s")
+            row_l.addWidget(lbl); row_l.addWidget(spin, 1)
+            return row, spin
+
+        clip_fill_btn = QPushButton("Fill from current clip")
+        time_l.addWidget(clip_fill_btn)
+        start_row, start_spin = _make_time_row("Start", 0.0)
+        dur_row,   dur_spin   = _make_time_row("Duration", 5.0)
+        time_l.addWidget(start_row); time_l.addWidget(dur_row)
+
+        def _fill_from_clip():
+            clip = _anim_state.current_clip if _ANIM_AVAILABLE else None
+            if clip:
+                start_spin.setValue(0.0)
+                dur_spin.setValue(clip.duration)
+        clip_fill_btn.clicked.connect(_fill_from_clip)
+
+        fps_row = QWidget(); fps_row_l = QHBoxLayout(fps_row)
+        fps_row_l.setContentsMargins(4, 1, 4, 1); fps_row_l.setSpacing(6)
+        fps_lbl = QLabel("FPS"); fps_lbl.setFixedWidth(80); fps_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        fps_combo = QComboBox()
+        for f in [24, 25, 30, 50, 60, 120]:
+            fps_combo.addItem(str(f), f)
+        fps_combo.setCurrentIndex(2)
+        fps_row_l.addWidget(fps_lbl); fps_row_l.addWidget(fps_combo, 1)
+        time_l.addWidget(fps_row)
+        layout.addWidget(time_grp)
+
+        codec_grp = _section("CODEC & QUALITY")
+        codec_l = QVBoxLayout(codec_grp)
+        codec_l.setSpacing(4)
+
+        codec_row = QWidget(); codec_row_l = QHBoxLayout(codec_row)
+        codec_row_l.setContentsMargins(4, 1, 4, 1); codec_row_l.setSpacing(6)
+        codec_lbl = QLabel("Codec"); codec_lbl.setFixedWidth(80); codec_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        codec_combo = QComboBox()
+        CODECS = [
+            ("H.264 (MP4)",        "libx264",      ".mp4"),
+            ("H.265 / HEVC (MP4)", "libx265",      ".mp4"),
+            ("VP9 (WebM)",         "libvpx-vp9",   ".webm"),
+            ("AV1 (MP4)",          "libaom-av1",   ".mp4"),
+            ("ProRes HQ (MOV)",    "prores_ks",    ".mov"),
+            ("Raw video (AVI)",    "rawvideo",     ".avi"),
+            ("PNG sequence",       "png_sequence", ""),
+        ]
+        for lbl, val, ext in CODECS:
+            codec_combo.addItem(lbl, (val, ext))
+        codec_combo.setCurrentIndex(0)
+        codec_row_l.addWidget(codec_lbl); codec_row_l.addWidget(codec_combo, 1)
+        codec_l.addWidget(codec_row)
+
+        gpu_row = QWidget(); gpu_row_l = QHBoxLayout(gpu_row)
+        gpu_row_l.setContentsMargins(4, 1, 4, 1); gpu_row_l.setSpacing(6)
+        gpu_lbl = QLabel("GPU Encoder"); gpu_lbl.setFixedWidth(80); gpu_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        gpu_combo = QComboBox()
+        _GPU_ENC_OPTIONS = [
+            ("CPU (software)",       "cpu"),
+            ("NVENC H.264 (NVIDIA)", "nvenc_h264"),
+            ("NVENC H.265 (NVIDIA)", "nvenc_h265"),
+            ("AMF H.264 (AMD)",      "amf_h264"),
+            ("AMF H.265 (AMD)",      "amf_h265"),
+            ("QSV H.264 (Intel)",    "qsv_h264"),
+            ("QSV H.265 (Intel)",    "qsv_h265"),
+        ]
+        for _glbl, _gval in _GPU_ENC_OPTIONS:
+            gpu_combo.addItem(_glbl, _gval)
+        gpu_combo.setCurrentIndex(0)
+        gpu_combo.setToolTip(
+            "GPU encoder bypasses the software codec and uses hardware acceleration.\n"
+            "NVENC=NVIDIA, AMF=AMD, QSV=Intel. If GPU encode fails, switch back to CPU."
+        )
+        gpu_row_l.addWidget(gpu_lbl); gpu_row_l.addWidget(gpu_combo, 1)
+        codec_l.addWidget(gpu_row)
+
+        preset_row = QWidget(); preset_row_l = QHBoxLayout(preset_row)
+        preset_row_l.setContentsMargins(4, 1, 4, 1); preset_row_l.setSpacing(6)
+        preset_lbl2 = QLabel("Preset"); preset_lbl2.setFixedWidth(80); preset_lbl2.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        preset_combo = QComboBox()
+        X264_PRESETS = ["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"]
+        for p in X264_PRESETS:
+            preset_combo.addItem(p)
+        preset_combo.setCurrentIndex(5)
+        preset_row_l.addWidget(preset_lbl2); preset_row_l.addWidget(preset_combo, 1)
+        codec_l.addWidget(preset_row)
+
+        crf_row = QWidget(); crf_row_l = QHBoxLayout(crf_row)
+        crf_row_l.setContentsMargins(4, 1, 4, 1); crf_row_l.setSpacing(6)
+        crf_lbl = QLabel("CRF"); crf_lbl.setFixedWidth(80); crf_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        crf_slider = QSlider(Qt.Horizontal); crf_slider.setRange(0, 51); crf_slider.setValue(18)
+        crf_val_lbl = QLabel("18"); crf_val_lbl.setFixedWidth(30)
+        crf_slider.valueChanged.connect(lambda v: crf_val_lbl.setText(str(v)))
+        crf_row_l.addWidget(crf_lbl); crf_row_l.addWidget(crf_slider, 1); crf_row_l.addWidget(crf_val_lbl)
+        codec_l.addWidget(crf_row)
+
+        pix_fmt_row = QWidget(); pix_fmt_row_l = QHBoxLayout(pix_fmt_row)
+        pix_fmt_row_l.setContentsMargins(4, 1, 4, 1); pix_fmt_row_l.setSpacing(6)
+        pix_fmt_lbl = QLabel("Pixel fmt"); pix_fmt_lbl.setFixedWidth(80); pix_fmt_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        pix_fmt_combo = QComboBox()
+        for pf in ["yuv420p", "yuv444p", "yuv422p", "rgb24", "rgba"]:
+            pix_fmt_combo.addItem(pf)
+        pix_fmt_combo.setCurrentIndex(0)
+        pix_fmt_row_l.addWidget(pix_fmt_lbl); pix_fmt_row_l.addWidget(pix_fmt_combo, 1)
+        codec_l.addWidget(pix_fmt_row)
+
+        bitrate_row = QWidget(); bitrate_row_l = QHBoxLayout(bitrate_row)
+        bitrate_row_l.setContentsMargins(4, 1, 4, 1); bitrate_row_l.setSpacing(6)
+        bitrate_lbl = QLabel("Bitrate"); bitrate_lbl.setFixedWidth(80); bitrate_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        bitrate_edit = _make_line_edit("", "e.g. 8M  (blank = CRF only)")
+        bitrate_row_l.addWidget(bitrate_lbl); bitrate_row_l.addWidget(bitrate_edit, 1)
+        codec_l.addWidget(bitrate_row)
+
+        _CPU_PRESETS  = ["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"]
+        _NVENC_PRESETS = ["p1","p2","p3","p4","p5","p6","p7"]
+        _QSV_PRESETS   = ["veryfast","faster","fast","medium","slow"]
+        _GPU_PRESET_MAP = {
+            'nvenc_h264': _NVENC_PRESETS, 'nvenc_h265': _NVENC_PRESETS,
+            'qsv_h264':   _QSV_PRESETS,   'qsv_h265':   _QSV_PRESETS,
+        }
+        def _rebuild_preset_combo(presets, default_idx):
+            preset_combo.blockSignals(True)
+            preset_combo.clear()
+            for p in presets:
+                preset_combo.addItem(p)
+            preset_combo.setCurrentIndex(min(default_idx, len(presets) - 1))
+            preset_combo.blockSignals(False)
+        _rebuild_preset_combo(_CPU_PRESETS, 5)
+        def _update_codec_widgets(idx=None):
+            codec_val, _ = codec_combo.currentData()
+            gpu_val      = gpu_combo.currentData()
+            use_gpu      = gpu_val != 'cpu'
+            gpu_presets  = _GPU_PRESET_MAP.get(gpu_val)
+            if use_gpu:
+                has_preset = gpu_presets is not None
+                has_crf    = True
+                if has_preset:
+                    cur = preset_combo.currentText()
+                    _rebuild_preset_combo(gpu_presets, gpu_presets.index('p4') if 'p4' in gpu_presets else 3)
+                    if cur in gpu_presets:
+                        preset_combo.setCurrentText(cur)
+                else:
+                    _rebuild_preset_combo([], 0)
+            else:
+                has_preset = codec_val in ('libx264', 'libx265')
+                has_crf    = codec_val in ('libx264', 'libx265', 'libvpx-vp9', 'libaom-av1')
+                cur = preset_combo.currentText()
+                _rebuild_preset_combo(_CPU_PRESETS, 5)
+                if cur in _CPU_PRESETS:
+                    preset_combo.setCurrentText(cur)
+            preset_row.setVisible(has_preset)
+            crf_row.setVisible(has_crf)
+            bitrate_row.setVisible(has_crf or use_gpu)
+            pix_fmt_row.setVisible(codec_val not in ('png_sequence', 'prores_ks'))
+        codec_combo.currentIndexChanged.connect(_update_codec_widgets)
+        gpu_combo.currentIndexChanged.connect(_update_codec_widgets)
+        _update_codec_widgets()
+        layout.addWidget(codec_grp)
+
+        adv_grp = _section("ADVANCED")
+        adv_l = QVBoxLayout(adv_grp)
+        adv_l.setSpacing(4)
+
+        _cpu_count = os.cpu_count() or 4
+        png_workers_row = QWidget(); png_workers_row_l = QHBoxLayout(png_workers_row)
+        png_workers_row_l.setContentsMargins(4, 1, 4, 1); png_workers_row_l.setSpacing(6)
+        png_workers_lbl = QLabel("PNG threads"); png_workers_lbl.setFixedWidth(80); png_workers_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        png_workers_spin = QDoubleSpinBox()
+        png_workers_spin.setDecimals(0)
+        png_workers_spin.setRange(1, _cpu_count)
+        png_workers_spin.setValue(max(2, _cpu_count - 1))
+        png_workers_spin.setToolTip("Parallel threads for PNG sequence encoding. Only used when codec=PNG sequence.")
+        png_workers_row_l.addWidget(png_workers_lbl); png_workers_row_l.addWidget(png_workers_spin, 1)
+        adv_l.addWidget(png_workers_row)
+
+        vf_row = QWidget(); vf_row_l = QHBoxLayout(vf_row)
+        vf_row_l.setContentsMargins(4, 1, 4, 1); vf_row_l.setSpacing(6)
+        vf_lbl = QLabel("vf filter"); vf_lbl.setFixedWidth(80); vf_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        vf_edit = _make_line_edit("", "e.g. unsharp=5:5:0.8")
+        vf_row_l.addWidget(vf_lbl); vf_row_l.addWidget(vf_edit, 1)
+        adv_l.addWidget(vf_row)
+
+        extra_row = QWidget(); extra_row_l = QHBoxLayout(extra_row)
+        extra_row_l.setContentsMargins(4, 1, 4, 1); extra_row_l.setSpacing(6)
+        extra_lbl = QLabel("Extra args"); extra_lbl.setFixedWidth(80); extra_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        extra_edit = _make_line_edit("", "appended before output path")
+        extra_row_l.addWidget(extra_lbl); extra_row_l.addWidget(extra_edit, 1)
+        adv_l.addWidget(extra_row)
+
+        out_row = QWidget(); out_row_l = QHBoxLayout(out_row)
+        out_row_l.setContentsMargins(4, 1, 4, 1); out_row_l.setSpacing(6)
+        out_lbl = QLabel("Output"); out_lbl.setFixedWidth(80); out_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        out_edit = _make_line_edit("", "leave blank = auto filename")
+        out_browse = QPushButton("…"); out_browse.setFixedWidth(28)
+        out_row_l.addWidget(out_lbl); out_row_l.addWidget(out_edit, 1); out_row_l.addWidget(out_browse)
+        adv_l.addWidget(out_row)
+
+        def _browse_output():
+            _, ext = codec_combo.currentData()
+            flt = f"Video (*{ext})" if ext else "All files (*)"
+            path, _ = QFileDialog.getSaveFileName(self, "Output file", str(Path.home()), flt)
+            if path:
+                out_edit.setText(path)
+        out_browse.clicked.connect(_browse_output)
+        layout.addWidget(adv_grp)
+
+        render_lbl = QLabel("Render")
+        render_lbl.setStyleSheet("color: #8888cc; font-size: 10px;")
+        layout.addWidget(render_lbl)
+        progress_bar = QProgressBar(); progress_bar.setRange(0, 100); progress_bar.setValue(0)
+        progress_bar.setTextVisible(True); progress_bar.setFormat("Ready")
+        layout.addWidget(progress_bar)
+
+        encode_lbl = QLabel("Encoder")
+        encode_lbl.setStyleSheet("color: #8888cc; font-size: 10px;")
+        layout.addWidget(encode_lbl)
+        encode_bar = QProgressBar(); encode_bar.setRange(0, 100); encode_bar.setValue(0)
+        encode_bar.setTextVisible(True); encode_bar.setFormat("Idle")
+        encode_bar.setStyleSheet(
+            "QProgressBar { border: 1px solid #2d2d5e; border-radius: 3px; background: #12122a; }"
+            "QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "stop:0 #3a6040, stop:1 #55cc88); border-radius: 2px; }"
+        )
+        layout.addWidget(encode_bar)
+
+        log_lbl = QLabel(""); log_lbl.setWordWrap(True)
+        log_lbl.setStyleSheet("color: #aaaacc; font-size: 10px;")
+        layout.addWidget(log_lbl)
+
+        btn_row = QHBoxLayout()
+        render_btn = QPushButton("▶  Render Video")
+        render_btn.setFixedHeight(32)
+        abort_btn  = QPushButton("■  Abort")
+        abort_btn.setFixedHeight(32)
+        abort_btn.setEnabled(False)
+        btn_row.addWidget(render_btn); btn_row.addWidget(abort_btn)
+        layout.addLayout(btn_row)
+
+        def _get_output_path():
+            path = out_edit.text().strip()
+            if path:
+                return path
+            import datetime
+            ts   = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            _, ext = codec_combo.currentData()
+            return str(Path(__file__).parent / f'render_{ts}{ext}')
+
+        def _get_wh():
+            w, h = res_combo.currentData()
+            if w == -1:
+                return int(vr_w_spin.value()), int(vr_h_spin.value())
+            if w == 0:
+                wnd = _gl_window_ref[0]
+                if wnd:
+                    return wnd.wnd.size
+                return 1920, 1080
+            return w, h
+
+        def _on_render_done():
+            self._vrender_thread = None
+            self._vrender_worker = None
+
+        def _start_render():
+            try:
+                if self._vrender_thread is not None and self._vrender_thread.isRunning():
+                    return
+            except RuntimeError:
+                self._vrender_thread = None
+                self._vrender_worker = None
+            w, h = _get_wh()
+            codec_val, _ = codec_combo.currentData()
+            cfg = {
+                'width':      w,
+                'height':     h,
+                'fps':        fps_combo.currentData(),
+                'duration':   dur_spin.value(),
+                'start_time': start_spin.value(),
+                'codec':      codec_val,
+                'crf':        crf_slider.value(),
+                'preset':     preset_combo.currentText(),
+                'pix_fmt':    pix_fmt_combo.currentText(),
+                'bitrate':    bitrate_edit.text().strip(),
+                'vf_filter':  vf_edit.text().strip(),
+                'extra_args':   extra_edit.text().strip(),
+                'output':       _get_output_path(),
+                'gpu_encoder':  gpu_combo.currentData(),
+                'png_workers':  int(png_workers_spin.value()),
+            }
+            total = max(1, int(round(cfg['duration'] * cfg['fps'])))
+            progress_bar.setRange(0, total)
+            progress_bar.setValue(0)
+            progress_bar.setFormat(f"0 / {total} frames")
+            encode_bar.setRange(0, total)
+            encode_bar.setValue(0)
+            encode_bar.setFormat("Waiting...")
+            log_lbl.setText(f"Starting render: {w}×{h} @ {cfg['fps']}fps, {cfg['duration']}s → {cfg['output']}")
+            render_btn.setEnabled(False)
+            abort_btn.setEnabled(True)
+            worker = VideoRenderWorker(cfg)
+            thread = QThread()
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.progress.connect(lambda done, total, fps_a: (
+                progress_bar.setValue(done),
+                progress_bar.setFormat(f"{done} / {total} frames  ({fps_a:.1f} fps)"),
+            ))
+            worker.encode_progress.connect(lambda enc, tot: (
+                encode_bar.setValue(min(enc, tot)),
+                encode_bar.setFormat(f"{min(enc, tot)} / {tot} frames"),
+            ))
+            worker.log.connect(lambda msg: log_lbl.setText(msg))
+            worker.finished.connect(lambda path: (
+                progress_bar.setFormat(f"Done → {Path(path).name}"),
+                encode_bar.setValue(encode_bar.maximum()),
+                encode_bar.setFormat("Done"),
+                log_lbl.setText(f"✓ Saved: {path}"),
+                render_btn.setEnabled(True),
+                abort_btn.setEnabled(False),
+            ))
+            worker.error.connect(lambda msg: (
+                progress_bar.setFormat("Error"),
+                encode_bar.setFormat("Error"),
+                log_lbl.setText(f"✗ {msg}"),
+                render_btn.setEnabled(True),
+                abort_btn.setEnabled(False),
+            ))
+            worker.finished.connect(lambda _: thread.quit())
+            worker.error.connect(lambda _: thread.quit())
+            thread.finished.connect(_on_render_done)
+            self._vrender_thread = thread
+            self._vrender_worker = worker
+            thread.start()
+
+        def _abort_render():
+            if self._vrender_worker:
+                self._vrender_worker.abort()
+            abort_btn.setEnabled(False)
+
+        render_btn.clicked.connect(_start_render)
+        abort_btn.clicked.connect(_abort_render)
+        self._add_section(grp)
 
     def _open_anim_editor(self):
         if _ANIM_AVAILABLE:
@@ -3837,10 +5028,13 @@ class ControlGUI(QMainWindow):
         layout.setSpacing(2)
         self._type_grp = QButtonGroup(self)
         row = QHBoxLayout()
-        for i, name in enumerate(["Mandelbox", "Menger Sponge", "Sierpinski", "Octahedron IFS", "Mandelbulb", "Kleinian"]):
+        for i, (idx, name) in enumerate([
+            (0, "Mandelbox"), (1, "Menger Sponge"), (2, "Sierpinski"),
+            (3, "Octahedron IFS"), (4, "Mandelbulb"), (5, "Kleinian"), (6, "Quat Julia 4D"),
+        ]):
             rb = QRadioButton(name)
-            rb.setChecked(i == _params.fractal_type)
-            self._type_grp.addButton(rb, i)
+            rb.setChecked(idx == _params.fractal_type)
+            self._type_grp.addButton(rb, idx)
             if i % 2 == 0 and i > 0:
                 layout.addLayout(row)
                 row = QHBoxLayout()
@@ -4163,6 +5357,30 @@ class ControlGUI(QMainWindow):
         self._fractal_panels[5] = kl
         self._add_section(kl)
 
+        qj = _section("QUATERNION JULIA 4D FINE-TUNE")
+        qj_l = QVBoxLayout(qj)
+        qj_l.setSpacing(2)
+        _lbl_hint(qj_l, "4D fractal. W Slice sweeps a 3D cross-section through 4D space — animate it for morphing geometry. "
+                         "Slice rotations rotate the 4D slicing plane. C constant (cx..cw) controls Julia set shape.")
+        for label, attr, mn, mx, val, step in [
+            ("C x",           'qj_cx',           -2.0,  2.0,  _params.qj_cx,           0.005),
+            ("C y",           'qj_cy',           -2.0,  2.0,  _params.qj_cy,           0.005),
+            ("C z",           'qj_cz',           -2.0,  2.0,  _params.qj_cz,           0.005),
+            ("C w",           'qj_cw',           -2.0,  2.0,  _params.qj_cw,           0.005),
+            ("W Slice",       'qj_w_slice',      -2.0,  2.0,  _params.qj_w_slice,      0.005),
+            ("Bailout",       'qj_bailout',       1.0,  8.0,  _params.qj_bailout,      0.05),
+            ("Slice Rot XW",  'qj_slice_rot_xw', -math.pi, math.pi, _params.qj_slice_rot_xw, 0.01),
+            ("Slice Rot YW",  'qj_slice_rot_yw', -math.pi, math.pi, _params.qj_slice_rot_yw, 0.01),
+            ("Slice Rot ZW",  'qj_slice_rot_zw', -math.pi, math.pi, _params.qj_slice_rot_zw, 0.01),
+        ]:
+            sr = SliderRow(label, mn, mx, val, step)
+            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
+            setattr(self, f'_sl_{attr}', sr)
+            qj_l.addWidget(sr)
+        self._fractal_panels[6] = qj
+        self._add_section(qj)
+
         space_grp = _section("SPACE OPERATORS")
         space_l = QVBoxLayout(space_grp)
         space_l.setSpacing(4)
@@ -4304,7 +5522,7 @@ class ControlGUI(QMainWindow):
         setattr(_params, 'fractal_type', idx)
         for ftype, panel in self._fractal_panels.items():
             panel.setVisible(ftype == idx)
-        canonical_bailout = {0: 100.0, 1: 100.0, 2: 100.0, 3: 100.0, 4: 4.0, 5: 100.0}
+        canonical_bailout = {0: 100.0, 1: 100.0, 2: 100.0, 3: 100.0, 4: 4.0, 5: 100.0, 6: 4.0}
         b = canonical_bailout.get(idx, 100.0)
         _params.bailout = b
         if hasattr(self, '_sl_bailout'):
@@ -4492,6 +5710,67 @@ class ControlGUI(QMainWindow):
         sep = QLabel()
         sep.setFixedHeight(4)
         layout.addWidget(sep)
+
+        ss_res_row = QHBoxLayout()
+        ss_res_lbl = QLabel("Resolution:")
+        ss_res_lbl.setFixedWidth(80)
+        ss_res_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._ss_res_combo = QComboBox()
+        SS_PRESETS = [
+            ("Window size", 0, 0),
+            ("1920×1080 (Full HD)", 1920, 1080),
+            ("2560×1440 (2K)",      2560, 1440),
+            ("3840×2160 (4K)",      3840, 2160),
+            ("7680×4320 (8K)",      7680, 4320),
+            ("Custom…",             -1,   -1),
+        ]
+        for label, w, h in SS_PRESETS:
+            self._ss_res_combo.addItem(label, (w, h))
+        self._ss_res_combo.setCurrentIndex(0)
+        ss_res_row.addWidget(ss_res_lbl)
+        ss_res_row.addWidget(self._ss_res_combo, 1)
+        layout.addLayout(ss_res_row)
+
+        ss_custom_row = QWidget()
+        ss_custom_l = QHBoxLayout(ss_custom_row)
+        ss_custom_l.setContentsMargins(4, 0, 4, 0)
+        ss_custom_l.setSpacing(4)
+        self._ss_w_spin = QDoubleSpinBox()
+        self._ss_w_spin.setDecimals(0)
+        self._ss_w_spin.setRange(64, 16384)
+        self._ss_w_spin.setValue(1920)
+        self._ss_w_spin.setSuffix(" px")
+        self._ss_h_spin = QDoubleSpinBox()
+        self._ss_h_spin.setDecimals(0)
+        self._ss_h_spin.setRange(64, 16384)
+        self._ss_h_spin.setValue(1080)
+        self._ss_h_spin.setSuffix(" px")
+        ss_custom_l.addWidget(QLabel("W:"))
+        ss_custom_l.addWidget(self._ss_w_spin, 1)
+        ss_custom_l.addWidget(QLabel("H:"))
+        ss_custom_l.addWidget(self._ss_h_spin, 1)
+        ss_custom_row.setVisible(False)
+        layout.addWidget(ss_custom_row)
+
+        def _on_ss_res_changed(idx):
+            w, h = self._ss_res_combo.itemData(idx)
+            ss_custom_row.setVisible(w == -1)
+            if w != -1:
+                _params.screenshot_width  = w
+                _params.screenshot_height = h
+
+        def _on_ss_custom_w(v):
+            if self._ss_res_combo.currentData()[0] == -1:
+                _params.screenshot_width = int(v)
+
+        def _on_ss_custom_h(v):
+            if self._ss_res_combo.currentData()[0] == -1:
+                _params.screenshot_height = int(v)
+
+        self._ss_res_combo.currentIndexChanged.connect(_on_ss_res_changed)
+        self._ss_w_spin.valueChanged.connect(_on_ss_custom_w)
+        self._ss_h_spin.valueChanged.connect(_on_ss_custom_h)
+
         ss_row = QHBoxLayout()
         ss_btn = QPushButton("📷  Save Screenshot  (F12)")
         ss_btn.clicked.connect(self._trigger_screenshot)
@@ -4499,13 +5778,17 @@ class ControlGUI(QMainWindow):
         self._ss_status = QLabel("")
         ss_row.addWidget(self._ss_status)
         layout.addLayout(ss_row)
-        # register callback for status update
         _params._on_screenshot = self._on_screenshot_saved
         self._add_section(grp)
 
     def _trigger_screenshot(self):
         _params.screenshot_requested = True
-        self._ss_status.setText("capturing…")
+        w = _params.screenshot_width
+        h = _params.screenshot_height
+        if w > 0 and h > 0:
+            self._ss_status.setText(f"capturing {w}×{h}…")
+        else:
+            self._ss_status.setText("capturing…")
 
     def _on_screenshot_saved(self, path: str):
         fname = Path(path).name
@@ -4894,6 +6177,71 @@ class ControlGUI(QMainWindow):
 
         layout.addWidget(res_grp)
 
+        vsync_grp = _section("VSYNC")
+        vsync_l = QVBoxLayout(vsync_grp)
+        vsync_l.setSpacing(4)
+        import sys as _sys, os as _os
+        _on_wayland = (_sys.platform == 'linux' and
+                       bool(_os.environ.get('WAYLAND_DISPLAY') or
+                            _os.environ.get('XDG_SESSION_TYPE', '').lower() == 'wayland'))
+        if _on_wayland:
+            _lbl_hint(vsync_l,
+                "Wayland detected. VSync Off restarts GL via XWayland on next launch.\n"
+                "On: compositor-controlled sync (always active on Wayland).\n"
+                "Off: uses XWayland — requires restart to apply.")
+        else:
+            _lbl_hint(vsync_l,
+                "Synchronize rendering with monitor refresh rate.\n"
+                "On: caps FPS to monitor Hz, eliminates tearing.\n"
+                "Off: uncapped FPS, lower latency.")
+
+        vsync_row = QHBoxLayout()
+        self._vsync_cb = QCheckBox("Enable VSync")
+        self._vsync_cb.setChecked(_params.vsync)
+        vsync_row.addWidget(self._vsync_cb)
+        vsync_l.addLayout(vsync_row)
+
+        cap_row = QWidget()
+        cap_row_l = QHBoxLayout(cap_row)
+        cap_row_l.setContentsMargins(4, 2, 4, 2)
+        cap_row_l.setSpacing(6)
+        cap_lbl = QLabel("FPS Cap")
+        cap_lbl.setFixedWidth(80)
+        cap_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._fps_cap_slider = QSlider(Qt.Horizontal)
+        self._fps_cap_slider.setRange(0, 360)
+        self._fps_cap_slider.setValue(_params.fps_cap)
+        self._fps_cap_val_lbl = QLabel("Off" if _params.fps_cap == 0 else str(_params.fps_cap))
+        self._fps_cap_val_lbl.setFixedWidth(50)
+        self._fps_cap_val_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        cap_row_l.addWidget(cap_lbl)
+        cap_row_l.addWidget(self._fps_cap_slider, 1)
+        cap_row_l.addWidget(self._fps_cap_val_lbl)
+        vsync_l.addWidget(cap_row)
+        _lbl_hint(vsync_l, "FPS Cap: 0 = unlimited (active only when VSync is Off)")
+
+        def _on_vsync_toggled(state):
+            enabled = bool(state)
+            _params.vsync = enabled
+            wnd = _gl_window_ref[0]
+            if wnd is not None:
+                try:
+                    pw = getattr(wnd.wnd, '_window', None)
+                    if pw is not None:
+                        pw.vsync = enabled
+                except Exception:
+                    pass
+            cap_row.setVisible(not enabled)
+
+        def _on_fps_cap(v):
+            _params.fps_cap = v
+            self._fps_cap_val_lbl.setText("Off" if v == 0 else str(v))
+
+        cap_row.setVisible(not _params.vsync)
+        self._vsync_cb.stateChanged.connect(_on_vsync_toggled)
+        self._fps_cap_slider.valueChanged.connect(_on_fps_cap)
+        layout.addWidget(vsync_grp)
+
         FEATURES = [
             ('feat_ao',           'Ambient Occlusion',  '~6x sceneDist per pixel'),
             ('feat_shadows',      'Soft Shadows',       '~32x sceneDist per pixel'),
@@ -5255,6 +6603,8 @@ class ControlGUI(QMainWindow):
             'kl_rot_per_iter','kl_mix_factor',
             'kl_fold_limit_x','kl_fold_limit_y','kl_fold_limit_z',
             'kl_offset_x','kl_offset_y','kl_offset_z',
+            'qj_cx','qj_cy','qj_cz','qj_cw','qj_w_slice','qj_bailout',
+            'qj_slice_rot_xw','qj_slice_rot_yw','qj_slice_rot_zw',
             'offset_x','offset_y','offset_z',
             'light_x','light_y','light_z',
             'specular_power','specular_strength','ambient','subsurface','fresnel_power',
@@ -6025,7 +7375,15 @@ def _set_pyglet_icon(wnd):
     except Exception:
         pass
 
+def _is_wayland() -> bool:
+    import os
+    return bool(os.environ.get('WAYLAND_DISPLAY') or os.environ.get('XDG_SESSION_TYPE', '').lower() == 'wayland')
+
 def run_gl():
+    import os
+    if not _params.vsync and _is_wayland():
+        os.environ.setdefault('PYGLET_PLATFORM', 'x11')
+        os.environ.setdefault('DISPLAY', os.environ.get('DISPLAY', ':0'))
     mglw_settings.WINDOW = {
         'class':        'moderngl_window.context.pyglet.Window',
         'gl_version':   (3, 3),
@@ -6033,11 +7391,12 @@ def run_gl():
         'size':         (1280, 720),
         'aspect_ratio': False,
         'resizable':    True,
-        'vsync':        False,
+        'vsync':        _params.vsync,
     }
     mglw.run_window_config(FractalWindow)
 
 if __name__ == '__main__':
+    _ensure_ffmpeg_in_env()
     app = QApplication(sys.argv)
     icon = _make_icon()
     app.setWindowIcon(icon)
@@ -6047,8 +7406,17 @@ if __name__ == '__main__':
     gl_thread = threading.Thread(target=run_gl, daemon=True)
     gl_thread.start()
     def _on_gl_ready():
-        gui = ControlGUI()
-        gui.setWindowIcon(icon)
-        gui.show()
+        import traceback
+        try:
+            gui = ControlGUI()
+            gui.setWindowIcon(icon)
+            gui.show()
+        except Exception:
+            traceback.print_exc()
+            from pathlib import Path
+            Path(__file__).parent.joinpath('gui_crash.log').write_text(
+                traceback.format_exc(), encoding='utf-8'
+            )
+            raise
     _gl_signals.ready.connect(_on_gl_ready)
     sys.exit(app.exec_())
