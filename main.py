@@ -1305,40 +1305,7 @@ void main() {
 }
 """
 
-POST_VERT = """
-#version 330 core
-in vec2 in_position;
-out vec2 v_uv;
-void main() {
-    v_uv = in_position * 0.5 + 0.5;
-    gl_Position = vec4(in_position, 0.0, 1.0);
-}
-"""
-
-POST_FRAG = """
-#version 330 core
-in vec2 v_uv;
-out vec4 fragColor;
-
-uniform sampler2D u_scene;
-uniform float u_gamma;
-uniform float u_exposure;
-uniform float u_saturation;
-uniform int   u_flip_y;
-
-void main() {
-    vec2 uv = u_flip_y != 0 ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
-    vec3 col = texture(u_scene, uv).rgb;
-
-    col *= u_exposure;
-
-    float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
-    col = mix(vec3(lum), col, u_saturation);
-
-    col = pow(clamp(col, 0.0, 1.0), vec3(1.0 / max(u_gamma, 0.1)));
-    fragColor = vec4(col, 1.0);
-}
-"""
+from post_process import PostProcessor
 
 DEBUG_OVERLAY_VERT = """
 #version 330 core
@@ -1446,7 +1413,7 @@ _debug_overlay_enabled = False
 
 class FractalParams:
     def __init__(self):
-        self.iterations   = 8
+        self.iterations   = 32
         self.scale        = 3.0
         self.fold_x       = True
         self.fold_y       = True
@@ -1469,7 +1436,7 @@ class FractalParams:
         self.color3       = (1.0, 1.0, 1.0)
         self.color_mode   = 0
         self.ao_strength  = 1.0
-        self.shadow_soft  = 8.0
+        self.shadow_soft  = 32.0
         self.shadows      = True
         self.glow         = 5.0
         self.cam_pos      = [0.0, 0.0, 5.0]
@@ -1616,8 +1583,8 @@ class FractalParams:
         self.light_x          = 1.0
         self.light_y          = 2.0
         self.light_z          = 1.5
-        self.specular_power   = 32.0
-        self.specular_strength= 0.3
+        self.specular_power   = 2.0
+        self.specular_strength= 1.0
         self.ambient          = 0.2
         self.subsurface       = 0.0
         self.fresnel_power    = 5.0
@@ -1670,14 +1637,17 @@ class FractalParams:
         self.glow_intensity   = 5.0
         self.glow_falloff     = 8.0
         self.glow_radius      = 1.0
-        self.rim_strength     = 0.4
-        self.emission         = 0.2
+        self.rim_strength     = 0.0
+        self.emission         = 0.0
         # --- Background ---
         self.bg_color1        = (0.02, 0.03, 0.08)
         self.bg_color2        = (0.0,  0.0,  0.0)
-        self.bg_mode          = 1   # 0=flat 1=gradient 2=nebula 3=starfield
+        self.bg_mode          = 3   # 0=flat 1=gradient 2=nebula 3=starfield
         # --- Anti-aliasing ---
-        self.aa_samples       = 1   # 1=off 2=4xRGSS 3=9x
+        self.aa_samples       = 1   # 1=off 2=4xRGSS 3=9x 4=FXAA
+        self.fxaa_span_max    = 8.0
+        self.fxaa_reduce_mul  = 0.125
+        self.fxaa_reduce_min  = 0.0078125
         # --- Screenshot ---
         self.screenshot_requested = False
         self.screenshot_width     = 0
@@ -1685,7 +1655,7 @@ class FractalParams:
         self.player_mode = False
         # --- Render resolution ---
         self.render_scale        = 100
-        self.dyn_res_enabled     = False
+        self.dyn_res_enabled     = True
         self.dyn_res_target_fps  = 60
         self.dyn_res_min_fps     = 30
         self.vsync               = False
@@ -2418,20 +2388,21 @@ class PlayerState:
     FRICTION         = 10.0
     AIR_CONTROL      = 0.13
     SPEED_CAP        = 4.2
-    COLLISION_BIAS   = 1.0
+    COLLISION_BIAS   = 0.1
     GRAVITY_MODE     = 0
     PLAYER_HEIGHT    = 0.08
     GROUND_DIST      = 0.12
-    _PROBE_STEPS     = 6
-    _PUSH_ITERS      = 4
-    _GROUND_PROBES   = 5
-    CAM_SPRING_K     = 100.0
-    CAM_DAMPING      = 10.0
+    COLLIDER_RADIUS  = 0.0
+    _PROBE_STEPS     = 16
+    _PUSH_ITERS      = 140
+    _GROUND_PROBES   = 15
+    CAM_SPRING_K     = 300.0
+    CAM_DAMPING      = 25.0
     BOB_FREQ         = 0.0
-    BOB_AMP_V        = 0.006
-    BOB_AMP_H        = 0.003
-    BOB_SPEED_THRESH = 0.05
-    NORMAL_SMOOTH    = 6.0
+    BOB_AMP_V        = 0.6
+    BOB_AMP_H        = 0.3
+    BOB_SPEED_THRESH = 0.005
+    NORMAL_SMOOTH    = 0.0
 
     def __init__(self):
         self.vel              = [0.0, 0.0, 0.0]
@@ -2446,7 +2417,7 @@ class PlayerState:
         self._bob_phase       = 0.0
 
     def _calibrate_sdf_scale(self, pos):
-        eps = 0.2
+        eps = 0.1
         samples = [
             _py_sdf((pos[0]+eps, pos[1], pos[2])),
             _py_sdf((pos[0]-eps, pos[1], pos[2])),
@@ -2461,7 +2432,9 @@ class PlayerState:
         return max(mean_grad, 0.01)
 
     def _effective_radius(self):
-        return max(self.PLAYER_HEIGHT, 0.005) * self.COLLISION_BIAS
+        if self.COLLIDER_RADIUS > 0.0:
+            return self.COLLIDER_RADIUS
+        return max(self.PLAYER_HEIGHT, 0.005) * self.COLLISION_BIAS * 0.1
 
     def _ground_threshold(self):
         return self._effective_radius() + max(self.GROUND_DIST, 0.005)
@@ -2551,7 +2524,7 @@ class PlayerState:
         if mv_len > 1e-6:
             mvx /= mv_len; mvy /= mv_len; mvz /= mv_len
 
-        eff_move_spd  = self.MOVE_SPEED * spd_mul
+        eff_move_spd  = self.MOVE_SPEED * spd_mul * 0.5
         eff_speed_cap = self.SPEED_CAP  * spd_mul
 
         if self.on_ground:
@@ -2742,10 +2715,10 @@ class FractalWindow(mglw.WindowConfig):
         vbo = self.ctx.buffer(verts)
         self.vao = self.ctx.simple_vertex_array(self.prog, vbo, 'in_position')
 
-        self.post_prog = self.ctx.program(vertex_shader=POST_VERT,
-                                          fragment_shader=POST_FRAG)
-        self._post_uloc = {name: self.post_prog[name] for name in self.post_prog}
-        self.post_vao  = self.ctx.simple_vertex_array(self.post_prog, vbo, 'in_position')
+        self.post_prog = None
+        self._post_uloc = {}
+        self.post_vao  = None
+        self._post = PostProcessor(self.ctx, vbo)
 
         w, h = self.wnd.size
         self._fbo_size = (w, h)
@@ -2917,7 +2890,8 @@ class FractalWindow(mglw.WindowConfig):
         _sv('u_bg_color1',      tuple(self._smooth_bg_color1))
         _sv('u_bg_color2',      tuple(self._smooth_bg_color2))
         _sv('u_bg_mode',        p.bg_mode)
-        _sv('u_aa_samples',     p.aa_samples)
+        _sv('u_aa_samples',     min(p.aa_samples, 3))
+        self._post.set_fxaa_params(p.fxaa_span_max, p.fxaa_reduce_mul, p.fxaa_reduce_min)
         _sv('u_mb_fold_limit',   p.mb_fold_limit)
         _sv('u_mb_sphere_inner', p.mb_sphere_inner)
         _sv('u_mb_sphere_outer', p.mb_sphere_outer)
@@ -3096,14 +3070,11 @@ class FractalWindow(mglw.WindowConfig):
         self.vao.render(moderngl.TRIANGLE_STRIP)
         eye_fbo.use()
         eye_fbo.clear(0, 0, 0)
-        pl = self._post_uloc
-        scene_tex.use(location=0)
-        if 'u_scene'      in pl: pl['u_scene'].value      = 0
-        if 'u_resolution' in pl: pl['u_resolution'].value = (float(ew), float(eh))
-        if 'u_gamma'      in pl: pl['u_gamma'].value      = p.gamma
-        if 'u_exposure'   in pl: pl['u_exposure'].value   = p.exposure
-        if 'u_saturation' in pl: pl['u_saturation'].value = p.saturation
-        self.post_vao.render(moderngl.TRIANGLE_STRIP)
+        self._post.render(
+            scene_tex, eye_fbo,
+            p.gamma, p.exposure, p.saturation,
+            (float(ew), float(eh)), flip_y=False, fxaa=(p.aa_samples == 4),
+        )
 
     def _init_debug_overlay(self):
         self._dbg_prog = self.ctx.program(
@@ -3487,12 +3458,96 @@ class FractalWindow(mglw.WindowConfig):
         if k is not None:
             if action == PRESS:   _cam_input.keys_pressed.add(k)
             elif action == RELEASE: _cam_input.keys_pressed.discard(k)
+    def key_event(self, key, action, modifiers):
+        from moderngl_window.context.pyglet.keys import Keys
+        import pyglet
+        km = pyglet.window.key
+        PRESS   = self.wnd.keys.ACTION_PRESS
+        RELEASE = self.wnd.keys.ACTION_RELEASE
+        mod_keys = {
+            (km.LSHIFT, km.RSHIFT): 'shift',
+            (km.LALT,   km.RALT):   'alt',
+            (km.LCTRL,  km.RCTRL):  'ctrl',
+        }
+        for key_pair, name in mod_keys.items():
+            if key in key_pair:
+                if action == PRESS:   _cam_input.keys_pressed.add(name)
+                elif action == RELEASE: _cam_input.keys_pressed.discard(name)
+        if key == km.V and action == PRESS:
+            _params.player_mode = not _params.player_mode
+            if _params.player_mode:
+                _player_state.vel = [0.0, 0.0, 0.0]
+                _player_state.on_ground = False
+                _player_state.jump_queued = False
+                _player_state._smooth_pos = list(_params.cam_pos)
+                _player_state._smooth_vel = [0.0, 0.0, 0.0]
+                _player_state._smooth_normal = list(_player_state._surface_normal)
+                _player_state._bob_phase  = 0.0
+            self._set_mouse_exclusive(_params.player_mode)
+            return
+        if key == km.F1 and action == PRESS:
+            global _debug_overlay_enabled
+            _debug_overlay_enabled = not _debug_overlay_enabled
+            return
+        if key == km.F2 and action == PRESS:
+            p = _params
+            if not p.vr_mode:
+                ok = vr_mode.toggle_vr(self.ctx)
+                p.vr_mode = ok
+                if ok:
+                    vr_mode.reset_hmd_origin()
+            else:
+                vr_mode.toggle_vr(self.ctx)
+                p.vr_mode = False
+            return
+
+        if key == km.SPACE and action == PRESS and _params.player_mode:
+            _player_state.jump_queued = True
+            return
+        name_map = {
+            Keys.W: 'w', Keys.S: 's',
+            Keys.A: 'a', Keys.D: 'd',
+            Keys.Q: 'q', Keys.E: 'e',
+        }
+        try:
+            name_map[km.SPACE]    = 'space'
+            name_map[km.X]        = 'x'
+            name_map[km.RBRACKET] = 'rbracket'
+        except Exception:
+            pass
+        k = name_map.get(key)
+        if k is None:
+            try:
+                import pyglet
+                km2 = pyglet.window.key
+                if key == km2.F12 and action == PRESS:
+                    self._pending_screenshot = True
+                if key == km2.SPACE:
+                    k = 'space'
+                if key == km2.X:
+                    k = 'x'
+                if key == km2.RBRACKET:
+                    k = 'rbracket'
+            except Exception:
+                pass
+        if k is not None:
+            if action == PRESS:   _cam_input.keys_pressed.add(k)
+            elif action == RELEASE: _cam_input.keys_pressed.discard(k)
+
     def on_mouse_press_event(self, x, y, button):
         if button == 1:
             _cam_input.mouse_dragging = True
+    def mouse_press_event(self, x, y, button):
+        if button == 1:
+            _cam_input.mouse_dragging = True
+
     def on_mouse_release_event(self, x, y, button):
         if button == 1:
             _cam_input.mouse_dragging = False
+    def mouse_release_event(self, x, y, button):
+        if button == 1:
+            _cam_input.mouse_dragging = False
+
     def on_mouse_drag_event(self, x, y, dx, dy):
         if _params.player_mode:
             return
@@ -3501,18 +3556,41 @@ class FractalWindow(mglw.WindowConfig):
         _params.cam_yaw   += dx * self.MOUSE_SENS_YAW
         _params.cam_pitch  = max(-self.PITCH_LIMIT, min(self.PITCH_LIMIT,
             _params.cam_pitch - dy * self.MOUSE_SENS_PITCH))
+    def mouse_drag_event(self, x, y, dx, dy):
+        if _params.player_mode:
+            return
+        if not _cam_input.mouse_dragging:
+            return
+        _params.cam_yaw   += dx * self.MOUSE_SENS_YAW
+        _params.cam_pitch  = max(-self.PITCH_LIMIT, min(self.PITCH_LIMIT,
+            _params.cam_pitch - dy * self.MOUSE_SENS_PITCH))
+
     def on_mouse_position_event(self, x, y, dx, dy):
         if not _params.player_mode:
             return
         _params.cam_yaw   += dx * self.MOUSE_SENS_YAW
         _params.cam_pitch  = max(-self.PITCH_LIMIT, min(self.PITCH_LIMIT,
             _params.cam_pitch - dy * self.MOUSE_SENS_PITCH))
+    def mouse_position_event(self, x, y, dx, dy):
+        if not _params.player_mode:
+            return
+        _params.cam_yaw   += dx * self.MOUSE_SENS_YAW
+        _params.cam_pitch  = max(-self.PITCH_LIMIT, min(self.PITCH_LIMIT,
+            _params.cam_pitch - dy * self.MOUSE_SENS_PITCH))
+
     def on_mouse_scroll_event(self, x_offset, y_offset):
         mul = self._speed_mul()
         fwd, _, _ = self._calc_basis()
         p = _params.cam_pos
         spd = y_offset * self.MOUSE_SCROLL_SPD * mul
         _params.cam_pos = [p[0]+fwd[0]*spd, p[1]+fwd[1]*spd, p[2]+fwd[2]*spd]
+    def mouse_scroll_event(self, x_offset, y_offset):
+        mul = self._speed_mul()
+        fwd, _, _ = self._calc_basis()
+        p = _params.cam_pos
+        spd = y_offset * self.MOUSE_SCROLL_SPD * mul
+        _params.cam_pos = [p[0]+fwd[0]*spd, p[1]+fwd[1]*spd, p[2]+fwd[2]*spd]
+
     def _calc_basis(self):
         yaw, pitch, roll = _params.cam_yaw, _params.cam_pitch, _params.cam_roll
         fx =  math.cos(pitch) * math.sin(yaw)
@@ -3662,14 +3740,11 @@ class FractalWindow(mglw.WindowConfig):
         self.vao.render(moderngl.TRIANGLE_STRIP)
         self.ctx.screen.use()
         self.ctx.clear(0, 0, 0)
-        self._scene_tex.use(location=0)
-        pl = self._post_uloc
-        if 'u_scene'      in pl: pl['u_scene'].value      = 0
-        if 'u_resolution' in pl: pl['u_resolution'].value = self.wnd.size
-        if 'u_gamma'      in pl: pl['u_gamma'].value      = p.gamma
-        if 'u_exposure'   in pl: pl['u_exposure'].value   = p.exposure
-        if 'u_saturation' in pl: pl['u_saturation'].value = p.saturation
-        self.post_vao.render(moderngl.TRIANGLE_STRIP)
+        self._post.render(
+            self._scene_tex, self.ctx.screen,
+            p.gamma, p.exposure, p.saturation,
+            self.wnd.size, flip_y=False, fxaa=(p.aa_samples == 4),
+        )
         if self._pending_screenshot or p.screenshot_requested:
             self._pending_screenshot = False
             p.screenshot_requested   = False
@@ -3748,16 +3823,11 @@ class FractalWindow(mglw.WindowConfig):
             self._u_resolution.value = prev_res
         ob['fbo'].use()
         ob['fbo'].clear(0, 0, 0)
-        sb['tex'].use(location=0)
-        pl = self._post_uloc
-        if 'u_scene'      in pl: pl['u_scene'].value      = 0
-        if 'u_resolution' in pl: pl['u_resolution'].value = (tw, th)
-        if 'u_gamma'      in pl: pl['u_gamma'].value      = p.gamma
-        if 'u_exposure'   in pl: pl['u_exposure'].value   = p.exposure
-        if 'u_saturation' in pl: pl['u_saturation'].value = p.saturation
-        if 'u_flip_y'     in pl: pl['u_flip_y'].value     = 1
-        self.post_vao.render(moderngl.TRIANGLE_STRIP)
-        if 'u_flip_y' in pl: pl['u_flip_y'].value = 0
+        self._post.render(
+            sb['tex'], ob['fbo'],
+            p.gamma, p.exposure, p.saturation,
+            (tw, th), flip_y=True, fxaa=(p.aa_samples == 4),
+        )
         self.ctx.screen.use()
         self.ctx.finish()
         raw = bytes(ob['fbo'].read(components=3))
@@ -3802,14 +3872,11 @@ class FractalWindow(mglw.WindowConfig):
                 self._u_resolution.value = prev_res
             out_fbo.use()
             out_fbo.clear(0, 0, 0)
-            ss_tex.use(location=0)
-            pl = self._post_uloc
-            if 'u_scene'      in pl: pl['u_scene'].value      = 0
-            if 'u_resolution' in pl: pl['u_resolution'].value = (tw, th)
-            if 'u_gamma'      in pl: pl['u_gamma'].value      = p.gamma
-            if 'u_exposure'   in pl: pl['u_exposure'].value   = p.exposure
-            if 'u_saturation' in pl: pl['u_saturation'].value = p.saturation
-            self.post_vao.render(moderngl.TRIANGLE_STRIP)
+            self._post.render(
+                ss_tex, out_fbo,
+                p.gamma, p.exposure, p.saturation,
+                (tw, th), flip_y=False, fxaa=(p.aa_samples == 4),
+            )
             self.ctx.finish()
             raw = out_fbo.read(components=3)
             img = Image.frombytes('RGB', (tw, th), raw)
@@ -4449,6 +4516,7 @@ class ControlGUI(QMainWindow):
         self._build_raymarching_section()
         self._build_postprocess_section()
         self._build_aa_section()
+        self._build_screenshot_section()
         self._vbox.addStretch()
         tabs.addTab(tab_render, "Rendering")
 
@@ -5692,24 +5760,47 @@ class ControlGUI(QMainWindow):
         self._add_section(grp)
 
     def _build_aa_section(self):
-        grp = _section("ANTI-ALIASING  &  SCREENSHOT")
+        grp = _section("ANTI-ALIASING")
         layout = QVBoxLayout(grp)
         layout.setSpacing(4)
-        _lbl_hint(layout, "More samples = sharper edges, slower render")
+        _lbl_hint(layout, "More samples = sharper edges, slower render. FXAA = fast post-process AA.")
         aa_row = QHBoxLayout()
         self._aa_grp = QButtonGroup(self)
-        for i, lbl in enumerate(["Off (1x)", "RGSS 4x", "Grid 9x"]):
+        for i, lbl in enumerate(["Off (1x)", "RGSS 4x", "Grid 9x", "FXAA"]):
             rb = QRadioButton(lbl)
             rb.setChecked(i + 1 == _params.aa_samples)
             self._aa_grp.addButton(rb, i + 1)
             aa_row.addWidget(rb)
-        self._aa_grp.idClicked.connect(lambda idx: setattr(_params, 'aa_samples', idx))
+        self._aa_grp.idClicked.connect(self._on_aa_changed)
         layout.addLayout(aa_row)
+        fxaa_grp = _section("FXAA SETTINGS")
+        fxaa_l = QVBoxLayout(fxaa_grp)
+        fxaa_l.setSpacing(2)
+        _lbl_hint(fxaa_l, "Applied in post-process pass. No scene re-render cost.")
+        for label, attr, mn, mx, val, step in [
+            ("Span Max",    'fxaa_span_max',   1.0,   16.0, _params.fxaa_span_max,   0.5),
+            ("Reduce Mul",  'fxaa_reduce_mul', 0.0,    0.5, _params.fxaa_reduce_mul, 0.001),
+            ("Reduce Min",  'fxaa_reduce_min', 0.0,   0.02, _params.fxaa_reduce_min, 0.0001),
+        ]:
+            sr = SliderRow(label, mn, mx, val, step)
+            sr.on_change(lambda v, a=attr: setattr(_params, a, v))
+            sr._params_attr = attr
+            setattr(self, f'_sl_{attr}', sr)
+            fxaa_l.addWidget(sr)
+        fxaa_grp.setVisible(_params.aa_samples == 4)
+        self._fxaa_settings_grp = fxaa_grp
+        layout.addWidget(fxaa_grp)
+        self._add_section(grp)
 
-        # Screenshot button
-        sep = QLabel()
-        sep.setFixedHeight(4)
-        layout.addWidget(sep)
+    def _on_aa_changed(self, idx: int):
+        setattr(_params, 'aa_samples', idx)
+        if hasattr(self, '_fxaa_settings_grp'):
+            self._fxaa_settings_grp.setVisible(idx == 4)
+
+    def _build_screenshot_section(self):
+        grp = _section("SCREENSHOT")
+        layout = QVBoxLayout(grp)
+        layout.setSpacing(4)
 
         ss_res_row = QHBoxLayout()
         ss_res_lbl = QLabel("Resolution:")
@@ -5772,7 +5863,7 @@ class ControlGUI(QMainWindow):
         self._ss_h_spin.valueChanged.connect(_on_ss_custom_h)
 
         ss_row = QHBoxLayout()
-        ss_btn = QPushButton("📷  Save Screenshot  (F12)")
+        ss_btn = QPushButton("Save Screenshot  (F12)")
         ss_btn.clicked.connect(self._trigger_screenshot)
         ss_row.addWidget(ss_btn)
         self._ss_status = QLabel("")
@@ -6620,6 +6711,7 @@ class ControlGUI(QMainWindow):
             'rep_cell_x','rep_cell_y','rep_cell_z',
             'sph_inv_radius','sph_inv_cx','sph_inv_cy','sph_inv_cz',
             'lattice_fold_x','lattice_fold_y','lattice_fold_z',
+            'fxaa_span_max','fxaa_reduce_mul','fxaa_reduce_min',
         ]:
             sl = getattr(self, f'_sl_{attr}', None)
             if sl is not None:
@@ -6783,10 +6875,12 @@ class ControlGUI(QMainWindow):
         self._sl_ps_height   = _make_ps_slider("Player Height",'PLAYER_HEIGHT',     0.01, 1.0, 0.005)
         self._sl_ps_gnd      = _make_ps_slider("Ground Dist",  'GROUND_DIST',       0.01, 1.0, 0.005)
         self._sl_ps_bias     = _make_ps_slider("Coll. Bias",   'COLLISION_BIAS',    0.1, 10.0, 0.1)
+        self._sl_ps_col_rad  = _make_ps_slider("Coll. Radius", 'COLLIDER_RADIUS',   0.0, 1.0, 0.001)
 
         _lbl_hint(layout_phys,
             "Coll. Bias scales collision threshold to match fractal density.\n"
-            "Increase if falling through surface, decrease if hovering above it.")
+            "Increase if falling through surface, decrease if hovering above it.\n"
+            "Coll. Radius: explicit collider radius (0 = auto from Height * Bias).")
 
         self._add_section(grp_phys)
 
@@ -6875,6 +6969,7 @@ class ControlGUI(QMainWindow):
             ('AIR_CONTROL',      self._sl_ps_air),
             ('SPEED_CAP',        self._sl_ps_speedcap),
             ('COLLISION_BIAS',   self._sl_ps_bias),
+            ('COLLIDER_RADIUS',  self._sl_ps_col_rad),
         ]:
             sl.set_value(getattr(_player_state, attr))
 
@@ -7317,6 +7412,8 @@ class ControlGUI(QMainWindow):
             btn = self._aa_grp.button(preset['aa_samples'])
             if btn:
                 btn.setChecked(True)
+            if hasattr(self, '_fxaa_settings_grp'):
+                self._fxaa_settings_grp.setVisible(preset['aa_samples'] == 4)
 
     def _toolbar_reset_all(self):
         reply = QMessageBox.question(
