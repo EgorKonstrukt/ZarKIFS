@@ -14,7 +14,6 @@ POST_FRAG_SRC = """
 #version 330 core
 in vec2 v_uv;
 out vec4 fragColor;
-
 uniform sampler2D u_scene;
 uniform vec2  u_resolution;
 uniform float u_gamma;
@@ -22,25 +21,17 @@ uniform float u_exposure;
 uniform float u_saturation;
 uniform int   u_flip_y;
 uniform int   u_fxaa_enabled;
-
 uniform float u_fxaa_span_max;
 uniform float u_fxaa_reduce_mul;
 uniform float u_fxaa_reduce_min;
-
-vec3 sampleScene(vec2 uv) {
-    return texture(u_scene, uv).rgb;
-}
-
 vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
-    float spanMax    = max(u_fxaa_span_max, 1.0);
-    float reduceMul  = u_fxaa_reduce_mul;
-    float reduceMin  = u_fxaa_reduce_min;
-    vec3 lumW = vec3(0.299, 0.587, 0.114);
-    vec3 nw = sampleScene(uv + vec2(-1.0, -1.0) * rcpFrame);
-    vec3 ne = sampleScene(uv + vec2( 1.0, -1.0) * rcpFrame);
-    vec3 sw = sampleScene(uv + vec2(-1.0,  1.0) * rcpFrame);
-    vec3 se = sampleScene(uv + vec2( 1.0,  1.0) * rcpFrame);
-    vec3 m  = sampleScene(uv);
+    float spanMax   = max(u_fxaa_span_max, 1.0);
+    const vec3 lumW = vec3(0.299, 0.587, 0.114);
+    vec3 nw = texture(u_scene, uv + vec2(-1.0, -1.0) * rcpFrame).rgb;
+    vec3 ne = texture(u_scene, uv + vec2( 1.0, -1.0) * rcpFrame).rgb;
+    vec3 sw = texture(u_scene, uv + vec2(-1.0,  1.0) * rcpFrame).rgb;
+    vec3 se = texture(u_scene, uv + vec2( 1.0,  1.0) * rcpFrame).rgb;
+    vec3 m  = texture(u_scene, uv).rgb;
     float lumNW = dot(nw, lumW);
     float lumNE = dot(ne, lumW);
     float lumSW = dot(sw, lumW);
@@ -48,85 +39,606 @@ vec3 applyFXAA(vec2 uv, vec2 rcpFrame) {
     float lumM  = dot(m,  lumW);
     float lumMin = min(lumM, min(min(lumNW, lumNE), min(lumSW, lumSE)));
     float lumMax = max(lumM, max(max(lumNW, lumNE), max(lumSW, lumSE)));
+    if (lumMax - lumMin < lumMax * 0.125) return m;
     vec2 dir;
     dir.x = -((lumNW + lumNE) - (lumSW + lumSE));
     dir.y =  ((lumNW + lumSW) - (lumNE + lumSE));
-    float dirReduce = max((lumNW + lumNE + lumSW + lumSE) * (0.25 * reduceMul), reduceMin);
+    float dirReduce = max((lumNW + lumNE + lumSW + lumSE) * (0.25 * u_fxaa_reduce_mul), u_fxaa_reduce_min);
     float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
     dir = clamp(dir * rcpDirMin, vec2(-spanMax), vec2(spanMax)) * rcpFrame;
-    vec3 rgbA = 0.5 * (sampleScene(uv + dir * (1.0/3.0 - 0.5)) +
-                       sampleScene(uv + dir * (2.0/3.0 - 0.5)));
-    vec3 rgbB = rgbA * 0.5 + 0.25 * (sampleScene(uv + dir * -0.5) +
-                                       sampleScene(uv + dir *  0.5));
+    vec3 rgbA = 0.5 * (texture(u_scene, uv + dir * (1.0/3.0 - 0.5)).rgb +
+                       texture(u_scene, uv + dir * (2.0/3.0 - 0.5)).rgb);
+    vec3 rgbB = rgbA * 0.5 + 0.25 * (texture(u_scene, uv + dir * -0.5).rgb +
+                                       texture(u_scene, uv + dir *  0.5).rgb);
     float lumB = dot(rgbB, lumW);
     return (lumB < lumMin || lumB > lumMax) ? rgbA : rgbB;
 }
-
-vec3 applyToneAndGrade(vec3 col) {
+vec3 tonemap(vec3 col) {
     col *= u_exposure;
     float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
     col = mix(vec3(lum), col, u_saturation);
-    col = pow(clamp(col, 0.0, 1.0), vec3(1.0 / max(u_gamma, 0.1)));
-    return col;
+    return pow(clamp(col, 0.0, 1.0), vec3(1.0 / max(u_gamma, 0.1)));
 }
-
 void main() {
-    vec2 uv = u_flip_y != 0 ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
-    vec3 col;
-    if (u_fxaa_enabled != 0) {
-        vec2 rcpFrame = 1.0 / u_resolution;
-        col = applyFXAA(uv, rcpFrame);
-    } else {
-        col = texture(u_scene, uv).rgb;
-    }
-    col = applyToneAndGrade(col);
-    fragColor = vec4(col, 1.0);
+    vec2 uv = (u_flip_y != 0) ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
+    vec3 col = (u_fxaa_enabled != 0)
+        ? applyFXAA(uv, 1.0 / u_resolution)
+        : texture(u_scene, uv).rgb;
+    fragColor = vec4(tonemap(col), 1.0);
 }
 """
 
-FXAA_DEFAULTS = {
-    'span_max':    8.0,
-    'reduce_mul':  0.125,
-    'reduce_min':  0.0078125,
+TAA_FRAG_SRC = """
+#version 330 core
+in vec2 v_uv;
+out vec4 fragColor;
+uniform sampler2D u_current;
+uniform sampler2D u_history;
+uniform vec2  u_resolution;
+uniform vec2  u_jitter;
+uniform float u_blend_alpha;
+uniform int   u_taa_first;
+vec3 clipHistory(vec3 history, vec3 c, vec2 uv, vec2 rcp) {
+    vec3 n = texture(u_current, uv + vec2( 0.0,  1.0) * rcp).rgb;
+    vec3 s = texture(u_current, uv + vec2( 0.0, -1.0) * rcp).rgb;
+    vec3 e = texture(u_current, uv + vec2( 1.0,  0.0) * rcp).rgb;
+    vec3 w = texture(u_current, uv + vec2(-1.0,  0.0) * rcp).rgb;
+    vec3 cmin = min(c, min(min(n, s), min(e, w)));
+    vec3 cmax = max(c, max(max(n, s), max(e, w)));
+    vec3 center = (cmin + cmax) * 0.5;
+    vec3 extent = (cmax - cmin) * 0.625;
+    return clamp(history, center - extent, center + extent);
+}
+void main() {
+    vec2 rcpRes = 1.0 / u_resolution;
+    vec2 uvCur  = v_uv - u_jitter;
+    vec3 cur    = texture(u_current, uvCur).rgb;
+    if (u_taa_first != 0) { fragColor = vec4(cur, 1.0); return; }
+    vec3 hist = clipHistory(texture(u_history, v_uv).rgb, cur, uvCur, rcpRes);
+    fragColor = vec4(mix(hist, cur, u_blend_alpha), 1.0);
+}
+"""
+
+TONEMAP_FRAG_SRC = """
+#version 330 core
+in vec2 v_uv;
+out vec4 fragColor;
+uniform sampler2D u_scene;
+uniform float u_gamma;
+uniform float u_exposure;
+uniform float u_saturation;
+uniform int   u_flip_y;
+void main() {
+    vec2 uv  = (u_flip_y != 0) ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
+    vec3 col = texture(u_scene, uv).rgb * u_exposure;
+    float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    col = mix(vec3(lum), col, u_saturation);
+    fragColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / max(u_gamma, 0.1))), 1.0);
+}
+"""
+
+TONEMAP_SHARPEN_FRAG_SRC = """
+#version 330 core
+in vec2 v_uv;
+out vec4 fragColor;
+uniform sampler2D u_scene;
+uniform vec2  u_resolution;
+uniform float u_gamma;
+uniform float u_exposure;
+uniform float u_saturation;
+uniform int   u_flip_y;
+uniform float u_sharpen_strength;
+void main() {
+    vec2 uv  = (u_flip_y != 0) ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
+    vec2 rcp = 1.0 / u_resolution;
+    vec3 c   = texture(u_scene, uv).rgb;
+    vec3 n   = texture(u_scene, uv + vec2( 0.0,  1.0) * rcp).rgb;
+    vec3 s   = texture(u_scene, uv + vec2( 0.0, -1.0) * rcp).rgb;
+    vec3 e   = texture(u_scene, uv + vec2( 1.0,  0.0) * rcp).rgb;
+    vec3 w   = texture(u_scene, uv + vec2(-1.0,  0.0) * rcp).rgb;
+    vec3 lap = c * 4.0 - n - s - e - w;
+    vec3 col = clamp(c + lap * u_sharpen_strength, 0.0, 1.0) * u_exposure;
+    float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    col = mix(vec3(lum), col, u_saturation);
+    fragColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / max(u_gamma, 0.1))), 1.0);
+}
+"""
+
+FSR_EASU_FRAG_SRC = """
+#version 330 core
+in vec2 v_uv;
+out vec4 fragColor;
+uniform sampler2D u_scene;
+uniform vec2  u_src_resolution;
+uniform int   u_flip_y;
+uniform float u_easu_sharpness;
+
+float lanczos2Weight(float x) {
+    if (abs(x) < 1e-5) return 1.0;
+    if (abs(x) >= 2.0)  return 0.0;
+    float px = 3.14159265 * x;
+    float px2 = 3.14159265 * x * 0.5;
+    return (sin(px) / px) * (sin(px2) / px2);
 }
 
+vec3 sampleSrc(vec2 uv) {
+    return texture(u_scene, clamp(uv, vec2(0.0), vec2(1.0))).rgb;
+}
+
+vec3 fsrEasu(vec2 uv) {
+    vec2 rcp = 1.0 / u_src_resolution;
+    vec2 pp  = uv * u_src_resolution - 0.5;
+    vec2 tc  = floor(pp) + 0.5;
+    vec2 fp  = pp - floor(pp);
+
+    vec3 lumW = vec3(0.299, 0.587, 0.114);
+
+    vec3 c00 = sampleSrc((tc + vec2(-1.0, -1.0)) * rcp);
+    vec3 c10 = sampleSrc((tc + vec2( 0.0, -1.0)) * rcp);
+    vec3 c20 = sampleSrc((tc + vec2( 1.0, -1.0)) * rcp);
+    vec3 c30 = sampleSrc((tc + vec2( 2.0, -1.0)) * rcp);
+    vec3 c01 = sampleSrc((tc + vec2(-1.0,  0.0)) * rcp);
+    vec3 c11 = sampleSrc((tc + vec2( 0.0,  0.0)) * rcp);
+    vec3 c21 = sampleSrc((tc + vec2( 1.0,  0.0)) * rcp);
+    vec3 c31 = sampleSrc((tc + vec2( 2.0,  0.0)) * rcp);
+    vec3 c02 = sampleSrc((tc + vec2(-1.0,  1.0)) * rcp);
+    vec3 c12 = sampleSrc((tc + vec2( 0.0,  1.0)) * rcp);
+    vec3 c22 = sampleSrc((tc + vec2( 1.0,  1.0)) * rcp);
+    vec3 c32 = sampleSrc((tc + vec2( 2.0,  1.0)) * rcp);
+    vec3 c03 = sampleSrc((tc + vec2(-1.0,  2.0)) * rcp);
+    vec3 c13 = sampleSrc((tc + vec2( 0.0,  2.0)) * rcp);
+    vec3 c23 = sampleSrc((tc + vec2( 1.0,  2.0)) * rcp);
+    vec3 c33 = sampleSrc((tc + vec2( 2.0,  2.0)) * rcp);
+
+    float l11 = dot(c11, lumW), l21 = dot(c21, lumW);
+    float l12 = dot(c12, lumW), l22 = dot(c22, lumW);
+
+    float gx = (l21 - l11) + (l22 - l12);
+    float gy = (l12 - l11) + (l22 - l21);
+    float gLen = sqrt(gx*gx + gy*gy) + 1e-5;
+    vec2 dir = vec2(gx, gy) / gLen;
+
+    float edgeness = clamp(gLen * 4.0, 0.0, 1.0);
+    float aniso = mix(1.0, 1.0 + u_easu_sharpness * 1.5, edgeness);
+
+    vec3 col = vec3(0.0);
+    float wsum = 0.0;
+
+    vec2 offsets[16];
+    vec3 samples[16];
+    offsets[0]  = vec2(-1.0,-1.0); samples[0]  = c00;
+    offsets[1]  = vec2( 0.0,-1.0); samples[1]  = c10;
+    offsets[2]  = vec2( 1.0,-1.0); samples[2]  = c20;
+    offsets[3]  = vec2( 2.0,-1.0); samples[3]  = c30;
+    offsets[4]  = vec2(-1.0, 0.0); samples[4]  = c01;
+    offsets[5]  = vec2( 0.0, 0.0); samples[5]  = c11;
+    offsets[6]  = vec2( 1.0, 0.0); samples[6]  = c21;
+    offsets[7]  = vec2( 2.0, 0.0); samples[7]  = c31;
+    offsets[8]  = vec2(-1.0, 1.0); samples[8]  = c02;
+    offsets[9]  = vec2( 0.0, 1.0); samples[9]  = c12;
+    offsets[10] = vec2( 1.0, 1.0); samples[10] = c22;
+    offsets[11] = vec2( 2.0, 1.0); samples[11] = c32;
+    offsets[12] = vec2(-1.0, 2.0); samples[12] = c03;
+    offsets[13] = vec2( 0.0, 2.0); samples[13] = c13;
+    offsets[14] = vec2( 1.0, 2.0); samples[14] = c23;
+    offsets[15] = vec2( 2.0, 2.0); samples[15] = c33;
+
+    vec2 perp = vec2(-dir.y, dir.x);
+
+    for (int k = 0; k < 16; k++) {
+        vec2 d = offsets[k] - fp;
+        float along = dot(d, dir);
+        float across = dot(d, perp);
+        float wx = lanczos2Weight(along * aniso);
+        float wy = lanczos2Weight(across / aniso);
+        float w  = wx * wy;
+        col  += w * samples[k];
+        wsum += w;
+    }
+
+    if (wsum < 1e-4) {
+        return mix(c11, c22, fp.x * 0.5 + fp.y * 0.5);
+    }
+    return clamp(col / wsum, vec3(0.0), vec3(1.0));
+}
+
+void main() {
+    vec2 uv = (u_flip_y != 0) ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
+    fragColor = vec4(fsrEasu(uv), 1.0);
+}
+"""
+
+FSR_RCAS_FRAG_SRC = """
+#version 330 core
+in vec2 v_uv;
+out vec4 fragColor;
+uniform sampler2D u_scene;
+uniform vec2  u_resolution;
+uniform float u_gamma;
+uniform float u_exposure;
+uniform float u_saturation;
+uniform int   u_flip_y;
+uniform float u_rcas_sharpness;
+
+void main() {
+    vec2 uv  = (u_flip_y != 0) ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
+    vec2 rcp = 1.0 / u_resolution;
+
+    vec3 e  = texture(u_scene, uv).rgb;
+    vec3 n  = texture(u_scene, uv + vec2( 0.0,  1.0) * rcp).rgb;
+    vec3 s  = texture(u_scene, uv + vec2( 0.0, -1.0) * rcp).rgb;
+    vec3 ww = texture(u_scene, uv + vec2(-1.0,  0.0) * rcp).rgb;
+    vec3 ee = texture(u_scene, uv + vec2( 1.0,  0.0) * rcp).rgb;
+
+    vec3 lumW = vec3(0.299, 0.587, 0.114);
+    float le = dot(e,  lumW);
+    float ln = dot(n,  lumW);
+    float ls = dot(s,  lumW);
+    float lw = dot(ww, lumW);
+    float la = dot(ee, lumW);
+
+    float mn4 = min(le, min(min(ln, ls), min(lw, la)));
+    float mx4 = max(le, max(max(ln, ls), max(lw, la)));
+    float contrast = mx4 - mn4;
+
+    float sharpAmt = -u_rcas_sharpness * 0.125;
+    if (contrast < 1.0 / 255.0) sharpAmt = 0.0;
+
+    float denom = 1.0 + 4.0 * sharpAmt;
+    denom = max(denom, 1e-5);
+    vec3 col = clamp((e + (n + s + ww + ee) * sharpAmt) / denom, vec3(0.0), vec3(1.0));
+
+    col *= u_exposure;
+    float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    col = mix(vec3(lum), col, u_saturation);
+    fragColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / max(u_gamma, 0.1))), 1.0);
+}
+"""
+
+TAAU_UPSAMPLE_FRAG_SRC = FSR_EASU_FRAG_SRC
+
+FXAA_DEFAULTS        = {'span_max': 8.0, 'reduce_mul': 0.125, 'reduce_min': 0.0078125}
+TAA_SHARPEN_DEFAULT  = 0.15
+TAAU_SHARPEN_DEFAULT = 0.25
+TAAU_SCALE_DEFAULT   = 0.5
+TAAU_VALID_SCALES    = (0.25, 0.333, 0.5, 0.667, 0.75)
+
+FSR_EASU_SHARPNESS_DEFAULT = 0.5
+FSR_RCAS_SHARPNESS_DEFAULT = 0.25
+FSR_QUALITY_PRESETS = {
+    'Ultra Quality': {'scale': 0.77, 'easu': 0.35, 'rcas': 0.15},
+    'Quality':       {'scale': 0.667,'easu': 0.50, 'rcas': 0.25},
+    'Balanced':      {'scale': 0.585,'easu': 0.65, 'rcas': 0.30},
+    'Performance':   {'scale': 0.5,  'easu': 0.80, 'rcas': 0.35},
+    'Ultra Perf':    {'scale': 0.333,'easu': 1.00, 'rcas': 0.40},
+}
+
+
+def _halton(base, n):
+    out = []
+    for i in range(1, n + 1):
+        f, r, j = 1.0, 0.0, i
+        while j > 0:
+            f /= base; r += f * (j % base); j //= base
+        out.append(r)
+    return out
+
+
+TAA_JITTER_SEQ = tuple((x - 0.5, y - 0.5) for x, y in zip(_halton(2, 16), _halton(3, 16)))
+_TAA_SEQ_LEN   = len(TAA_JITTER_SEQ)
+
+
+def _make_fbo(ctx, w, h):
+    tex = ctx.texture((w, h), 3, dtype='f4')
+    tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    return {'tex': tex, 'fbo': ctx.framebuffer(color_attachments=[tex])}
+
+
+def _free_fbo(b):
+    if b is None:
+        return
+    for k in ('fbo', 'tex'):
+        try: b[k].release()
+        except Exception: pass
+
+
 class PostProcessor:
+    TAA_BLEND_ALPHA = 0.1
+
     def __init__(self, ctx: moderngl.Context, quad_vbo: moderngl.Buffer):
-        self._ctx  = ctx
-        self._prog = ctx.program(vertex_shader=POST_VERT_SRC,
-                                  fragment_shader=POST_FRAG_SRC)
-        self._uloc = {name: self._prog[name] for name in self._prog}
-        self._vao  = ctx.simple_vertex_array(self._prog, quad_vbo, 'in_position')
-        self._set_fxaa_defaults()
+        self._ctx = ctx
+        self._prog_fxaa  = ctx.program(vertex_shader=POST_VERT_SRC, fragment_shader=POST_FRAG_SRC)
+        self._prog_taa   = ctx.program(vertex_shader=POST_VERT_SRC, fragment_shader=TAA_FRAG_SRC)
+        self._prog_tone  = ctx.program(vertex_shader=POST_VERT_SRC, fragment_shader=TONEMAP_FRAG_SRC)
+        self._prog_sharp = ctx.program(vertex_shader=POST_VERT_SRC, fragment_shader=TONEMAP_SHARPEN_FRAG_SRC)
+        self._prog_fsr_easu = ctx.program(vertex_shader=POST_VERT_SRC, fragment_shader=FSR_EASU_FRAG_SRC)
+        self._prog_fsr_rcas = ctx.program(vertex_shader=POST_VERT_SRC, fragment_shader=FSR_RCAS_FRAG_SRC)
+        self._vao_fxaa      = ctx.simple_vertex_array(self._prog_fxaa,     quad_vbo, 'in_position')
+        self._vao_taa       = ctx.simple_vertex_array(self._prog_taa,      quad_vbo, 'in_position')
+        self._vao_tone      = ctx.simple_vertex_array(self._prog_tone,     quad_vbo, 'in_position')
+        self._vao_sharp     = ctx.simple_vertex_array(self._prog_sharp,    quad_vbo, 'in_position')
+        self._vao_fsr_easu  = ctx.simple_vertex_array(self._prog_fsr_easu, quad_vbo, 'in_position')
+        self._vao_fsr_rcas  = ctx.simple_vertex_array(self._prog_fsr_rcas, quad_vbo, 'in_position')
+        pf = self._prog_fxaa
+        self._uf_scene       = pf['u_scene']
+        self._uf_resolution  = pf['u_resolution']
+        self._uf_gamma       = pf['u_gamma']
+        self._uf_exposure    = pf['u_exposure']
+        self._uf_saturation  = pf['u_saturation']
+        self._uf_flip_y      = pf['u_flip_y']
+        self._uf_fxaa_en     = pf['u_fxaa_enabled']
+        self._uf_span_max    = pf['u_fxaa_span_max']
+        self._uf_reduce_mul  = pf['u_fxaa_reduce_mul']
+        self._uf_reduce_min  = pf['u_fxaa_reduce_min']
+        self._uf_span_max.value   = FXAA_DEFAULTS['span_max']
+        self._uf_reduce_mul.value = FXAA_DEFAULTS['reduce_mul']
+        self._uf_reduce_min.value = FXAA_DEFAULTS['reduce_min']
+        pt = self._prog_taa
+        self._ut_current    = pt['u_current']
+        self._ut_history    = pt['u_history']
+        self._ut_resolution = pt['u_resolution']
+        self._ut_jitter     = pt['u_jitter']
+        self._ut_blend      = pt['u_blend_alpha']
+        self._ut_first      = pt['u_taa_first']
+        po = self._prog_tone
+        self._uo_scene      = po['u_scene']
+        self._uo_gamma      = po['u_gamma']
+        self._uo_exposure   = po['u_exposure']
+        self._uo_saturation = po['u_saturation']
+        self._uo_flip_y     = po['u_flip_y']
+        ps = self._prog_sharp
+        self._us_scene      = ps['u_scene']
+        self._us_resolution = ps['u_resolution']
+        self._us_gamma      = ps['u_gamma']
+        self._us_exposure   = ps['u_exposure']
+        self._us_saturation = ps['u_saturation']
+        self._us_flip_y     = ps['u_flip_y']
+        self._us_strength   = ps['u_sharpen_strength']
+        pe = self._prog_fsr_easu
+        self._ue_scene      = pe['u_scene']
+        self._ue_src_res    = pe['u_src_resolution']
+        self._ue_flip_y     = pe['u_flip_y']
+        self._ue_easu_sharp = pe['u_easu_sharpness']
+        pr = self._prog_fsr_rcas
+        self._ur_scene      = pr['u_scene']
+        self._ur_resolution = pr['u_resolution']
+        self._ur_gamma      = pr['u_gamma']
+        self._ur_exposure   = pr['u_exposure']
+        self._ur_saturation = pr['u_saturation']
+        self._ur_flip_y     = pr['u_flip_y']
+        self._ur_rcas_sharp = pr['u_rcas_sharpness']
+        self._taa_size      = (0, 0)
+        self._taa_bufs      = [None, None]
+        self._taa_cur       = 0
+        self._taa_first     = True
+        self._taa_frame     = 0
+        self._taau_scale    = TAAU_SCALE_DEFAULT
+        self._taau_size     = (0, 0)
+        self._taau_bufs     = [None, None]
+        self._taau_cur      = 0
+        self._taau_first    = True
+        self._taau_frame    = 0
+        self._taa_sharpen   = TAA_SHARPEN_DEFAULT
+        self._taau_sharpen  = TAAU_SHARPEN_DEFAULT
+        self._fsr_easu_sharpness = FSR_EASU_SHARPNESS_DEFAULT
+        self._fsr_rcas_sharpness = FSR_RCAS_SHARPNESS_DEFAULT
+        self._fsr_easu_buf       = None
+        self._fsr_easu_buf_size  = (0, 0)
 
-    def _set_fxaa_defaults(self):
-        self._set('u_fxaa_span_max',   FXAA_DEFAULTS['span_max'])
-        self._set('u_fxaa_reduce_mul', FXAA_DEFAULTS['reduce_mul'])
-        self._set('u_fxaa_reduce_min', FXAA_DEFAULTS['reduce_min'])
+    def _ensure_taa_bufs(self, w: int, h: int):
+        if self._taa_size == (w, h):
+            return
+        for b in self._taa_bufs:
+            _free_fbo(b)
+        self._taa_bufs  = [_make_fbo(self._ctx, w, h) for _ in range(2)]
+        self._taa_size  = (w, h)
+        self._taa_cur   = 0
+        self._taa_first = True
 
-    def _set(self, name, value):
-        if name in self._uloc:
-            self._uloc[name].value = value
+    def _ensure_taau_bufs(self, sw: int, sh: int):
+        if self._taau_size == (sw, sh):
+            return
+        for b in self._taau_bufs:
+            _free_fbo(b)
+        self._taau_bufs  = [_make_fbo(self._ctx, sw, sh) for _ in range(2)]
+        self._taau_size  = (sw, sh)
+        self._taau_cur   = 0
+        self._taau_first = True
 
-    def render(self, scene_tex: moderngl.Texture, target_fbo: moderngl.Framebuffer,
-               gamma: float, exposure: float, saturation: float,
-               resolution: tuple, flip_y: bool = False, fxaa: bool = False):
+    def render(self,
+               scene_tex: moderngl.Texture,
+               target_fbo: moderngl.Framebuffer,
+               gamma: float,
+               exposure: float,
+               saturation: float,
+               resolution: tuple,
+               flip_y: bool = False,
+               fxaa: bool = False,
+               taa: bool = False,
+               taa_sharpen: bool = False,
+               taau: bool = False):
+        if taau:
+            self._render_taau(scene_tex, target_fbo, gamma, exposure, saturation, resolution, flip_y)
+        elif taa:
+            self._render_taa(scene_tex, target_fbo, gamma, exposure, saturation, resolution, flip_y, taa_sharpen)
+        else:
+            self._render_fxaa(scene_tex, target_fbo, gamma, exposure, saturation, resolution, flip_y, fxaa)
+
+    def _render_fxaa(self, scene_tex, target_fbo, gamma, exposure, saturation, resolution, flip_y, fxaa_on):
+        rw, rh = resolution
         target_fbo.use()
         scene_tex.use(location=0)
-        self._set('u_scene',        0)
-        self._set('u_resolution',   (float(resolution[0]), float(resolution[1])))
-        self._set('u_gamma',        gamma)
-        self._set('u_exposure',     exposure)
-        self._set('u_saturation',   saturation)
-        self._set('u_flip_y',       1 if flip_y else 0)
-        self._set('u_fxaa_enabled', 1 if fxaa else 0)
-        self._vao.render(moderngl.TRIANGLE_STRIP)
+        self._uf_scene.value      = 0
+        self._uf_resolution.value = (float(rw), float(rh))
+        self._uf_gamma.value      = gamma
+        self._uf_exposure.value   = exposure
+        self._uf_saturation.value = saturation
+        self._uf_flip_y.value     = 1 if flip_y else 0
+        self._uf_fxaa_en.value    = 1 if fxaa_on else 0
+        self._vao_fxaa.render(moderngl.TRIANGLE_STRIP)
+
+    def _render_taa(self, scene_tex, target_fbo, gamma, exposure, saturation, resolution, flip_y, sharpen):
+        rw, rh   = resolution
+        self._ensure_taa_bufs(rw, rh)
+        cur_idx  = self._taa_cur
+        hist_idx = 1 - cur_idx
+        cur_buf  = self._taa_bufs[cur_idx]
+        hist_buf = self._taa_bufs[hist_idx]
+        jx, jy   = TAA_JITTER_SEQ[self._taa_frame % _TAA_SEQ_LEN]
+        cur_buf['fbo'].use()
+        scene_tex.use(location=0)
+        hist_buf['tex'].use(location=1)
+        self._ut_current.value    = 0
+        self._ut_history.value    = 1
+        self._ut_resolution.value = (float(rw), float(rh))
+        self._ut_jitter.value     = (jx / rw, jy / rh)
+        self._ut_blend.value      = self.TAA_BLEND_ALPHA
+        self._ut_first.value      = 1 if self._taa_first else 0
+        self._vao_taa.render(moderngl.TRIANGLE_STRIP)
+        target_fbo.use()
+        cur_buf['tex'].use(location=0)
+        if sharpen:
+            self._us_scene.value      = 0
+            self._us_resolution.value = (float(rw), float(rh))
+            self._us_gamma.value      = gamma
+            self._us_exposure.value   = exposure
+            self._us_saturation.value = saturation
+            self._us_flip_y.value     = 1 if flip_y else 0
+            self._us_strength.value   = self._taa_sharpen
+            self._vao_sharp.render(moderngl.TRIANGLE_STRIP)
+        else:
+            self._uo_scene.value      = 0
+            self._uo_gamma.value      = gamma
+            self._uo_exposure.value   = exposure
+            self._uo_saturation.value = saturation
+            self._uo_flip_y.value     = 1 if flip_y else 0
+            self._vao_tone.render(moderngl.TRIANGLE_STRIP)
+        self._taa_cur   = hist_idx
+        self._taa_first = False
+        self._taa_frame += 1
+
+    def _ensure_fsr_easu_buf(self, w: int, h: int):
+        if self._fsr_easu_buf_size == (w, h):
+            return
+        _free_fbo(self._fsr_easu_buf)
+        tex = self._ctx.texture((w, h), 3, dtype='f4')
+        tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._fsr_easu_buf = {'tex': tex, 'fbo': self._ctx.framebuffer(color_attachments=[tex])}
+        self._fsr_easu_buf_size = (w, h)
+
+    def _render_taau(self, scene_tex, target_fbo, gamma, exposure, saturation, resolution, flip_y):
+        rw, rh = resolution
+        sw     = max(1, int(rw * self._taau_scale))
+        sh     = max(1, int(rh * self._taau_scale))
+        self._ensure_taau_bufs(sw, sh)
+        self._ensure_fsr_easu_buf(rw, rh)
+        cur_idx  = self._taau_cur
+        hist_idx = 1 - cur_idx
+        cur_buf  = self._taau_bufs[cur_idx]
+        hist_buf = self._taau_bufs[hist_idx]
+        jx, jy   = TAA_JITTER_SEQ[self._taau_frame % _TAA_SEQ_LEN]
+        cur_buf['fbo'].use()
+        scene_tex.use(location=0)
+        hist_buf['tex'].use(location=1)
+        self._ut_current.value    = 0
+        self._ut_history.value    = 1
+        self._ut_resolution.value = (float(sw), float(sh))
+        self._ut_jitter.value     = (jx / sw, jy / sh)
+        self._ut_blend.value      = self.TAA_BLEND_ALPHA
+        self._ut_first.value      = 1 if self._taau_first else 0
+        self._vao_taa.render(moderngl.TRIANGLE_STRIP)
+        easu_buf = self._fsr_easu_buf
+        easu_buf['fbo'].use()
+        cur_buf['tex'].use(location=0)
+        self._ue_scene.value      = 0
+        self._ue_src_res.value    = (float(sw), float(sh))
+        self._ue_flip_y.value     = 0
+        self._ue_easu_sharp.value = self._fsr_easu_sharpness
+        self._vao_fsr_easu.render(moderngl.TRIANGLE_STRIP)
+        target_fbo.use()
+        easu_buf['tex'].use(location=0)
+        self._ur_scene.value      = 0
+        self._ur_resolution.value = (float(rw), float(rh))
+        self._ur_gamma.value      = gamma
+        self._ur_exposure.value   = exposure
+        self._ur_saturation.value = saturation
+        self._ur_flip_y.value     = 1 if flip_y else 0
+        self._ur_rcas_sharp.value = self._fsr_rcas_sharpness
+        self._vao_fsr_rcas.render(moderngl.TRIANGLE_STRIP)
+        self._taau_cur   = hist_idx
+        self._taau_first = False
+        self._taau_frame += 1
+
+    def get_taau_render_size(self, output_w: int, output_h: int) -> tuple:
+        return (max(1, int(output_w * self._taau_scale)),
+                max(1, int(output_h * self._taau_scale)))
 
     def set_fxaa_params(self, span_max: float, reduce_mul: float, reduce_min: float):
-        self._set('u_fxaa_span_max',   span_max)
-        self._set('u_fxaa_reduce_mul', reduce_mul)
-        self._set('u_fxaa_reduce_min', reduce_min)
+        self._uf_span_max.value   = span_max
+        self._uf_reduce_mul.value = reduce_mul
+        self._uf_reduce_min.value = reduce_min
+
+    def set_taa_blend(self, alpha: float):
+        self.TAA_BLEND_ALPHA = max(0.01, min(1.0, alpha))
+
+    def set_taa_sharpen(self, strength: float):
+        self._taa_sharpen = max(0.0, min(1.0, strength))
+
+    def set_taau_sharpen(self, strength: float):
+        self._taau_sharpen = max(0.0, min(1.0, strength))
+
+    def set_taau_scale(self, scale: float):
+        self._taau_scale = min(TAAU_VALID_SCALES, key=lambda x: abs(x - scale))
+        self._taau_size  = (0, 0)
+        self._taau_first = True
+        self._taau_frame = 0
+        self._fsr_easu_buf_size = (0, 0)
+
+    def set_fsr_easu_sharpness(self, v: float):
+        self._fsr_easu_sharpness = max(0.0, min(1.0, v))
+
+    def set_fsr_rcas_sharpness(self, v: float):
+        self._fsr_rcas_sharpness = max(0.0, min(1.0, v))
+
+    def apply_fsr_preset(self, preset_name: str):
+        if preset_name not in FSR_QUALITY_PRESETS:
+            return
+        p = FSR_QUALITY_PRESETS[preset_name]
+        self.set_taau_scale(p['scale'])
+        self.set_fsr_easu_sharpness(p['easu'])
+        self.set_fsr_rcas_sharpness(p['rcas'])
+
+    def get_fsr_info(self) -> dict:
+        sw = max(1, int(100 * self._taau_scale))
+        return {
+            'render_pct':     int(round(self._taau_scale * 100)),
+            'easu_sharpness': self._fsr_easu_sharpness,
+            'rcas_sharpness': self._fsr_rcas_sharpness,
+        }
+
+    def reset_taa(self):
+        self._taa_first  = True
+        self._taa_frame  = 0
+        self._taau_first = True
+        self._taau_frame = 0
+
+    def get_taa_jitter(self, scene_w: int, scene_h: int) -> tuple:
+        jx, jy = TAA_JITTER_SEQ[self._taa_frame % _TAA_SEQ_LEN]
+        return (jx / scene_w * 2.0, jy / scene_h * 2.0)
+
+    def get_taau_jitter(self, output_w: int, output_h: int) -> tuple:
+        sw = max(1, int(output_w * self._taau_scale))
+        sh = max(1, int(output_h * self._taau_scale))
+        jx, jy = TAA_JITTER_SEQ[self._taau_frame % _TAA_SEQ_LEN]
+        return (jx / sw * 2.0, jy / sh * 2.0)
 
     def release(self):
-        self._vao.release()
-        self._prog.release()
+        for vao in (self._vao_fxaa, self._vao_taa, self._vao_tone, self._vao_sharp, self._vao_fsr_easu, self._vao_fsr_rcas):
+            try: vao.release()
+            except Exception: pass
+        for prog in (self._prog_fxaa, self._prog_taa, self._prog_tone, self._prog_sharp, self._prog_fsr_easu, self._prog_fsr_rcas):
+            try: prog.release()
+            except Exception: pass
+        for b in self._taa_bufs + self._taau_bufs:
+            _free_fbo(b)
+        _free_fbo(self._fsr_easu_buf)

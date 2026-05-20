@@ -25,7 +25,7 @@ from moderngl_window.conf import settings as mglw_settings
 import app_config
 import vr_mode
 
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 
 try:
     from animation_editor import (
@@ -365,6 +365,7 @@ uniform int   u_milkyway;
 
 // --- Anti-aliasing ---
 uniform int   u_aa_samples;
+uniform vec2  u_taa_jitter;    // субпиксельный NDC-сдвиг для TAA
 
 // --- Performance feature flags ---
 uniform int u_feat_ao;           // 0=off 1=on
@@ -1032,7 +1033,7 @@ vec2 hash2(vec2 p) {
     return fract(sin(vec2(dot(p, vec2(127.1, 311.7)),
                           dot(p, vec2(269.5, 183.3)))) * 43758.5453);
 }
-float noise2(vec2 p) {
+float smoothNoise2(vec2 p) {
     vec2 i = floor(p), f = fract(p);
     f = f*f*(3.0-2.0*f);
     return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),
@@ -1041,7 +1042,7 @@ float noise2(vec2 p) {
 float fbm(vec2 p) {
     float v = 0.0, a = 0.5;
     for (int i = 0; i < 5; i++) {
-        v += a * noise2(p);
+        v += a * smoothNoise2(p);
         p  = p * 2.1 + vec2(1.7, 9.2);
         a *= 0.5;
     }
@@ -1127,8 +1128,8 @@ vec3 background(vec3 rd, float t) {
     if (u_bg_mode == 1) return mix(u_bg_color2, u_bg_color1, h);
     vec2 cuv = cubeFaceUV(rd);
     if (u_bg_mode == 2) {
-        float n1 = noise2(cuv * 1.5 + vec2(t * 0.05, 0.0));
-        float n2 = noise2(cuv * 3.0 - vec2(0.0, t * 0.03));
+        float n1 = smoothNoise2(cuv * 1.5 + vec2(t * 0.05, 0.0));
+        float n2 = smoothNoise2(cuv * 3.0 - vec2(0.0, t * 0.03));
         float n  = n1 * 0.6 + n2 * 0.4;
         return mix(u_bg_color2, u_bg_color1, n) * (0.4 + 0.6 * h);
     }
@@ -1279,7 +1280,9 @@ void main() {
 
     vec3 col = vec3(0.0);
     if (u_aa_samples <= 1) {
-        col = castRay(vec2(v_uv.x * aspect, v_uv.y), t);
+        // TAA: субпиксельный джиттер (u_taa_jitter == 0 когда TAA выключен)
+        vec2 jUV = v_uv + u_taa_jitter;
+        col = castRay(vec2(jUV.x * aspect, jUV.y), t);
     } else if (u_aa_samples == 2) {
         const vec2 o[4] = vec2[4](vec2(-0.25,-0.25), vec2( 0.25,-0.25),
                                    vec2(-0.25, 0.25), vec2( 0.25, 0.25));
@@ -1644,10 +1647,17 @@ class FractalParams:
         self.bg_color2        = (0.0,  0.0,  0.0)
         self.bg_mode          = 3   # 0=flat 1=gradient 2=nebula 3=starfield
         # --- Anti-aliasing ---
-        self.aa_samples       = 1   # 1=off 2=4xRGSS 3=9x 4=FXAA
+        self.aa_samples       = 1   # 1=off 2=4xRGSS 3=9x 4=FXAA 5=TAA 6=TAAU
         self.fxaa_span_max    = 8.0
         self.fxaa_reduce_mul  = 0.125
         self.fxaa_reduce_min  = 0.0078125
+        self.taa_sharpen_enabled = False
+        self.taa_sharpen_str     = 0.15
+        self.taau_sharpen        = 0.5
+        self.taau_scale          = 0.5
+        self.fsr_easu_sharpness  = 0.5
+        self.fsr_rcas_sharpness  = 0.25
+        self.fsr_preset          = "Quality"
         # --- Screenshot ---
         self.screenshot_requested = False
         self.screenshot_width     = 0
@@ -1717,6 +1727,7 @@ _FRACTAL_FIELDS = [
     'feat_fog', 'feat_glow', 'feat_reflection', 'feat_subsurface', 'feat_orbit_trap',
     'glow_intensity', 'glow_falloff', 'glow_radius', 'rim_strength', 'emission',
     'bg_color1', 'bg_color2', 'bg_mode', 'aa_samples',
+    'fsr_easu_sharpness', 'fsr_rcas_sharpness', 'fsr_preset',
 ]
 _SESSION_EXTRA_FIELDS = ['cam_pos', 'cam_yaw', 'cam_pitch', 'cam_roll', 'player_mode']
 
@@ -2719,6 +2730,11 @@ class FractalWindow(mglw.WindowConfig):
         self._post_uloc = {}
         self.post_vao  = None
         self._post = PostProcessor(self.ctx, vbo)
+        self._post.set_taa_sharpen(_params.taa_sharpen_str)
+        self._post.set_taau_sharpen(_params.taau_sharpen)
+        self._post.set_taau_scale(_params.taau_scale)
+        self._post.set_fsr_easu_sharpness(_params.fsr_easu_sharpness)
+        self._post.set_fsr_rcas_sharpness(_params.fsr_rcas_sharpness)
 
         w, h = self.wnd.size
         self._fbo_size = (w, h)
@@ -2890,7 +2906,25 @@ class FractalWindow(mglw.WindowConfig):
         _sv('u_bg_color1',      tuple(self._smooth_bg_color1))
         _sv('u_bg_color2',      tuple(self._smooth_bg_color2))
         _sv('u_bg_mode',        p.bg_mode)
-        _sv('u_aa_samples',     min(p.aa_samples, 3))
+        _sv('u_aa_samples',     min(p.aa_samples, 3) if p.aa_samples not in (5, 6) else 1)
+        if p.aa_samples == 5:
+            gl_wnd = _gl_window_ref[0]
+            if gl_wnd is not None and hasattr(gl_wnd, '_post'):
+                rw, rh = gl_wnd._fbo_size
+                jx, jy = gl_wnd._post.get_taa_jitter(rw, rh)
+                _sv('u_taa_jitter', (jx, jy))
+            else:
+                _sv('u_taa_jitter', (0.0, 0.0))
+        elif p.aa_samples == 6:
+            gl_wnd = _gl_window_ref[0]
+            if gl_wnd is not None and hasattr(gl_wnd, '_post'):
+                rw, rh = gl_wnd._fbo_size
+                jx, jy = gl_wnd._post.get_taau_jitter(rw, rh)
+                _sv('u_taa_jitter', (jx, jy))
+            else:
+                _sv('u_taa_jitter', (0.0, 0.0))
+        else:
+            _sv('u_taa_jitter', (0.0, 0.0))
         self._post.set_fxaa_params(p.fxaa_span_max, p.fxaa_reduce_mul, p.fxaa_reduce_min)
         _sv('u_mb_fold_limit',   p.mb_fold_limit)
         _sv('u_mb_sphere_inner', p.mb_sphere_inner)
@@ -3073,7 +3107,10 @@ class FractalWindow(mglw.WindowConfig):
         self._post.render(
             scene_tex, eye_fbo,
             p.gamma, p.exposure, p.saturation,
-            (float(ew), float(eh)), flip_y=False, fxaa=(p.aa_samples == 4),
+            (float(rw), float(rh)),  # FBO-размер VR-рендера, не размер глаза
+            flip_y=False,
+            fxaa=(p.aa_samples == 4),
+            taa=False,               # TAA не применяется для VR
         )
 
     def _init_debug_overlay(self):
@@ -3243,8 +3280,13 @@ class FractalWindow(mglw.WindowConfig):
     def _get_render_size(self):
         ww, wh = self.wnd.size
         scale = max(10, min(200, self._dyn_res_scale)) / 100.0
-        rw = max(1, int(ww * scale))
-        rh = max(1, int(wh * scale))
+        if _params.aa_samples == 6:
+            taau_scale = self._post._taau_scale if hasattr(self, '_post') else 0.5
+            rw = max(1, int(ww * scale * taau_scale))
+            rh = max(1, int(wh * scale * taau_scale))
+        else:
+            rw = max(1, int(ww * scale))
+            rh = max(1, int(wh * scale))
         return rw, rh
 
     def _update_dyn_res(self, ft):
@@ -3670,10 +3712,19 @@ class FractalWindow(mglw.WindowConfig):
             if ft > 0.0:
                 self._display_fps = 1.0 / ft
             scale_str = f' | {int(round(self._dyn_res_scale))}%' if _params.dyn_res_enabled else (f' | {_params.render_scale}%' if _params.render_scale != 100 else '')
+            rw, rh = self._fbo_size
+            ww, wh = self.wnd.size
+            if _params.aa_samples == 6:
+                taau_scale = self._post._taau_scale if hasattr(self, '_post') else 0.5
+                _irw = max(1, int(rw * taau_scale))
+                _irh = max(1, int(rh * taau_scale))
+                res_str = f' | {ww}x{wh} (FSR {_irw}x{_irh})'
+            else:
+                res_str = f' | {rw}x{rh}' if (rw, rh) != (ww, wh) else f' | {ww}x{wh}'
             try:
                 pw = getattr(self.wnd, '_window', None)
                 if pw is not None:
-                    pw.set_caption(f'Kaleidoscopic IFS Fractal {APP_VERSION} | {self._display_fps:.1f} FPS{scale_str}')
+                    pw.set_caption(f'Kaleidoscopic IFS Fractal {APP_VERSION} | {self._display_fps:.1f} FPS{scale_str}{res_str}')
             except Exception:
                 pass
             self._title_accum = 0.0
@@ -3740,10 +3791,19 @@ class FractalWindow(mglw.WindowConfig):
         self.vao.render(moderngl.TRIANGLE_STRIP)
         self.ctx.screen.use()
         self.ctx.clear(0, 0, 0)
+        ww, wh = self.wnd.size
+        dyn_scale = max(10, min(200, self._dyn_res_scale)) / 100.0
+        output_w = max(1, int(ww * dyn_scale))
+        output_h = max(1, int(wh * dyn_scale))
         self._post.render(
             self._scene_tex, self.ctx.screen,
             p.gamma, p.exposure, p.saturation,
-            self.wnd.size, flip_y=False, fxaa=(p.aa_samples == 4),
+            (ww, wh) if p.aa_samples == 6 else self._fbo_size,
+            flip_y=False,
+            fxaa=(p.aa_samples == 4),
+            taa=(p.aa_samples == 5),
+            taa_sharpen=(p.aa_samples == 5 and p.taa_sharpen_enabled),
+            taau=(p.aa_samples == 6),
         )
         if self._pending_screenshot or p.screenshot_requested:
             self._pending_screenshot = False
@@ -3826,7 +3886,9 @@ class FractalWindow(mglw.WindowConfig):
         self._post.render(
             sb['tex'], ob['fbo'],
             p.gamma, p.exposure, p.saturation,
-            (tw, th), flip_y=True, fxaa=(p.aa_samples == 4),
+            (tw, th), flip_y=True,
+            fxaa=(p.aa_samples == 4),
+            taa=False,               # TAA не имеет смысла для одиночных кадров видео
         )
         self.ctx.screen.use()
         self.ctx.finish()
@@ -3875,7 +3937,9 @@ class FractalWindow(mglw.WindowConfig):
             self._post.render(
                 ss_tex, out_fbo,
                 p.gamma, p.exposure, p.saturation,
-                (tw, th), flip_y=False, fxaa=(p.aa_samples == 4),
+                (tw, th), flip_y=False,
+                fxaa=(p.aa_samples == 4),
+                taa=False,
             )
             self.ctx.finish()
             raw = out_fbo.read(components=3)
@@ -4515,7 +4579,6 @@ class ControlGUI(QMainWindow):
         self._vbox = vbox
         self._build_raymarching_section()
         self._build_postprocess_section()
-        self._build_aa_section()
         self._build_screenshot_section()
         self._vbox.addStretch()
         tabs.addTab(tab_render, "Rendering")
@@ -4523,6 +4586,7 @@ class ControlGUI(QMainWindow):
         tab_perf, vbox = self._make_scroll_tab()
         self._vbox = vbox
         self._build_performance_section()
+        self._build_aa_section()
         self._vbox.addStretch()
         tabs.addTab(tab_perf, "Performance")
 
@@ -5766,7 +5830,7 @@ class ControlGUI(QMainWindow):
         _lbl_hint(layout, "More samples = sharper edges, slower render. FXAA = fast post-process AA.")
         aa_row = QHBoxLayout()
         self._aa_grp = QButtonGroup(self)
-        for i, lbl in enumerate(["Off (1x)", "RGSS 4x", "Grid 9x", "FXAA"]):
+        for i, lbl in enumerate(["Off (1x)", "RGSS 4x", "Grid 9x", "FXAA", "TAA", "FSR 1.0"]):
             rb = QRadioButton(lbl)
             rb.setChecked(i + 1 == _params.aa_samples)
             self._aa_grp.addButton(rb, i + 1)
@@ -5790,12 +5854,152 @@ class ControlGUI(QMainWindow):
         fxaa_grp.setVisible(_params.aa_samples == 4)
         self._fxaa_settings_grp = fxaa_grp
         layout.addWidget(fxaa_grp)
+
+        taa_grp = _section("TAA SETTINGS")
+        taa_l = QVBoxLayout(taa_grp)
+        taa_l.setSpacing(2)
+        _lbl_hint(taa_l, "Temporal accumulation. Blend Alpha: weight of the current frame (lower = smoother, more ghosting). Sharpen applies a post-TAA unsharp pass.")
+
+        taa_blend_row = SliderRow("Blend Alpha", 0.05, 1.0, 0.1, 0.005)
+        def _on_taa_blend(v):
+            gl_wnd = _gl_window_ref[0]
+            if gl_wnd is not None and hasattr(gl_wnd, '_post'):
+                gl_wnd._post.set_taa_blend(v)
+        taa_blend_row.on_change(_on_taa_blend)
+        taa_l.addWidget(taa_blend_row)
+        self._taa_blend_row = taa_blend_row
+
+        taa_sharpen_check = QCheckBox("Enable sharpening pass")
+        taa_sharpen_check.setChecked(_params.taa_sharpen_enabled)
+        taa_sharpen_check.stateChanged.connect(lambda s: setattr(_params, 'taa_sharpen_enabled', bool(s)))
+        taa_l.addWidget(taa_sharpen_check)
+        self._taa_sharpen_check = taa_sharpen_check
+
+        taa_sharpen_str_row = SliderRow("Sharpen Str", 0.0, 1.0, _params.taa_sharpen_str, 0.01)
+        def _on_taa_sharpen_str(v):
+            _params.taa_sharpen_str = v
+            gl_wnd = _gl_window_ref[0]
+            if gl_wnd is not None and hasattr(gl_wnd, '_post'):
+                gl_wnd._post.set_taa_sharpen(v)
+        taa_sharpen_str_row.on_change(_on_taa_sharpen_str)
+        taa_l.addWidget(taa_sharpen_str_row)
+        self._taa_sharpen_str_row = taa_sharpen_str_row
+
+        taa_grp.setVisible(_params.aa_samples == 5)
+        self._taa_settings_grp = taa_grp
+        layout.addWidget(taa_grp)
+
+        from post_process import TAAU_VALID_SCALES, FSR_QUALITY_PRESETS, FSR_EASU_SHARPNESS_DEFAULT, FSR_RCAS_SHARPNESS_DEFAULT
+
+        fsr_grp = _section("FSR 1.0 SETTINGS")
+        fsr_l = QVBoxLayout(fsr_grp)
+        fsr_l.setSpacing(4)
+        _lbl_hint(fsr_l, "AMD FSR 1.0: renders at reduced resolution, upscales with edge-adaptive EASU pass, then sharpens with RCAS pass.")
+
+        preset_row_w = QWidget()
+        preset_row_l = QHBoxLayout(preset_row_w)
+        preset_row_l.setContentsMargins(4, 2, 4, 2)
+        preset_row_l.setSpacing(4)
+        preset_lbl = QLabel("Quality Preset")
+        preset_lbl.setFixedWidth(90)
+        preset_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        preset_row_l.addWidget(preset_lbl)
+        self._fsr_preset_grp = QButtonGroup(self)
+        _PRESET_ORDER = ["Ultra Quality", "Quality", "Balanced", "Performance", "Ultra Perf"]
+        _PRESET_SHORT = ["Ultra Q", "Quality", "Balanced", "Perf", "Ultra P"]
+        for pi, (pname, pshort) in enumerate(zip(_PRESET_ORDER, _PRESET_SHORT)):
+            pb = QRadioButton(pshort)
+            pb.setToolTip(f"{pname}  —  {int(FSR_QUALITY_PRESETS[pname]['scale']*100)}% render scale")
+            pb.setChecked(pname == _params.fsr_preset)
+            pb.setProperty('preset_name', pname)
+            self._fsr_preset_grp.addButton(pb, pi)
+            preset_row_l.addWidget(pb)
+        def _on_fsr_preset_btn(btn):
+            pname = btn.property('preset_name')
+            if pname is None:
+                return
+            p = FSR_QUALITY_PRESETS[pname]
+            _params.fsr_preset          = pname
+            _params.taau_scale          = p['scale']
+            _params.fsr_easu_sharpness  = p['easu']
+            _params.fsr_rcas_sharpness  = p['rcas']
+            gl_wnd = _gl_window_ref[0]
+            if gl_wnd is not None and hasattr(gl_wnd, '_post'):
+                gl_wnd._post.set_taau_scale(p['scale'])
+                gl_wnd._post.set_fsr_easu_sharpness(p['easu'])
+                gl_wnd._post.set_fsr_rcas_sharpness(p['rcas'])
+            if hasattr(self, '_fsr_easu_row'):
+                self._fsr_easu_row.set_value(p['easu'])
+            if hasattr(self, '_fsr_rcas_row'):
+                self._fsr_rcas_row.set_value(p['rcas'])
+            if hasattr(self, '_fsr_scale_grp'):
+                for sb in self._fsr_scale_grp.buttons():
+                    if abs(sb.property('scale_val') - p['scale']) < 0.001:
+                        sb.setChecked(True)
+                        break
+            if hasattr(self, '_fsr_info_lbl'):
+                self._fsr_info_lbl.setText(f"Render: {int(p['scale']*100)}%  |  EASU: {p['easu']:.2f}  |  RCAS: {p['rcas']:.2f}")
+        self._fsr_preset_grp.buttonClicked.connect(_on_fsr_preset_btn)
+        fsr_l.addWidget(preset_row_w)
+
+
+        fsr_easu_row = SliderRow("EASU Sharpness", 0.0, 1.0, _params.fsr_easu_sharpness, 0.01)
+        fsr_easu_row.setToolTip(
+            "Edge-Adaptive Spatial Upscaling sensitivity.\n"
+            "Higher = more aggressive edge detection and reconstruction.\n"
+            "Lower = smoother but less defined edges.")
+        def _on_fsr_easu(v):
+            _params.fsr_easu_sharpness = v
+            gl_wnd = _gl_window_ref[0]
+            if gl_wnd is not None and hasattr(gl_wnd, '_post'):
+                gl_wnd._post.set_fsr_easu_sharpness(v)
+            if hasattr(self, '_fsr_info_lbl'):
+                self._fsr_info_lbl.setText(
+                    f"Render: {int(_params.taau_scale*100)}%  |  EASU: {v:.2f}  |  RCAS: {_params.fsr_rcas_sharpness:.2f}")
+        fsr_easu_row.on_change(_on_fsr_easu)
+        fsr_l.addWidget(fsr_easu_row)
+        self._fsr_easu_row = fsr_easu_row
+
+        fsr_rcas_row = SliderRow("RCAS Sharpness", 0.0, 1.0, _params.fsr_rcas_sharpness, 0.01)
+        fsr_rcas_row.setToolTip(
+            "Robust Contrast-Adaptive Sharpening strength.\n"
+            "Applied after EASU upscale pass.\n"
+            "Higher = more sharpening, may introduce ringing on high-contrast edges.")
+        def _on_fsr_rcas(v):
+            _params.fsr_rcas_sharpness = v
+            gl_wnd = _gl_window_ref[0]
+            if gl_wnd is not None and hasattr(gl_wnd, '_post'):
+                gl_wnd._post.set_fsr_rcas_sharpness(v)
+            if hasattr(self, '_fsr_info_lbl'):
+                self._fsr_info_lbl.setText(
+                    f"Render: {int(_params.taau_scale*100)}%  |  EASU: {_params.fsr_easu_sharpness:.2f}  |  RCAS: {v:.2f}")
+        fsr_rcas_row.on_change(_on_fsr_rcas)
+        fsr_l.addWidget(fsr_rcas_row)
+        self._fsr_rcas_row = fsr_rcas_row
+
+        fsr_info_lbl = QLabel(
+            f"Render: {int(_params.taau_scale*100)}%  |  EASU: {_params.fsr_easu_sharpness:.2f}  |  RCAS: {_params.fsr_rcas_sharpness:.2f}")
+        fsr_info_lbl.setStyleSheet("color: #8888cc; font-size: 10px; padding: 2px 6px;")
+        fsr_l.addWidget(fsr_info_lbl)
+        self._fsr_info_lbl = fsr_info_lbl
+
+        fsr_grp.setVisible(_params.aa_samples == 6)
+        self._taau_settings_grp = fsr_grp
+        layout.addWidget(fsr_grp)
+
         self._add_section(grp)
 
     def _on_aa_changed(self, idx: int):
         setattr(_params, 'aa_samples', idx)
         if hasattr(self, '_fxaa_settings_grp'):
             self._fxaa_settings_grp.setVisible(idx == 4)
+        if hasattr(self, '_taa_settings_grp'):
+            self._taa_settings_grp.setVisible(idx == 5)
+        if hasattr(self, '_taau_settings_grp'):
+            self._taau_settings_grp.setVisible(idx == 6)
+        gl_wnd = _gl_window_ref[0]
+        if gl_wnd is not None and hasattr(gl_wnd, '_post'):
+            gl_wnd._post.reset_taa()
 
     def _build_screenshot_section(self):
         grp = _section("SCREENSHOT")
@@ -7414,6 +7618,9 @@ class ControlGUI(QMainWindow):
                 btn.setChecked(True)
             if hasattr(self, '_fxaa_settings_grp'):
                 self._fxaa_settings_grp.setVisible(preset['aa_samples'] == 4)
+            gl_wnd = _gl_window_ref[0]
+            if gl_wnd is not None and hasattr(gl_wnd, '_post'):
+                gl_wnd._post.reset_taa()
 
     def _toolbar_reset_all(self):
         reply = QMessageBox.question(
