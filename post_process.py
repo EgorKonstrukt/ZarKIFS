@@ -1,4 +1,6 @@
 import moderngl
+from pathlib import Path as _Path
+_SHADER_DIR = _Path(__file__).parent
 
 POST_VERT_SRC = """
 #version 330 core
@@ -144,156 +146,9 @@ void main() {
 }
 """
 
-FSR_EASU_FRAG_SRC = """
-#version 330 core
-in vec2 v_uv;
-out vec4 fragColor;
-uniform sampler2D u_scene;
-uniform vec2  u_src_resolution;
-uniform int   u_flip_y;
-uniform float u_easu_sharpness;
+FSR_EASU_FRAG_SRC = (_SHADER_DIR / "shaders/postprocess/fsr_easu_frag.glsl").read_text(encoding="utf-8")
 
-float lanczos2Weight(float x) {
-    if (abs(x) < 1e-5) return 1.0;
-    if (abs(x) >= 2.0)  return 0.0;
-    float px = 3.14159265 * x;
-    float px2 = 3.14159265 * x * 0.5;
-    return (sin(px) / px) * (sin(px2) / px2);
-}
-
-vec3 sampleSrc(vec2 uv) {
-    return texture(u_scene, clamp(uv, vec2(0.0), vec2(1.0))).rgb;
-}
-
-vec3 fsrEasu(vec2 uv) {
-    vec2 rcp = 1.0 / u_src_resolution;
-    vec2 pp  = uv * u_src_resolution - 0.5;
-    vec2 tc  = floor(pp) + 0.5;
-    vec2 fp  = pp - floor(pp);
-
-    vec3 lumW = vec3(0.299, 0.587, 0.114);
-
-    vec3 c00 = sampleSrc((tc + vec2(-1.0, -1.0)) * rcp);
-    vec3 c10 = sampleSrc((tc + vec2( 0.0, -1.0)) * rcp);
-    vec3 c20 = sampleSrc((tc + vec2( 1.0, -1.0)) * rcp);
-    vec3 c30 = sampleSrc((tc + vec2( 2.0, -1.0)) * rcp);
-    vec3 c01 = sampleSrc((tc + vec2(-1.0,  0.0)) * rcp);
-    vec3 c11 = sampleSrc((tc + vec2( 0.0,  0.0)) * rcp);
-    vec3 c21 = sampleSrc((tc + vec2( 1.0,  0.0)) * rcp);
-    vec3 c31 = sampleSrc((tc + vec2( 2.0,  0.0)) * rcp);
-    vec3 c02 = sampleSrc((tc + vec2(-1.0,  1.0)) * rcp);
-    vec3 c12 = sampleSrc((tc + vec2( 0.0,  1.0)) * rcp);
-    vec3 c22 = sampleSrc((tc + vec2( 1.0,  1.0)) * rcp);
-    vec3 c32 = sampleSrc((tc + vec2( 2.0,  1.0)) * rcp);
-    vec3 c03 = sampleSrc((tc + vec2(-1.0,  2.0)) * rcp);
-    vec3 c13 = sampleSrc((tc + vec2( 0.0,  2.0)) * rcp);
-    vec3 c23 = sampleSrc((tc + vec2( 1.0,  2.0)) * rcp);
-    vec3 c33 = sampleSrc((tc + vec2( 2.0,  2.0)) * rcp);
-
-    float l11 = dot(c11, lumW), l21 = dot(c21, lumW);
-    float l12 = dot(c12, lumW), l22 = dot(c22, lumW);
-
-    float gx = (l21 - l11) + (l22 - l12);
-    float gy = (l12 - l11) + (l22 - l21);
-    float gLen = sqrt(gx*gx + gy*gy) + 1e-5;
-    vec2 dir = vec2(gx, gy) / gLen;
-
-    float edgeness = clamp(gLen * 4.0, 0.0, 1.0);
-    float aniso = mix(1.0, 1.0 + u_easu_sharpness * 1.5, edgeness);
-
-    vec3 col = vec3(0.0);
-    float wsum = 0.0;
-
-    vec2 offsets[16];
-    vec3 samples[16];
-    offsets[0]  = vec2(-1.0,-1.0); samples[0]  = c00;
-    offsets[1]  = vec2( 0.0,-1.0); samples[1]  = c10;
-    offsets[2]  = vec2( 1.0,-1.0); samples[2]  = c20;
-    offsets[3]  = vec2( 2.0,-1.0); samples[3]  = c30;
-    offsets[4]  = vec2(-1.0, 0.0); samples[4]  = c01;
-    offsets[5]  = vec2( 0.0, 0.0); samples[5]  = c11;
-    offsets[6]  = vec2( 1.0, 0.0); samples[6]  = c21;
-    offsets[7]  = vec2( 2.0, 0.0); samples[7]  = c31;
-    offsets[8]  = vec2(-1.0, 1.0); samples[8]  = c02;
-    offsets[9]  = vec2( 0.0, 1.0); samples[9]  = c12;
-    offsets[10] = vec2( 1.0, 1.0); samples[10] = c22;
-    offsets[11] = vec2( 2.0, 1.0); samples[11] = c32;
-    offsets[12] = vec2(-1.0, 2.0); samples[12] = c03;
-    offsets[13] = vec2( 0.0, 2.0); samples[13] = c13;
-    offsets[14] = vec2( 1.0, 2.0); samples[14] = c23;
-    offsets[15] = vec2( 2.0, 2.0); samples[15] = c33;
-
-    vec2 perp = vec2(-dir.y, dir.x);
-
-    for (int k = 0; k < 16; k++) {
-        vec2 d = offsets[k] - fp;
-        float along = dot(d, dir);
-        float across = dot(d, perp);
-        float wx = lanczos2Weight(along * aniso);
-        float wy = lanczos2Weight(across / aniso);
-        float w  = wx * wy;
-        col  += w * samples[k];
-        wsum += w;
-    }
-
-    if (wsum < 1e-4) {
-        return mix(c11, c22, fp.x * 0.5 + fp.y * 0.5);
-    }
-    return clamp(col / wsum, vec3(0.0), vec3(1.0));
-}
-
-void main() {
-    vec2 uv = (u_flip_y != 0) ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
-    fragColor = vec4(fsrEasu(uv), 1.0);
-}
-"""
-
-FSR_RCAS_FRAG_SRC = """
-#version 330 core
-in vec2 v_uv;
-out vec4 fragColor;
-uniform sampler2D u_scene;
-uniform vec2  u_resolution;
-uniform float u_gamma;
-uniform float u_exposure;
-uniform float u_saturation;
-uniform int   u_flip_y;
-uniform float u_rcas_sharpness;
-
-void main() {
-    vec2 uv  = (u_flip_y != 0) ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
-    vec2 rcp = 1.0 / u_resolution;
-
-    vec3 e  = texture(u_scene, uv).rgb;
-    vec3 n  = texture(u_scene, uv + vec2( 0.0,  1.0) * rcp).rgb;
-    vec3 s  = texture(u_scene, uv + vec2( 0.0, -1.0) * rcp).rgb;
-    vec3 ww = texture(u_scene, uv + vec2(-1.0,  0.0) * rcp).rgb;
-    vec3 ee = texture(u_scene, uv + vec2( 1.0,  0.0) * rcp).rgb;
-
-    vec3 lumW = vec3(0.299, 0.587, 0.114);
-    float le = dot(e,  lumW);
-    float ln = dot(n,  lumW);
-    float ls = dot(s,  lumW);
-    float lw = dot(ww, lumW);
-    float la = dot(ee, lumW);
-
-    float mn4 = min(le, min(min(ln, ls), min(lw, la)));
-    float mx4 = max(le, max(max(ln, ls), max(lw, la)));
-    float contrast = mx4 - mn4;
-
-    float sharpAmt = -u_rcas_sharpness * 0.125;
-    if (contrast < 1.0 / 255.0) sharpAmt = 0.0;
-
-    float denom = 1.0 + 4.0 * sharpAmt;
-    denom = max(denom, 1e-5);
-    vec3 col = clamp((e + (n + s + ww + ee) * sharpAmt) / denom, vec3(0.0), vec3(1.0));
-
-    col *= u_exposure;
-    float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
-    col = mix(vec3(lum), col, u_saturation);
-    fragColor = vec4(pow(clamp(col, 0.0, 1.0), vec3(1.0 / max(u_gamma, 0.1))), 1.0);
-}
-"""
+FSR_RCAS_FRAG_SRC = (_SHADER_DIR / "shaders/postprocess/fsr_rcas_frag.glsl").read_text(encoding="utf-8")
 
 TAAU_UPSAMPLE_FRAG_SRC = FSR_EASU_FRAG_SRC
 
@@ -642,3 +497,231 @@ class PostProcessor:
         for b in self._taa_bufs + self._taau_bufs:
             _free_fbo(b)
         _free_fbo(self._fsr_easu_buf)
+
+
+
+FSR2_ACCUMULATE_FRAG_SRC = (_SHADER_DIR / "shaders/postprocess/fsr2_accumulate_frag.glsl").read_text(encoding="utf-8")
+FSR2_RECONSTRUCT_FRAG_SRC = (_SHADER_DIR / "shaders/postprocess/fsr2_reconstruct_frag.glsl").read_text(encoding="utf-8")
+
+FSR2_DEPTH_THRESHOLD_DEFAULT   = 0.005
+FSR2_REACTIVE_SCALE_DEFAULT    = 2.0
+FSR2_BLEND_ALPHA_DEFAULT       = 0.1
+FSR2_RCAS_SHARPNESS_DEFAULT    = 0.2
+FSR2_VALID_SCALES              = (0.5, 0.585, 0.667, 0.77)
+FSR2_QUALITY_PRESETS = {
+    'Ultra Quality': {'scale': 0.77,  'rcas': 0.15, 'reactive': 1.5},
+    'Quality':       {'scale': 0.667, 'rcas': 0.20, 'reactive': 2.0},
+    'Balanced':      {'scale': 0.585, 'rcas': 0.25, 'reactive': 2.0},
+    'Performance':   {'scale': 0.5,   'rcas': 0.30, 'reactive': 2.5},
+}
+
+
+def _make_fbo_rgba16f(ctx, w, h):
+    tex = ctx.texture((w, h), 4, dtype='f2')
+    tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    tex.repeat_x = False
+    tex.repeat_y = False
+    return {'tex': tex, 'fbo': ctx.framebuffer(color_attachments=[tex])}
+
+
+def _make_depth_tex(ctx, w, h):
+    tex = ctx.texture((w, h), 1, dtype='f4')
+    tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+    tex.repeat_x = False
+    tex.repeat_y = False
+    return tex
+
+
+class FSR2Renderer:
+    def __init__(self, ctx: moderngl.Context, quad_vbo: moderngl.Buffer):
+        self._ctx  = ctx
+        self._vert = POST_VERT_SRC
+
+        self._prog_accum = ctx.program(
+            vertex_shader=self._vert,
+            fragment_shader=FSR2_ACCUMULATE_FRAG_SRC,
+        )
+        self._prog_recon = ctx.program(
+            vertex_shader=self._vert,
+            fragment_shader=FSR2_RECONSTRUCT_FRAG_SRC,
+        )
+        self._vao_accum = ctx.simple_vertex_array(self._prog_accum, quad_vbo, 'in_position')
+        self._vao_recon = ctx.simple_vertex_array(self._prog_recon, quad_vbo, 'in_position')
+
+        self._scale         = 0.667
+        self._rcas          = FSR2_RCAS_SHARPNESS_DEFAULT
+        self._reactive      = FSR2_REACTIVE_SCALE_DEFAULT
+        self._depth_thresh  = FSR2_DEPTH_THRESHOLD_DEFAULT
+        self._blend_alpha   = FSR2_BLEND_ALPHA_DEFAULT
+
+        self._render_size   = (0, 0)
+        self._output_size   = (0, 0)
+        self._accum_bufs    = [None, None]
+        self._cur_idx       = 0
+        self._first_frame   = True
+        self._frame         = 0
+
+        self._depth_cur     = None
+        self._depth_prev    = None
+        self._depth_size    = (0, 0)
+
+        n = 16
+        from math import log2
+        def halton(base, count):
+            out = []
+            for i in range(1, count + 1):
+                f, r, j = 1.0, 0.0, i
+                while j > 0:
+                    f /= base; r += f * (j % base); j //= base
+                out.append(r - 0.5)
+            return out
+        xs = halton(2, n)
+        ys = halton(3, n)
+        self._jitter_seq = tuple(zip(xs, ys))
+
+    def get_render_size(self, out_w: int, out_h: int):
+        return (max(1, int(out_w * self._scale)),
+                max(1, int(out_h * self._scale)))
+
+    def get_jitter(self, out_w: int, out_h: int):
+        rw, rh = self.get_render_size(out_w, out_h)
+        jx, jy = self._jitter_seq[self._frame % len(self._jitter_seq)]
+        return (jx / rw * 2.0, jy / rh * 2.0)
+
+    def _ensure_bufs(self, rw: int, rh: int, ow: int, oh: int):
+        if self._render_size == (rw, rh) and self._output_size == (ow, oh):
+            return
+        for b in self._accum_bufs:
+            _free_fbo(b)
+        self._accum_bufs  = [_make_fbo_rgba16f(self._ctx, rw, rh) for _ in range(2)]
+        self._render_size = (rw, rh)
+        self._output_size = (ow, oh)
+        self._first_frame = True
+        if self._depth_cur is not None:
+            self._depth_cur.release()
+            self._depth_prev.release()
+        self._depth_cur  = _make_depth_tex(self._ctx, rw, rh)
+        self._depth_prev = _make_depth_tex(self._ctx, rw, rh)
+        self._depth_size = (rw, rh)
+
+    def upload_depth(self, depth_data, rw: int, rh: int):
+        if self._depth_cur is not None and self._depth_size == (rw, rh):
+            self._depth_cur.write(depth_data)
+
+    def render(self,
+               scene_tex: moderngl.Texture,
+               target_fbo: moderngl.Framebuffer,
+               gamma: float,
+               exposure: float,
+               saturation: float,
+               output_size: tuple,
+               flip_y: bool = False,
+               depth_tex: moderngl.Texture = None):
+
+        ow, oh = output_size
+        rw, rh = self.get_render_size(ow, oh)
+        self._ensure_bufs(rw, rh, ow, oh)
+
+        cur_idx  = self._cur_idx
+        hist_idx = 1 - cur_idx
+        cur_buf  = self._accum_bufs[cur_idx]
+        hist_buf = self._accum_bufs[hist_idx]
+
+        jx, jy = self._jitter_seq[self._frame % len(self._jitter_seq)]
+        jitter_uv = (jx / rw, jy / rh)
+
+        cur_buf['fbo'].use()
+        self._ctx.viewport = (0, 0, rw, rh)
+        scene_tex.use(location=0)
+        hist_buf['tex'].use(location=1)
+
+        if depth_tex is not None:
+            depth_tex.use(location=2)
+        else:
+            self._depth_cur.use(location=2)
+        self._depth_prev.use(location=3)
+
+        pa = self._prog_accum
+        pa['u_current'].value      = 0
+        pa['u_history'].value      = 1
+        pa['u_depth'].value        = 2
+        pa['u_prev_depth'].value   = 3
+        pa['u_render_size'].value  = (float(rw), float(rh))
+        pa['u_jitter'].value       = jitter_uv
+        pa['u_blend_alpha'].value  = self._blend_alpha
+        pa['u_first_frame'].value  = 1 if self._first_frame else 0
+        pa['u_depth_threshold'].value = self._depth_thresh
+        pa['u_reactive_scale'].value  = self._reactive
+        self._vao_accum.render(moderngl.TRIANGLE_STRIP)
+
+        self._depth_cur, self._depth_prev = self._depth_prev, self._depth_cur
+
+        target_fbo.use()
+        self._ctx.viewport = (0, 0, ow, oh)
+        cur_buf['tex'].use(location=0)
+
+        pr = self._prog_recon
+        pr['u_accumulated'].value    = 0
+        pr['u_output_size'].value    = (float(ow), float(oh))
+        pr['u_rcas_sharpness'].value = self._rcas
+        pr['u_exposure'].value       = exposure
+        pr['u_saturation'].value     = saturation
+        pr['u_gamma'].value          = gamma
+        pr['u_flip_y'].value         = 1 if flip_y else 0
+        self._vao_recon.render(moderngl.TRIANGLE_STRIP)
+
+        self._cur_idx     = hist_idx
+        self._first_frame = False
+        self._frame       += 1
+
+    def reset(self):
+        self._first_frame = True
+        self._frame       = 0
+
+    def set_scale(self, scale: float):
+        self._scale       = min(FSR2_VALID_SCALES, key=lambda x: abs(x - scale))
+        self._render_size = (0, 0)
+        self._first_frame = True
+        self._frame       = 0
+
+    def set_rcas_sharpness(self, v: float):
+        self._rcas = max(0.0, min(1.0, v))
+
+    def set_reactive_scale(self, v: float):
+        self._reactive = max(0.5, min(5.0, v))
+
+    def set_depth_threshold(self, v: float):
+        self._depth_thresh = max(1e-4, v)
+
+    def set_blend_alpha(self, v: float):
+        self._blend_alpha = max(0.05, min(0.5, v))
+
+    def apply_preset(self, name: str):
+        if name not in FSR2_QUALITY_PRESETS:
+            return
+        p = FSR2_QUALITY_PRESETS[name]
+        self.set_scale(p['scale'])
+        self.set_rcas_sharpness(p['rcas'])
+        self.set_reactive_scale(p['reactive'])
+
+    def get_info(self) -> dict:
+        return {
+            'render_pct':    int(round(self._scale * 100)),
+            'rcas':          self._rcas,
+            'reactive':      self._reactive,
+            'depth_thresh':  self._depth_thresh,
+            'blend_alpha':   self._blend_alpha,
+        }
+
+    def release(self):
+        for b in self._accum_bufs:
+            _free_fbo(b)
+        if self._depth_cur is not None:
+            try: self._depth_cur.release()
+            except Exception: pass
+        if self._depth_prev is not None:
+            try: self._depth_prev.release()
+            except Exception: pass
+        for prog in (self._prog_accum, self._prog_recon):
+            try: prog.release()
+            except Exception: pass

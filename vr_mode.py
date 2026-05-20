@@ -3,6 +3,9 @@ import math
 import ctypes
 import numpy as np
 import moderngl
+from pathlib import Path
+
+_SHADER_DIR = Path(__file__).parent
 
 try:
     import xr
@@ -666,34 +669,9 @@ def set_uniforms_for_eye(set_fn, eye: dict, rw: int, rh: int):
     set_fn('u_fov', 1.0)
 
 
-_CTRL_VERT = """
-#version 330 core
-in vec3 in_pos;
-in vec3 in_normal;
-uniform mat4 u_mvp;
-uniform mat3 u_normal_mat;
-out vec3 v_normal;
-void main() {
-    v_normal = normalize(u_normal_mat * in_normal);
-    gl_Position = u_mvp * vec4(in_pos, 1.0);
-}
-"""
+_CTRL_VERT = open(_SHADER_DIR / "shaders/vr/vr_controller_vert.glsl", "r", encoding="utf-8").read()
 
-_CTRL_FRAG = """
-#version 330 core
-in vec3 v_normal;
-uniform vec3 u_color;
-uniform float u_grip;
-out vec4 fragColor;
-void main() {
-    vec3 light = normalize(vec3(0.5, 1.0, 0.7));
-    float diff = max(dot(v_normal, light), 0.0);
-    vec3 ambient = u_color * 0.3;
-    vec3 col = u_color * diff + ambient;
-    col = mix(col, vec3(1.0, 0.5, 0.1), u_grip * 0.6);
-    fragColor = vec4(col, 1.0);
-}
-"""
+_CTRL_FRAG = open(_SHADER_DIR / "shaders/vr/vr_controller_frag.glsl", "r", encoding="utf-8").read()
 
 
 def _make_proj_matrix(fov_angles, near=0.01, far=100.0):
@@ -944,27 +922,8 @@ class VRRenderer:
         self._compose_prog.release()
 
 
-_COMPOSE_VERT = (
-    "#version 330 core\n"
-    "in vec2 in_position;\n"
-    "out vec2 v_uv;\n"
-    "void main() { v_uv = in_position * 0.5 + 0.5; gl_Position = vec4(in_position, 0.0, 1.0); }"
-)
-_COMPOSE_FRAG = (
-    "#version 330 core\n"
-    "in vec2 v_uv;\n"
-    "out vec4 fragColor;\n"
-    "uniform sampler2D u_eye_left;\n"
-    "uniform sampler2D u_eye_right;\n"
-    "uniform vec2 u_resolution;\n"
-    "void main() {\n"
-    "    float hx = 0.5;\n"
-    "    if (v_uv.x < hx)\n"
-    "        fragColor = texture(u_eye_left,  vec2(v_uv.x / hx, v_uv.y));\n"
-    "    else\n"
-    "        fragColor = texture(u_eye_right, vec2((v_uv.x - hx) / hx, v_uv.y));\n"
-    "}"
-)
+_COMPOSE_VERT = open(_SHADER_DIR / "shaders/vr/vr_compose_vert.glsl", "r", encoding="utf-8").read()
+_COMPOSE_FRAG = open(_SHADER_DIR / "shaders/vr/vr_compose_frag.glsl", "r", encoding="utf-8").read()
 
 
 class VRToggleState:
