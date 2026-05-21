@@ -28,7 +28,7 @@ import vr_mode
 from pathlib import Path as _Path
 _SHADER_DIR = _Path(__file__).parent
 
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.10.2"
 
 try:
     from animation_editor import (
@@ -1626,7 +1626,11 @@ class FractalWindow(mglw.WindowConfig):
         self._fbo_size = (w, h)
         self._scene_tex = self.ctx.texture((w, h), 3, dtype='f4')
         self._scene_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-        self._scene_fbo = self.ctx.framebuffer(color_attachments=[self._scene_tex])
+        self._scene_depth_tex = self.ctx.texture((w, h), 1, dtype='f4')
+        self._scene_depth_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self._scene_fbo = self.ctx.framebuffer(
+            color_attachments=[self._scene_tex, self._scene_depth_tex]
+        )
 
         self.start = time.time()
         self._pending_screenshot = False
@@ -2316,10 +2320,15 @@ class FractalWindow(mglw.WindowConfig):
         rw, rh = self._get_render_size()
         if (rw, rh) != self._fbo_size:
             self._scene_tex.release()
+            self._scene_depth_tex.release()
             self._scene_fbo.release()
             self._scene_tex = self.ctx.texture((rw, rh), 3, dtype='f4')
             self._scene_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-            self._scene_fbo = self.ctx.framebuffer(color_attachments=[self._scene_tex])
+            self._scene_depth_tex = self.ctx.texture((rw, rh), 1, dtype='f4')
+            self._scene_depth_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+            self._scene_fbo = self.ctx.framebuffer(
+                color_attachments=[self._scene_tex, self._scene_depth_tex]
+            )
             self._fbo_size  = (rw, rh)
 
     def _set(self, name, val):
@@ -2728,11 +2737,15 @@ class FractalWindow(mglw.WindowConfig):
         output_w = max(1, int(ww * dyn_scale))
         output_h = max(1, int(wh * dyn_scale))
         if p.aa_samples == 7:
+            self._fsr2.set_camera_matrices(
+                render_pos, fwd, right, up, p.fov
+            )
             self._fsr2.render(
                 self._scene_tex, self.ctx.screen,
                 p.gamma, p.exposure, p.saturation,
                 (ww, wh),
                 flip_y=False,
+                depth_tex=self._scene_depth_tex,
             )
         else:
             self._post.render(

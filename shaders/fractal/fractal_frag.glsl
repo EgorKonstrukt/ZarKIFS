@@ -1,6 +1,7 @@
 #version 330 core
 in vec2 v_uv;
-out vec4 fragColor;
+layout(location = 0) out vec4 fragColor;
+layout(location = 1) out float fragLinearDepth;
 
 uniform float u_time;
 uniform vec2  u_resolution;
@@ -873,7 +874,7 @@ vec3 background(vec3 rd, float t) {
 }
 
 // ---- Single ray -------------------------------------------------------
-vec3 castRay(vec2 uv, float t) {
+vec4 castRay(vec2 uv, float t) {
     vec3 ro = u_cam_pos;
     float focalLen = u_fov;
     vec3 rd = normalize(uv.x * u_cam_right + uv.y * u_cam_up + focalLen * u_cam_fwd);
@@ -1003,7 +1004,7 @@ vec3 castRay(vec2 uv, float t) {
             col += glowCol * glow * u_glow_intensity * 0.8;
         }
     }
-    return col;
+    return vec4(col, hit ? totalDist : 0.0);
 }
 
 void main() {
@@ -1011,31 +1012,30 @@ void main() {
     float t       = u_animate == 1 ? u_time * u_anim_speed : 0.0;
     vec2  pixSize = 1.0 / u_resolution;
 
-    vec3 col = vec3(0.0);
+    vec4 result = vec4(0.0);
     if (u_aa_samples <= 1) {
-        // TAA: субпиксельный джиттер (u_taa_jitter == 0 когда TAA выключен)
         vec2 jUV = v_uv + u_taa_jitter;
-        col = castRay(vec2(jUV.x * aspect, jUV.y), t);
+        result = castRay(vec2(jUV.x * aspect, jUV.y), t);
     } else if (u_aa_samples == 2) {
         const vec2 o[4] = vec2[4](vec2(-0.25,-0.25), vec2( 0.25,-0.25),
                                    vec2(-0.25, 0.25), vec2( 0.25, 0.25));
         for (int i = 0; i < 4; i++) {
             vec2 uv = vec2((v_uv.x + o[i].x * pixSize.x * 2.0) * aspect,
                             v_uv.y + o[i].y * pixSize.y * 2.0);
-            col += castRay(uv, t);
+            result += castRay(uv, t);
         }
-        col *= 0.25;
+        result *= 0.25;
     } else {
         for (int y = -1; y <= 1; y++) {
             for (int x = -1; x <= 1; x++) {
                 vec2 off = vec2(float(x), float(y)) * 0.33;
                 vec2 uv  = vec2((v_uv.x + off.x * pixSize.x) * aspect,
                                  v_uv.y + off.y * pixSize.y);
-                col += castRay(uv, t);
+                result += castRay(uv, t);
             }
         }
-        col /= 9.0;
+        result /= 9.0;
     }
-
-    fragColor = vec4(col, 1.0);
+    fragColor      = vec4(result.rgb, 1.0);
+    fragLinearDepth = result.w;
 }

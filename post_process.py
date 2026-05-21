@@ -502,6 +502,17 @@ class PostProcessor:
 
 FSR2_ACCUMULATE_FRAG_SRC = (_SHADER_DIR / "shaders/postprocess/fsr2_accumulate_frag.glsl").read_text(encoding="utf-8")
 FSR2_RECONSTRUCT_FRAG_SRC = (_SHADER_DIR / "shaders/postprocess/fsr2_reconstruct_frag.glsl").read_text(encoding="utf-8")
+MOTION_VECTORS_FRAG_SRC = (_SHADER_DIR / "shaders/postprocess/motion_vectors_frag.glsl").read_text(encoding="utf-8")
+
+MOTION_VEC_VERT_SRC = """
+#version 330 core
+in vec2 in_position;
+out vec2 v_uv;
+void main() {
+    v_uv = in_position * 0.5 + 0.5;
+    gl_Position = vec4(in_position, 0.0, 1.0);
+}
+"""
 
 FSR2_DEPTH_THRESHOLD_DEFAULT   = 0.005
 FSR2_REACTIVE_SCALE_DEFAULT    = 2.0
@@ -536,7 +547,6 @@ class FSR2Renderer:
     def __init__(self, ctx: moderngl.Context, quad_vbo: moderngl.Buffer):
         self._ctx  = ctx
         self._vert = POST_VERT_SRC
-
         self._prog_accum = ctx.program(
             vertex_shader=self._vert,
             fragment_shader=FSR2_ACCUMULATE_FRAG_SRC,
@@ -545,28 +555,40 @@ class FSR2Renderer:
             vertex_shader=self._vert,
             fragment_shader=FSR2_RECONSTRUCT_FRAG_SRC,
         )
+        self._prog_mv = ctx.program(
+            vertex_shader=MOTION_VEC_VERT_SRC,
+            fragment_shader=MOTION_VECTORS_FRAG_SRC,
+        )
         self._vao_accum = ctx.simple_vertex_array(self._prog_accum, quad_vbo, 'in_position')
         self._vao_recon = ctx.simple_vertex_array(self._prog_recon, quad_vbo, 'in_position')
-
+        self._vao_mv    = ctx.simple_vertex_array(self._prog_mv,    quad_vbo, 'in_position')
         self._scale         = 0.667
         self._rcas          = FSR2_RCAS_SHARPNESS_DEFAULT
         self._reactive      = FSR2_REACTIVE_SCALE_DEFAULT
         self._depth_thresh  = FSR2_DEPTH_THRESHOLD_DEFAULT
         self._blend_alpha   = FSR2_BLEND_ALPHA_DEFAULT
-
         self._render_size   = (0, 0)
         self._output_size   = (0, 0)
         self._accum_bufs    = [None, None]
         self._cur_idx       = 0
         self._first_frame   = True
         self._frame         = 0
-
         self._depth_cur     = None
         self._depth_prev    = None
         self._depth_size    = (0, 0)
-
+        self._mv_buf        = None
+        self._mv_size       = (0, 0)
+        self._cam_pos       = (0.0, 0.0, 0.0)
+        self._cam_fwd       = (0.0, 0.0, 1.0)
+        self._cam_right     = (1.0, 0.0, 0.0)
+        self._cam_up        = (0.0, 1.0, 0.0)
+        self._cam_fov       = 1.5
+        self._prev_cam_pos   = (0.0, 0.0, 0.0)
+        self._prev_cam_fwd   = (0.0, 0.0, 1.0)
+        self._prev_cam_right = (1.0, 0.0, 0.0)
+        self._prev_cam_up    = (0.0, 1.0, 0.0)
+        self._prev_cam_fov   = 1.5
         n = 16
-        from math import log2
         def halton(base, count):
             out = []
             for i in range(1, count + 1):
@@ -603,10 +625,48 @@ class FSR2Renderer:
         self._depth_cur  = _make_depth_tex(self._ctx, rw, rh)
         self._depth_prev = _make_depth_tex(self._ctx, rw, rh)
         self._depth_size = (rw, rh)
+        if self._mv_buf is not None:
+            _free_fbo(self._mv_buf)
+        mv_tex = self._ctx.texture((rw, rh), 2, dtype='f2')
+        mv_tex.filter   = (moderngl.NEAREST, moderngl.NEAREST)
+        mv_tex.repeat_x = False
+        mv_tex.repeat_y = False
+        self._mv_buf  = {'tex': mv_tex, 'fbo': self._ctx.framebuffer(color_attachments=[mv_tex])}
+        self._mv_size = (rw, rh)
 
-    def upload_depth(self, depth_data, rw: int, rh: int):
-        if self._depth_cur is not None and self._depth_size == (rw, rh):
-            self._depth_cur.write(depth_data)
+    def set_camera_matrices(self,
+                            pos, fwd, right, up, fov: float):
+        self._prev_cam_pos   = self._cam_pos
+        self._prev_cam_fwd   = self._cam_fwd
+        self._prev_cam_right = self._cam_right
+        self._prev_cam_up    = self._cam_up
+        self._prev_cam_fov   = self._cam_fov
+        self._cam_pos   = tuple(pos)
+        self._cam_fwd   = tuple(fwd)
+        self._cam_right = tuple(right)
+        self._cam_up    = tuple(up)
+        self._cam_fov   = float(fov)
+
+    def _render_motion_vectors(self, depth_tex: moderngl.Texture, rw: int, rh: int,
+                               jitter_uv: tuple):
+        self._mv_buf['fbo'].use()
+        self._ctx.viewport = (0, 0, rw, rh)
+        depth_tex.use(location=0)
+        pm = self._prog_mv
+        pm['u_depth'].value          = 0
+        pm['u_render_size'].value    = (float(rw), float(rh))
+        pm['u_jitter'].value         = jitter_uv
+        pm['u_cam_pos'].value        = self._cam_pos
+        pm['u_cam_fwd'].value        = self._cam_fwd
+        pm['u_cam_right'].value      = self._cam_right
+        pm['u_cam_up'].value         = self._cam_up
+        pm['u_fov'].value            = self._cam_fov
+        pm['u_prev_cam_pos'].value   = self._prev_cam_pos
+        pm['u_prev_cam_fwd'].value   = self._prev_cam_fwd
+        pm['u_prev_cam_right'].value = self._prev_cam_right
+        pm['u_prev_cam_up'].value    = self._prev_cam_up
+        pm['u_prev_fov'].value       = self._prev_cam_fov
+        self._vao_mv.render(moderngl.TRIANGLE_STRIP)
 
     def render(self,
                scene_tex: moderngl.Texture,
@@ -617,49 +677,43 @@ class FSR2Renderer:
                output_size: tuple,
                flip_y: bool = False,
                depth_tex: moderngl.Texture = None):
-
         ow, oh = output_size
         rw, rh = self.get_render_size(ow, oh)
         self._ensure_bufs(rw, rh, ow, oh)
-
         cur_idx  = self._cur_idx
         hist_idx = 1 - cur_idx
         cur_buf  = self._accum_bufs[cur_idx]
         hist_buf = self._accum_bufs[hist_idx]
-
-        jx, jy = self._jitter_seq[self._frame % len(self._jitter_seq)]
+        jx, jy    = self._jitter_seq[self._frame % len(self._jitter_seq)]
         jitter_uv = (jx / rw, jy / rh)
-
+        active_depth = depth_tex if depth_tex is not None else self._depth_cur
+        if not self._first_frame:
+            self._render_motion_vectors(active_depth, rw, rh, jitter_uv)
         cur_buf['fbo'].use()
         self._ctx.viewport = (0, 0, rw, rh)
         scene_tex.use(location=0)
         hist_buf['tex'].use(location=1)
-
-        if depth_tex is not None:
-            depth_tex.use(location=2)
-        else:
-            self._depth_cur.use(location=2)
+        active_depth.use(location=2)
         self._depth_prev.use(location=3)
-
+        mv_tex = self._mv_buf['tex'] if not self._first_frame else active_depth
+        mv_tex.use(location=4)
         pa = self._prog_accum
-        pa['u_current'].value      = 0
-        pa['u_history'].value      = 1
-        pa['u_depth'].value        = 2
-        pa['u_prev_depth'].value   = 3
-        pa['u_render_size'].value  = (float(rw), float(rh))
-        pa['u_jitter'].value       = jitter_uv
-        pa['u_blend_alpha'].value  = self._blend_alpha
-        pa['u_first_frame'].value  = 1 if self._first_frame else 0
+        pa['u_current'].value         = 0
+        pa['u_history'].value         = 1
+        pa['u_depth'].value           = 2
+        pa['u_prev_depth'].value      = 3
+        pa['u_motion'].value          = 4
+        pa['u_render_size'].value     = (float(rw), float(rh))
+        pa['u_jitter'].value          = jitter_uv
+        pa['u_blend_alpha'].value     = self._blend_alpha
+        pa['u_first_frame'].value     = 1 if self._first_frame else 0
         pa['u_depth_threshold'].value = self._depth_thresh
-        pa['u_reactive_scale'].value  = self._reactive
         self._vao_accum.render(moderngl.TRIANGLE_STRIP)
-
-        self._depth_cur, self._depth_prev = self._depth_prev, self._depth_cur
-
+        if depth_tex is None:
+            self._depth_cur, self._depth_prev = self._depth_prev, self._depth_cur
         target_fbo.use()
         self._ctx.viewport = (0, 0, ow, oh)
         cur_buf['tex'].use(location=0)
-
         pr = self._prog_recon
         pr['u_accumulated'].value    = 0
         pr['u_output_size'].value    = (float(ow), float(oh))
@@ -669,7 +723,6 @@ class FSR2Renderer:
         pr['u_gamma'].value          = gamma
         pr['u_flip_y'].value         = 1 if flip_y else 0
         self._vao_recon.render(moderngl.TRIANGLE_STRIP)
-
         self._cur_idx     = hist_idx
         self._first_frame = False
         self._frame       += 1
@@ -716,12 +769,14 @@ class FSR2Renderer:
     def release(self):
         for b in self._accum_bufs:
             _free_fbo(b)
+        if self._mv_buf is not None:
+            _free_fbo(self._mv_buf)
         if self._depth_cur is not None:
             try: self._depth_cur.release()
             except Exception: pass
         if self._depth_prev is not None:
             try: self._depth_prev.release()
             except Exception: pass
-        for prog in (self._prog_accum, self._prog_recon):
+        for prog in (self._prog_accum, self._prog_recon, self._prog_mv):
             try: prog.release()
             except Exception: pass
