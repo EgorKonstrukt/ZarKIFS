@@ -28,7 +28,7 @@ import vr_mode
 from pathlib import Path as _Path
 _SHADER_DIR = _Path(__file__).parent
 
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.10.1"
 
 try:
     from animation_editor import (
@@ -502,7 +502,7 @@ class FractalParams:
         self.bg_color2        = (0.0,  0.0,  0.0)
         self.bg_mode          = 3   # 0=flat 1=gradient 2=nebula 3=starfield
         # --- Anti-aliasing ---
-        self.aa_samples       = 1   # 1=off 2=4xRGSS 3=9x 4=FXAA 5=TAA 6=TAAU
+        self.aa_samples       = 7   # 1=off 2=4xRGSS 3=9x 4=FXAA 5=TAA 6=TAAU
         self.fxaa_span_max    = 8.0
         self.fxaa_reduce_mul  = 0.125
         self.fxaa_reduce_min  = 0.0078125
@@ -513,9 +513,9 @@ class FractalParams:
         self.fsr_easu_sharpness  = 0.5
         self.fsr_rcas_sharpness  = 0.25
         self.fsr_preset          = "Quality"
-        self.fsr2_rcas_sharpness  = 0.2
-        self.fsr2_reactive_scale  = 2.0
-        self.fsr2_blend_alpha     = 0.1
+        self.fsr2_rcas_sharpness  = 0.25
+        self.fsr2_reactive_scale  = 5.0
+        self.fsr2_blend_alpha     = 0.15
         self.fsr2_preset          = "Quality"
         # --- Screenshot ---
         self.screenshot_requested = False
@@ -534,7 +534,7 @@ class FractalParams:
         # --- VR settings ---
         self.vr_ipd              = 0.063
         self.vr_render_scale     = 100
-        self.vr_dyn_res_enabled  = False
+        self.vr_dyn_res_enabled  = True
         self.vr_comfort_vignette = False
         self.vr_prediction_mult  = 1.0
         self.vr_supersampling    = 1
@@ -1261,9 +1261,9 @@ class PlayerState:
     SPEED_CAP        = 4.2
     COLLISION_BIAS   = 0.1
     GRAVITY_MODE     = 0
-    PLAYER_HEIGHT    = 0.08
-    GROUND_DIST      = 0.12
-    COLLIDER_RADIUS  = 0.0
+    CAPSULE_RADIUS   = 0.025
+    CAPSULE_HEIGHT   = 0.175
+    GROUND_DIST      = 0.02
     _PROBE_STEPS     = 16
     _PUSH_ITERS      = 140
     _GROUND_PROBES   = 15
@@ -1273,62 +1273,52 @@ class PlayerState:
     BOB_AMP_V        = 0.6
     BOB_AMP_H        = 0.3
     BOB_SPEED_THRESH = 0.005
-    NORMAL_SMOOTH    = 0.0
+    NORMAL_SMOOTH    = 5.0
+    ORIENTATION_SPEED = 8.0
 
     def __init__(self):
         self.vel              = [0.0, 0.0, 0.0]
         self.on_ground        = False
         self.jump_queued      = False
-        self._gravity_dir     = (0.0, -1.0, 0.0)
-        self._surface_normal  = (0.0, 1.0, 0.0)
+        self._gravity_dir     = [0.0, -1.0, 0.0]
+        self._surface_normal  = [0.0, 1.0, 0.0]
         self._sdf_scale_cache = 1.0
         self._smooth_pos      = None
         self._smooth_vel      = [0.0, 0.0, 0.0]
         self._smooth_normal   = [0.0, 1.0, 0.0]
         self._bob_phase       = 0.0
+        self._local_up        = [0.0, 1.0, 0.0]
 
-    def _calibrate_sdf_scale(self, pos):
-        eps = 0.1
-        samples = [
-            _py_sdf((pos[0]+eps, pos[1], pos[2])),
-            _py_sdf((pos[0]-eps, pos[1], pos[2])),
-            _py_sdf((pos[0], pos[1]+eps, pos[2])),
-            _py_sdf((pos[0], pos[1]-eps, pos[2])),
-            _py_sdf((pos[0], pos[1], pos[2]+eps)),
-            _py_sdf((pos[0], pos[1], pos[2]-eps)),
-        ]
-        d0 = _py_sdf(pos)
-        gradients = [abs(s - d0) / eps for s in samples]
-        mean_grad = sum(gradients) / len(gradients)
-        return max(mean_grad, 0.01)
+    def _get_capsule_segment(self, base_pos):
+        h = max(self.CAPSULE_HEIGHT - 2.0 * self.CAPSULE_RADIUS, 0.0)
+        half_h = h * 0.5
+        ux, uy, uz = self._local_up[0], self._local_up[1], self._local_up[2]
+        p_a = [base_pos[0] - ux * half_h, base_pos[1] - uy * half_h, base_pos[2] - uz * half_h]
+        p_b = [base_pos[0] + ux * half_h, base_pos[1] + uy * half_h, base_pos[2] + uz * half_h]
+        return p_a, p_b
 
-    def _effective_radius(self):
-        if self.COLLIDER_RADIUS > 0.0:
-            return self.COLLIDER_RADIUS
-        return max(self.PLAYER_HEIGHT, 0.005) * self.COLLISION_BIAS * 0.1
-
-    def _ground_threshold(self):
-        return self._effective_radius() + max(self.GROUND_DIST, 0.005)
-
-    def _compute_gravity_dir(self, pos, surface_normal):
-        mode = self.GRAVITY_MODE
-        if mode == 0:
-            return (-surface_normal[0], -surface_normal[1], -surface_normal[2])
-        elif mode == 1:
-            cx, cy, cz = -pos[0], -pos[1], -pos[2]
-            clen = math.sqrt(cx*cx + cy*cy + cz*cz)
-            if clen < 1e-6:
-                return (0.0, -1.0, 0.0)
-            return (cx/clen, cy/clen, cz/clen)
-        else:
-            return (0.0, -1.0, 0.0)
+    def _sdf_capsule(self, base_pos):
+        p_a, p_b = self._get_capsule_segment(base_pos)
+        samples = self._GROUND_PROBES
+        min_d = 1e18
+        best_p = list(p_a)
+        for i in range(samples):
+            t = i / max(samples - 1, 1)
+            px = p_a[0] + (p_b[0] - p_a[0]) * t
+            py = p_a[1] + (p_b[1] - p_a[1]) * t
+            pz = p_a[2] + (p_b[2] - p_a[2]) * t
+            d = _py_sdf((px, py, pz))
+            if d < min_d:
+                min_d = d
+                best_p = [px, py, pz]
+        return min_d, best_p
 
     def _push_out(self, pos, radius):
         for _ in range(self._PUSH_ITERS):
-            d = _py_sdf(pos)
+            d, hit_p = self._sdf_capsule(pos)
             if d >= radius:
                 break
-            nx, ny, nz = _py_sdf_normal(pos)
+            nx, ny, nz = _py_sdf_normal(hit_p)
             push = (radius - d) + 1e-4
             pos[0] += nx * push
             pos[1] += ny * push
@@ -1336,33 +1326,62 @@ class PlayerState:
         return pos
 
     def _is_on_ground(self, pos, gd, radius, gnd_thresh):
-        d = _py_sdf(pos)
+        h = max(self.CAPSULE_HEIGHT - 2.0 * self.CAPSULE_RADIUS, 0.0)
+        half_h = h * 0.5
+        ux, uy, uz = self._local_up[0], self._local_up[1], self._local_up[2]
+        bot_sphere_center = [pos[0] - ux * half_h, pos[1] - uy * half_h, pos[2] - uz * half_h]
+        d = _py_sdf(bot_sphere_center)
         if d < gnd_thresh:
             return True
         probe_dist = gnd_thresh * 0.8
         for i in range(self._GROUND_PROBES):
             t = (i + 1) / self._GROUND_PROBES
-            px = pos[0] + gd[0] * probe_dist * t
-            py = pos[1] + gd[1] * probe_dist * t
-            pz = pos[2] + gd[2] * probe_dist * t
+            px = bot_sphere_center[0] + gd[0] * probe_dist * t
+            py = bot_sphere_center[1] + gd[1] * probe_dist * t
+            pz = bot_sphere_center[2] + gd[2] * probe_dist * t
             if _py_sdf((px, py, pz)) < radius:
                 return True
         return False
+
+    def _compute_gravity_dir(self, pos, surface_normal):
+        mode = self.GRAVITY_MODE
+        if mode == 0:
+            return [-surface_normal[0], -surface_normal[1], -surface_normal[2]]
+        elif mode == 1:
+            cx, cy, cz = -pos[0], -pos[1], -pos[2]
+            clen = math.sqrt(cx*cx + cy*cy + cz*cz)
+            if clen < 1e-6:
+                return [0.0, -1.0, 0.0]
+            return [cx/clen, cy/clen, cz/clen]
+        else:
+            return [0.0, -1.0, 0.0]
 
     def update(self, dt, spd_mul=1.0):
         if dt <= 0 or dt > 0.1:
             return
         pos = list(_params.cam_pos)
-        radius     = self._effective_radius()
-        gnd_thresh = self._ground_threshold()
+        radius = self.CAPSULE_RADIUS
+        gnd_thresh = radius + max(self.GROUND_DIST, 0.005)
 
-        pos = self._push_out(pos, radius)
+        d_init, hit_p_init = self._sdf_capsule(pos)
+        if d_init < radius:
+            nx, ny, nz = _py_sdf_normal(hit_p_init)
+        else:
+            nx, ny, nz = _py_sdf_normal(pos)
 
-        nx, ny, nz = _py_sdf_normal(pos)
-        self._surface_normal = (nx, ny, nz)
-        self._gravity_dir = self._compute_gravity_dir(pos, (nx, ny, nz))
+        self._surface_normal = [nx, ny, nz]
+        self._gravity_dir = self._compute_gravity_dir(pos, [nx, ny, nz])
         gd = self._gravity_dir
 
+        target_up = [-gd[0], -gd[1], -gd[2]]
+        alpha_o = 1.0 - math.exp(-self.ORIENTATION_SPEED * dt)
+        self._local_up[0] += (target_up[0] - self._local_up[0]) * alpha_o
+        self._local_up[1] += (target_up[1] - self._local_up[1]) * alpha_o
+        self._local_up[2] += (target_up[2] - self._local_up[2]) * alpha_o
+        ul = math.sqrt(self._local_up[0]**2 + self._local_up[1]**2 + self._local_up[2]**2) or 1.0
+        self._local_up = [self._local_up[0]/ul, self._local_up[1]/ul, self._local_up[2]/ul]
+
+        pos = self._push_out(pos, radius)
         self.on_ground = self._is_on_ground(pos, gd, radius, gnd_thresh)
 
         fwd, right, _ = _calc_basis_from_params()
@@ -1449,13 +1468,15 @@ class PlayerState:
             t   = 0.0
             max_t = step_len
             hit   = False
+            hit_p = list(pos)
             for _ in range(96):
                 cx_ = pos[0] + sdx * t
                 cy_ = pos[1] + sdy * t
                 cz_ = pos[2] + sdz * t
-                d   = _py_sdf((cx_, cy_, cz_))
+                d, c_hit_p = self._sdf_capsule([cx_, cy_, cz_])
                 if d < radius:
                     hit = True
+                    hit_p = c_hit_p
                     break
                 safe_step = d * 0.8
                 t += max(safe_step, 1e-5)
@@ -1471,17 +1492,17 @@ class PlayerState:
                 pos[0] += sdx * t
                 pos[1] += sdy * t
                 pos[2] += sdz * t
-                cn, cny, cnz = _py_sdf_normal(pos)
+                cn, cny, cnz = _py_sdf_normal(hit_p)
                 vdot = self.vel[0]*cn + self.vel[1]*cny + self.vel[2]*cnz
                 if vdot < 0.0:
                     self.vel[0] -= cn  * vdot
                     self.vel[1] -= cny * vdot
                     self.vel[2] -= cnz * vdot
             for _ in range(self._PUSH_ITERS):
-                d_now = _py_sdf(pos)
+                d_now, c_hit_p = self._sdf_capsule(pos)
                 if d_now >= radius:
                     break
-                pn, pny, pnz = _py_sdf_normal(pos)
+                pn, pny, pnz = _py_sdf_normal(c_hit_p)
                 push = (radius - d_now) + 2e-4
                 pos[0] += pn  * push
                 pos[1] += pny * push
@@ -2050,7 +2071,7 @@ class FractalWindow(mglw.WindowConfig):
 
     def _render_debug_overlay(self):
         global _debug_overlay_enabled
-        if not _debug_overlay_enabled or not _params.player_mode:
+        if not _debug_overlay_enabled:
             return
         ps  = _player_state
         pos = list(_params.cam_pos)
@@ -2104,8 +2125,11 @@ class FractalWindow(mglw.WindowConfig):
         col_ring_px = max(0.0, min(col_ring_px, float(min(w, h)) * 0.9))
         gnd_ring_px = max(0.0, min(gnd_ring_px, float(min(w, h)) * 0.9))
 
-        probes, probe_r = self._build_debug_probes(pos, ps)
-        n_probes = min(len(probes), 32)
+        if _params.player_mode:
+            probes, probe_r = self._build_debug_probes(pos, ps)
+            n_probes = min(len(probes), 32)
+        else:
+            probes, probe_r, n_probes = [], rad, 0
 
         probe_ss_list  = []
         probe_sdf_list = []
@@ -2121,19 +2145,45 @@ class FractalWindow(mglw.WindowConfig):
                 probe_ss_list.append((-9999.0, -9999.0))
             probe_sdf_list.append(float(sv))
 
-        self._dset('u_res',          (float(w), float(h)))
-        self._dset('u_on_ground',    1 if ps.on_ground else 0)
-        self._dset('u_enabled',      1)
-        self._dset('u_sdf_val',      sdf_v)
-        self._dset('u_radius',       float(rad))
-        self._dset('u_gnd_thresh',   float(gnd))
-        self._dset('u_speed',        float(_m.sqrt(sum(v*v for v in ps.vel))))
-        self._dset('u_norm_dir_ss',  norm_ss)
-        self._dset('u_grav_dir_ss',  grav_ss)
-        self._dset('u_col_ring_px',  col_ring_px)
-        self._dset('u_gnd_ring_px',  gnd_ring_px)
-        self._dset('u_probe_count',  n_probes)
-        self._dset('u_probe_radius', float(probe_r))
+        speed = float(_m.sqrt(sum(v*v for v in ps.vel)))
+
+        self._dset('u_res',           (float(w), float(h)))
+        self._dset('u_on_ground',     1 if ps.on_ground else 0)
+        self._dset('u_enabled',       1)
+        self._dset('u_sdf_val',       sdf_v)
+        self._dset('u_radius',        float(rad))
+        self._dset('u_gnd_thresh',    float(gnd))
+        self._dset('u_speed',         speed)
+        self._dset('u_norm_dir_ss',   norm_ss)
+        self._dset('u_grav_dir_ss',   grav_ss)
+        self._dset('u_col_ring_px',   col_ring_px)
+        self._dset('u_gnd_ring_px',   gnd_ring_px)
+        self._dset('u_probe_count',   n_probes)
+        self._dset('u_probe_radius',  float(probe_r))
+
+        self._dset('u_cam_pos',       tuple(_params.cam_pos))
+        self._dset('u_cam_yaw',       float(_params.cam_yaw))
+        self._dset('u_cam_pitch',     float(_params.cam_pitch))
+        self._dset('u_vel_x',         float(ps.vel[0]))
+        self._dset('u_vel_y',         float(ps.vel[1]))
+        self._dset('u_vel_z',         float(ps.vel[2]))
+        self._dset('u_fps',           float(self._display_fps))
+        self._dset('u_fractal_type',  int(_params.fractal_type))
+        self._dset('u_iterations',    int(_params.iterations))
+        self._dset('u_scale',         float(_params.scale))
+        self._dset('u_render_scale',  int(round(self._dyn_res_scale)))
+        self._dset('u_aa_samples',    int(_params.aa_samples))
+        self._dset('u_player_mode',   1 if _params.player_mode else 0)
+        self._dset('u_elapsed',       float(time.time() - self.start))
+        self._dset('u_dyn_res_scale', float(self._dyn_res_scale))
+        self._dset('u_max_steps',     int(_params.max_steps))
+        self._dset('u_fov',           float(_params.fov))
+        self._dset('u_gravity_mode',  float(ps.GRAVITY_MODE))
+
+        if not hasattr(self, '_dbg_frame_count'):
+            self._dbg_frame_count = 0
+        self._dbg_frame_count += 1
+        self._dset('u_frame_count',   self._dbg_frame_count)
 
         for i in range(32):
             kp = f'u_probe_ss[{i}]'
@@ -2700,6 +2750,8 @@ class FractalWindow(mglw.WindowConfig):
             p.screenshot_requested   = False
             self._save_screenshot()
 
+        self._render_debug_overlay()
+
         req = _video_render_req[0]
         if req is not None:
             _video_render_req[0] = None
@@ -2709,10 +2761,8 @@ class FractalWindow(mglw.WindowConfig):
                 _video_render_result.put(('ok', raw))
             except Exception as _ve:
                 _video_render_result.put(('err', str(_ve)))
-            self._render_debug_overlay()
             return
         if _video_rendering_flag.is_set():
-            self._render_debug_overlay()
             return
 
     def _ensure_vid_fbos(self, tw, th):
@@ -6070,10 +6120,10 @@ class ControlGUI(QMainWindow):
         self._sl_ps_friction = _make_ps_slider("Friction",     'FRICTION',          0.5, 30.0, 0.5)
         self._sl_ps_air      = _make_ps_slider("Air Control",  'AIR_CONTROL',       0.0,  1.0, 0.01)
         self._sl_ps_speedcap = _make_ps_slider("Speed Cap",    'SPEED_CAP',         0.5, 20.0, 0.2)
-        self._sl_ps_height   = _make_ps_slider("Player Height",'PLAYER_HEIGHT',     0.01, 1.0, 0.005)
+        # self._sl_ps_height   = _make_ps_slider("Player Height",'PLAYER_HEIGHT',     0.01, 1.0, 0.005)
         self._sl_ps_gnd      = _make_ps_slider("Ground Dist",  'GROUND_DIST',       0.01, 1.0, 0.005)
         self._sl_ps_bias     = _make_ps_slider("Coll. Bias",   'COLLISION_BIAS',    0.1, 10.0, 0.1)
-        self._sl_ps_col_rad  = _make_ps_slider("Coll. Radius", 'COLLIDER_RADIUS',   0.0, 1.0, 0.001)
+        # self._sl_ps_col_rad  = _make_ps_slider("Coll. Radius", 'COLLIDER_RADIUS',   0.0, 1.0, 0.001)
 
         _lbl_hint(layout_phys,
             "Coll. Bias scales collision threshold to match fractal density.\n"

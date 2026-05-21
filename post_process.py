@@ -161,7 +161,7 @@ TAAU_VALID_SCALES    = (0.25, 0.333, 0.5, 0.667, 0.75)
 FSR_EASU_SHARPNESS_DEFAULT = 0.5
 FSR_RCAS_SHARPNESS_DEFAULT = 0.25
 FSR_QUALITY_PRESETS = {
-    'Ultra Quality': {'scale': 0.77, 'easu': 0.35, 'rcas': 0.15},
+    'Ultra Quality': {'scale': 0.9, 'easu': 0.35, 'rcas': 0.15},
     'Quality':       {'scale': 0.667,'easu': 0.50, 'rcas': 0.25},
     'Balanced':      {'scale': 0.585,'easu': 0.65, 'rcas': 0.30},
     'Performance':   {'scale': 0.5,  'easu': 0.80, 'rcas': 0.35},
