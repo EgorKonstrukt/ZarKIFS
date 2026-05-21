@@ -28,7 +28,7 @@ import vr_mode
 from pathlib import Path as _Path
 _SHADER_DIR = _Path(__file__).parent
 
-APP_VERSION = "1.10.3"
+APP_VERSION = "1.10.4"
 
 try:
     from animation_editor import (
@@ -512,11 +512,11 @@ class FractalParams:
         self.taau_scale          = 0.5
         self.fsr_easu_sharpness  = 0.5
         self.fsr_rcas_sharpness  = 0.25
-        self.fsr_preset          = "Quality"
+        self.fsr_preset          = "Ultra Quality"
         self.fsr2_rcas_sharpness  = 0.25
         self.fsr2_reactive_scale  = 5.0
         self.fsr2_blend_alpha     = 0.15
-        self.fsr2_preset          = "Quality"
+        self.fsr2_preset          = "Ultra Quality"
         # --- Screenshot ---
         self.screenshot_requested = False
         self.screenshot_width     = 0
@@ -1289,6 +1289,12 @@ class PlayerState:
         self._bob_phase       = 0.0
         self._local_up        = [0.0, 1.0, 0.0]
 
+    def _effective_radius(self):
+        return self.CAPSULE_RADIUS
+
+    def _ground_threshold(self):
+        return self.CAPSULE_RADIUS + max(self.GROUND_DIST, 0.005)
+
     def _get_capsule_segment(self, base_pos):
         h = max(self.CAPSULE_HEIGHT - 2.0 * self.CAPSULE_RADIUS, 0.0)
         half_h = h * 0.5
@@ -2021,6 +2027,119 @@ class FractalWindow(mglw.WindowConfig):
             self._dbg_prog, self._debug_vbo, 'in_position'
         )
         self._dbg_probe_cache = []
+        self._dbg_font_tex = None
+        self._load_debug_font_texture()
+
+    def _load_debug_font_texture(self, font_path=None):
+        _FONT_CHAR_W  = 8
+        _FONT_CHAR_H  = 14
+        _FONT_COLS    = 16
+        _FONT_SIZE_PT = 11
+        _FONT_FIRST   = 32
+        _FONT_LAST    = 126
+        _num_chars = _FONT_LAST - _FONT_FIRST + 1
+        _rows = (_num_chars + _FONT_COLS - 1) // _FONT_COLS
+        _atlas_w = _FONT_COLS * _FONT_CHAR_W
+        _atlas_h = _rows * _FONT_CHAR_H
+        try:
+            from PIL import Image as _PILImage
+        except ImportError:
+            return
+        if font_path is not None and Path(font_path).exists() and Path(font_path).suffix.lower() == '.png':
+            try:
+                _img = _PILImage.open(str(font_path)).convert("RGBA")
+                _aw, _ah = _img.size
+                _raw = _img.tobytes()
+                if self._dbg_font_tex is not None:
+                    self._dbg_font_tex.release()
+                self._dbg_font_tex = self.ctx.texture((_aw, _ah), 4, _raw)
+                self._dbg_font_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                self._dbg_font_tex.use(1)
+                self._dset('u_font_tex',        1)
+                self._dset('u_font_atlas_size', (float(_aw), float(_ah)))
+                self._dset('u_font_char_size',  (float(_FONT_CHAR_W), float(_FONT_CHAR_H)))
+                self._dset('u_font_first_char', _FONT_FIRST)
+                self._dset('u_font_cols',       _FONT_COLS)
+                return
+            except Exception:
+                pass
+        _font = None
+        if font_path is not None and Path(font_path).exists():
+            try:
+                from PIL import ImageFont as _PILFont
+                _font = _PILFont.truetype(str(font_path), _FONT_SIZE_PT)
+            except Exception:
+                pass
+        if _font is None:
+            _png_default = Path(__file__).parent / "debug_font.png"
+            if _png_default.exists():
+                try:
+                    _img = _PILImage.open(str(_png_default)).convert("RGBA")
+                    _aw, _ah = _img.size
+                    _raw = _img.tobytes()
+                    if self._dbg_font_tex is not None:
+                        self._dbg_font_tex.release()
+                    self._dbg_font_tex = self.ctx.texture((_aw, _ah), 4, _raw)
+                    self._dbg_font_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                    self._dbg_font_tex.use(1)
+                    self._dset('u_font_tex',        1)
+                    self._dset('u_font_atlas_size', (float(_aw), float(_ah)))
+                    self._dset('u_font_char_size',  (float(_FONT_CHAR_W), float(_FONT_CHAR_H)))
+                    self._dset('u_font_first_char', _FONT_FIRST)
+                    self._dset('u_font_cols',       _FONT_COLS)
+                    return
+                except Exception:
+                    pass
+        if _font is None:
+            _ttf_default = Path(__file__).parent / "debug_font.ttf"
+            if _ttf_default.exists():
+                try:
+                    from PIL import ImageFont as _PILFont
+                    _font = _PILFont.truetype(str(_ttf_default), _FONT_SIZE_PT)
+                except Exception:
+                    pass
+        if _font is None:
+            _sys_candidates = [
+                "C:/Windows/Fonts/consola.ttf",
+                "C:/Windows/Fonts/lucon.ttf",
+                "C:/Windows/Fonts/cour.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+                "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+            ]
+            for _sc in _sys_candidates:
+                if Path(_sc).exists():
+                    try:
+                        from PIL import ImageFont as _PILFont
+                        _font = _PILFont.truetype(_sc, _FONT_SIZE_PT)
+                        break
+                    except Exception:
+                        pass
+        if _font is None:
+            return
+        try:
+            from PIL import ImageDraw as _PILDraw
+            _img = _PILImage.new("RGBA", (_atlas_w, _atlas_h), (0, 0, 0, 0))
+            _draw = _PILDraw.Draw(_img)
+            for _i, _code in enumerate(range(_FONT_FIRST, _FONT_LAST + 1)):
+                _col = _i % _FONT_COLS
+                _row = _i // _FONT_COLS
+                _x = _col * _FONT_CHAR_W
+                _y = _row * _FONT_CHAR_H
+                _draw.text((_x, _y), chr(_code), font=_font, fill=(255, 255, 255, 255))
+            _raw = _img.tobytes()
+            if self._dbg_font_tex is not None:
+                self._dbg_font_tex.release()
+            self._dbg_font_tex = self.ctx.texture((_atlas_w, _atlas_h), 4, _raw)
+            self._dbg_font_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self._dbg_font_tex.use(1)
+            self._dset('u_font_tex',        1)
+            self._dset('u_font_atlas_size', (float(_atlas_w), float(_atlas_h)))
+            self._dset('u_font_char_size',  (float(_FONT_CHAR_W), float(_FONT_CHAR_H)))
+            self._dset('u_font_first_char', _FONT_FIRST)
+            self._dset('u_font_cols',       _FONT_COLS)
+        except Exception:
+            pass
 
     def _dset(self, name, val):
         try:
@@ -2201,6 +2320,9 @@ class FractalWindow(mglw.WindowConfig):
 
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
+        if self._dbg_font_tex is not None:
+            self._dbg_font_tex.use(1)
+            self._dset('u_font_tex', 1)
         self._dbg_vao.render(moderngl.TRIANGLE_STRIP)
         self.ctx.disable(moderngl.BLEND)
 
@@ -6083,8 +6205,11 @@ class ControlGUI(QMainWindow):
 
         dbg_btn = _icon_btn(QStyle.SP_FileDialogInfoView, "Toggle debug overlay (F1)", "Toggle (F1)")
         dbg_btn.clicked.connect(self._toggle_debug_overlay)
+        font_btn = _icon_btn(QStyle.SP_DirOpenIcon, "Load debug overlay font (.ttf/.otf/.png)", "Font...")
+        font_btn.clicked.connect(self._load_debug_font_dialog)
         dbg_row.addWidget(self._dbg_lbl, 1)
         dbg_row.addWidget(dbg_btn)
+        dbg_row.addWidget(font_btn)
         layout_mode.addLayout(dbg_row)
 
         _lbl_hint(layout_mode,
@@ -6214,6 +6339,25 @@ class ControlGUI(QMainWindow):
 
         else:
             self._dbg_lbl.setText("COLLIDER DEBUG: OFF")
+
+    def _load_debug_font_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Debug Overlay Font",
+            str(Path(__file__).parent),
+            "Font / Atlas (*.ttf *.otf *.png);;TrueType Font (*.ttf);;OpenType Font (*.otf);;PNG Atlas (*.png)",
+        )
+        if not path:
+            return
+        gl_wnd = _gl_window_ref[0]
+        if gl_wnd is None:
+            QMessageBox.warning(self, "Debug Font", "GL window not ready.")
+            return
+        try:
+            gl_wnd._load_debug_font_texture(font_path=path)
+            QMessageBox.information(self, "Debug Font", f"Font loaded:\n{path}")
+        except Exception as _e:
+            QMessageBox.critical(self, "Debug Font", f"Failed to load font:\n{_e}")
 
     def _reset_player_velocity(self):
         _player_state.vel = [0.0, 0.0, 0.0]
