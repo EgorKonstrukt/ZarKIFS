@@ -28,7 +28,7 @@ import vr_mode
 from pathlib import Path as _Path
 _SHADER_DIR = _Path(__file__).parent
 
-APP_VERSION = "1.10.2"
+APP_VERSION = "1.10.3"
 
 try:
     from animation_editor import (

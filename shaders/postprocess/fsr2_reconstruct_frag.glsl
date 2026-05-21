@@ -10,16 +10,23 @@ uniform float u_saturation;
 uniform float u_gamma;
 uniform int   u_flip_y;
 
-float luminance(vec3 c) {
-    return dot(c, vec3(0.2126, 0.7152, 0.0722));
-}
+const vec3 LUM_W = vec3(0.2126, 0.7152, 0.0722);
+float luminance(vec3 c) { return dot(c, LUM_W); }
+vec3 tonemapW(vec3 c)    { float l = luminance(c); return c / (1.0 + l); }
+vec3 tonemapWInv(vec3 c) { float l = luminance(c); return c / max(1.0 - l, 1e-5); }
 
 vec3 rcas(vec2 uv, vec2 rcp) {
-    vec3 e  = texture(u_accumulated, uv).rgb;
-    vec3 n  = texture(u_accumulated, uv + vec2( 0.0,  1.0) * rcp).rgb;
-    vec3 s  = texture(u_accumulated, uv + vec2( 0.0, -1.0) * rcp).rgb;
-    vec3 w  = texture(u_accumulated, uv + vec2(-1.0,  0.0) * rcp).rgb;
-    vec3 ee = texture(u_accumulated, uv + vec2( 1.0,  0.0) * rcp).rgb;
+    vec3 eRaw  = texture(u_accumulated, uv).rgb;
+    vec3 nRaw  = texture(u_accumulated, uv + vec2( 0.0,  1.0) * rcp).rgb;
+    vec3 sRaw  = texture(u_accumulated, uv + vec2( 0.0, -1.0) * rcp).rgb;
+    vec3 wRaw  = texture(u_accumulated, uv + vec2(-1.0,  0.0) * rcp).rgb;
+    vec3 eeRaw = texture(u_accumulated, uv + vec2( 1.0,  0.0) * rcp).rgb;
+
+    vec3 e  = tonemapW(eRaw);
+    vec3 n  = tonemapW(nRaw);
+    vec3 s  = tonemapW(sRaw);
+    vec3 w  = tonemapW(wRaw);
+    vec3 ee = tonemapW(eeRaw);
 
     float le = luminance(e);
     float ln = luminance(n);
@@ -31,21 +38,34 @@ vec3 rcas(vec2 uv, vec2 rcp) {
     float mx4 = max(le, max(max(ln, ls), max(lw, la)));
     float contrast = mx4 - mn4;
 
-    float rcpL = 1.0 / (4.0 * le + 1e-5);
-    float ampN = clamp(min(mn4, 2.0 - mx4) * rcpL, 0.0, 1.0);
+    if (contrast < 1.5 / 255.0) {
+        vec3 col = eRaw * u_exposure;
+        float lum = luminance(col);
+        col = mix(vec3(lum), col, u_saturation);
+        return pow(clamp(col, 0.0, 1.0), vec3(1.0 / max(u_gamma, 0.1)));
+    }
+
+    float rcpSum = 1.0 / (mn4 + mx4 + 1e-5);
+    float ampN   = clamp(mn4 * 2.0 * rcpSum, 0.0, 1.0);
     ampN = sqrt(ampN);
 
-    float w_rcas = -ampN * clamp(u_rcas_sharpness, 0.0, 1.0) * 0.25;
-    if (contrast < 1.0 / 255.0) w_rcas = 0.0;
+    float sharpness = clamp(u_rcas_sharpness, 0.0, 1.0);
+    float edgeScale = 1.0 - smoothstep(0.3, 0.7, contrast);
+    float w_rcas    = -ampN * sharpness * edgeScale * 0.2;
 
-    float denom = 1.0 + 4.0 * w_rcas;
-    denom = max(abs(denom), 1e-5) * sign(denom + 1e-9);
-
-    vec3 col = (e + (n + s + w + ee) * w_rcas) / denom;
+    float rcpDenom = 1.0 / max(1.0 + 4.0 * w_rcas, 1e-5);
+    vec3 col = (e + (n + s + w + ee) * w_rcas) * rcpDenom;
     col = max(col, vec3(0.0));
 
+    float maxNeigh = max(le, max(max(ln, ls), max(lw, la)));
+    float lumSharp = luminance(col);
+    if (lumSharp > maxNeigh * 1.05) {
+        col *= (maxNeigh * 1.05) / max(lumSharp, 1e-5);
+    }
+
+    col = tonemapWInv(col);
     col *= u_exposure;
-    float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    float lum = luminance(col);
     col = mix(vec3(lum), col, u_saturation);
     return pow(clamp(col, 0.0, 1.0), vec3(1.0 / max(u_gamma, 0.1)));
 }
